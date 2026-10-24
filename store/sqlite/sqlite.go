@@ -189,6 +189,12 @@ func (s *Store) Drop(ids []string) error {
 	return nil
 }
 
+// Rehome moves from's unread mail to to, leaving its read mail where it is.
+func (s *Store) Rehome(from, to string) error {
+	_, err := s.db.Exec(`UPDATE messages SET mailbox = ? WHERE mailbox = ? AND read_at IS NULL`, to, from)
+	return err
+}
+
 // OutboxAdd queues m for peer at time at.
 func (s *Store) OutboxAdd(peer string, m message.Message, at time.Time) error {
 	body, err := json.Marshal(m)

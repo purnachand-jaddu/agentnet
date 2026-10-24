@@ -111,11 +111,15 @@ func (d *Daemon) register(c ipc.Conn, a RegisterArgs) (Registered, error) {
 	}
 
 	// Reverse join: a hook registration folds in a live MCP-only placeholder for the same process,
-	// freeing its name before the incoming key is named.
+	// freeing its name before the incoming key is named. Its unread mail moves with it, or the
+	// join fails rather than silently stranding that mail in the placeholder's mailbox.
 	var joinedConn ipc.Conn
 	var joinedMCPPush bool
 	if a.Hook && a.Session.PID != 0 {
 		if proc := d.findProcSession(a.Session.Agent, a.Session.PID); proc != nil {
+			if err := d.opts.Store.Rehome(proc.s.Key, a.Session.Key); err != nil {
+				return Registered{}, err
+			}
 			joinedConn, joinedMCPPush = proc.conn, proc.mcpPush
 			delete(d.live, proc.s.Key)
 		}

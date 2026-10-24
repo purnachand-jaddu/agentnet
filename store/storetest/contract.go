@@ -101,6 +101,34 @@ func Run(t *testing.T, open func(t *testing.T) store.Store) {
 			t.Fatalf("Pending after Drop = %+v", got)
 		}
 	})
+	t.Run("rehome moves unread mail, leaving read mail behind", func(t *testing.T) {
+		s := open(t)
+		_, err := s.PutMessage(msg("1", "bob/a"), "a", false)
+		must(t, err)
+		_, err = s.PutMessage(msg("2", "bob/a"), "a", false)
+		must(t, err)
+		_, err = s.PutMessage(msg("3", "bob/a"), "a", false)
+		must(t, err)
+		must(t, s.MarkRead([]string{"3"}, time.Now()))
+
+		must(t, s.Rehome("a", "b"))
+
+		got, err := s.Pending("b")
+		must(t, err)
+		if len(got) != 2 || got[0].ID != "1" || got[1].ID != "2" {
+			t.Fatalf("Pending(b) after Rehome = %+v", got)
+		}
+		got, err = s.Pending("a")
+		must(t, err)
+		if len(got) != 0 {
+			t.Fatalf("Pending(a) after Rehome = %+v", got)
+		}
+		ok, err := s.Has("3")
+		must(t, err)
+		if !ok {
+			t.Fatal("Rehome dropped the read message")
+		}
+	})
 	t.Run("outbox by peer and age", func(t *testing.T) {
 		s := open(t)
 		t0 := time.Unix(100, 0)

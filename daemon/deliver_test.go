@@ -224,6 +224,27 @@ func TestResolveToRefusesOtherMachine(t *testing.T) {
 	}
 }
 
+// TestReverseJoinCarriesPlaceholderMail checks that mail sent to an MCP-only proc: placeholder
+// isn't orphaned in its mailbox once a hook registration reverse-joins it to the real session key.
+func TestReverseJoinCarriesPlaceholderMail(t *testing.T) {
+	d := newTestDaemon(t, claudeFake(adapter.ChannelPull))
+	call[Registered](t, d, &fakeConn{id: 1}, "register",
+		RegisterArgs{Session: adapter.Session{Key: "proc:999", Agent: "claude-code", Cwd: "/src/api"}, MCPPush: true, MCPPID: 4242})
+
+	call[SendResult](t, d, &fakeConn{id: 2}, "send", SendArgs{From: "cli:terminal", To: "alex/api-claude", Body: "hi", Wake: true})
+
+	r := call[Registered](t, d, &fakeConn{id: 3}, "register",
+		RegisterArgs{Session: adapter.Session{Key: "claude-code:c1", Agent: "claude-code", ID: "c1", Cwd: "/src/api", PID: 4242}, Hook: true})
+
+	got, err := d.pending(r.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Body != "hi" {
+		t.Fatalf("expected the placeholder's mail carried over to %s, got %+v", r.Key, got)
+	}
+}
+
 // TestForgottenNameDoesNotLeakMail checks fix (a): mailboxes are keyed by session key, not
 // name, so mail left for a forgotten session doesn't leak to a new session that later claims
 // the same freed name.
