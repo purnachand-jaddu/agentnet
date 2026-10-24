@@ -239,3 +239,29 @@ func bytes32(b byte) []byte {
 	k[0] = b
 	return k
 }
+
+// A spoofed announcement must not steer the daemon at loopback, link-local, unspecified or multicast addresses.
+func TestReportDropsNonUnicastLANAddrs(t *testing.T) {
+	wantTag := tag("team-a")
+	e := &hmdns.ServiceEntry{
+		AddrV4: net.ParseIP("127.0.0.1"),
+		Port:   4000,
+		InfoFields: []string{
+			"k=" + base64.RawURLEncoding.EncodeToString(bytes32(5)),
+			"t=" + wantTag,
+			"a=127.0.0.1,169.254.1.2,0.0.0.0,224.0.0.251,255.255.255.255,192.168.1.20",
+		},
+	}
+	var got *discovery.Found
+	(&Discoverer{}).report(e, wantTag, func(f discovery.Found) { got = &f })
+	if got == nil || len(got.Addrs) != 1 || got.Addrs[0] != "lan://192.168.1.20:4000" {
+		t.Fatalf("got %+v, want only lan://192.168.1.20:4000", got)
+	}
+
+	e.InfoFields[2] = "a=127.0.0.1"
+	got = nil
+	(&Discoverer{}).report(e, wantTag, func(f discovery.Found) { got = &f })
+	if got != nil {
+		t.Fatalf("got %+v, want no report when only loopback is announced", got)
+	}
+}

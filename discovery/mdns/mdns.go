@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"slices"
 	"strings"
 	"time"
 
@@ -231,6 +232,8 @@ func (d *Discoverer) report(e *hmdns.ServiceEntry, want string, found func(disco
 	if e.AddrV4 != nil && !containsIP(ips, e.AddrV4) {
 		ips = append(ips, e.AddrV4)
 	}
+	// a real peer never announces loopback, link-local, unspecified, multicast or broadcast; drop them before they become hints
+	ips = slices.DeleteFunc(ips, func(ip net.IP) bool { return !ip.IsGlobalUnicast() })
 	if len(ips) == 0 {
 		return
 	}
