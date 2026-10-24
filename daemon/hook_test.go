@@ -112,11 +112,36 @@ func TestHookEndKeepsSessionWithMCP(t *testing.T) {
 	}
 }
 
+// TestHookOutputNotOkLeavesMailPendingNoIDs checks that a hook claims no ids and prints nothing when
+// the adapter has nothing printable (HookOutput ok=false), so the hook client's "delivered" follow-up
+// can't mark mail read that was never shown.
+func TestHookOutputNotOkLeavesMailPendingNoIDs(t *testing.T) {
+	cx := codexFake(adapter.ChannelHook)
+	cx.noHookOutput = true
+	d := newTestDaemon(t, cx, claudeFake(adapter.ChannelPull))
+	call[HookResult](t, d, &fakeConn{id: 1}, "hook", HookArgs{Agent: "codex", Event: adapter.EventStart, SessionID: "x1", Cwd: "/src/web"})
+	register(t, d, &fakeConn{id: 2}, "claude-code", "c1", "/src/api", false)
+	call[SendResult](t, d, &fakeConn{id: 3}, "send", SendArgs{From: "claude-code:c1", To: "alex/web-codex", Body: "hi", Wake: true})
+
+	r := call[HookResult](t, d, &fakeConn{id: 1}, "hook", HookArgs{Agent: "codex", Event: adapter.EventStop, SessionID: "x1", Cwd: "/src/web"})
+	if r.Out != "" || len(r.IDs) != 0 {
+		t.Fatalf("expected no output and no claimed ids, got %+v", r)
+	}
+
+	msgs, err := d.pending("codex:x1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("expected the message still pending (not claimed in-flight), got %+v", msgs)
+	}
+}
+
 // TestAttachPicksSoleBusyHookSeenInCwd checks the happy path: one busy hook-seen session in the given cwd.
 func TestAttachPicksSoleBusyHookSeenInCwd(t *testing.T) {
 	d := newTestDaemon(t, codexFake(adapter.ChannelHook))
 	call[HookResult](t, d, &fakeConn{id: 1}, "hook", HookArgs{Agent: "codex", Event: adapter.EventPrompt, SessionID: "x1", Cwd: "/src/web"})
-	r := call[Registered](t, d, &fakeConn{id: 2}, "attach", AttachArgs{Agent: "codex", Cwd: "/src/web"})
+	r := call[Registered](t, d, &fakeConn{id: 2}, "attach", AttachArgs{Agent: "codex", Cwd: "/src/web", MCPPush: true})
 	if r.Key != "codex:x1" {
 		t.Fatalf("attach = %+v", r)
 	}
@@ -124,7 +149,43 @@ func TestAttachPicksSoleBusyHookSeenInCwd(t *testing.T) {
 	mcpPush := d.live["codex:x1"].mcpPush
 	d.mu.Unlock()
 	if !mcpPush {
-		t.Fatal("expected attach to mark the session as push-capable")
+		t.Fatal("expected attach with mcp_push to mark the session as push-capable")
+	}
+}
+
+// TestAttachSetsMCPPushOnlyWhenRequested checks that attach without mcp_push leaves mcpPush
+// alone (still sets conn), rather than always claiming push capability.
+func TestAttachSetsMCPPushOnlyWhenRequested(t *testing.T) {
+	d := newTestDaemon(t, codexFake(adapter.ChannelHook))
+	call[HookResult](t, d, &fakeConn{id: 1}, "hook", HookArgs{Agent: "codex", Event: adapter.EventPrompt, SessionID: "x1", Cwd: "/src/web"})
+
+	call[Registered](t, d, &fakeConn{id: 2}, "attach", AttachArgs{Agent: "codex", Cwd: "/src/web"})
+	d.mu.Lock()
+	mcpPush := d.live["codex:x1"].mcpPush
+	d.mu.Unlock()
+	if mcpPush {
+		t.Fatal("expected attach without mcp_push to leave mcpPush false")
+	}
+
+	call[Registered](t, d, &fakeConn{id: 3}, "attach", AttachArgs{Agent: "codex", Cwd: "/src/web", MCPPush: true})
+	d.mu.Lock()
+	mcpPush = d.live["codex:x1"].mcpPush
+	d.mu.Unlock()
+	if !mcpPush {
+		t.Fatal("expected attach with mcp_push to set mcpPush true")
+	}
+}
+
+// TestAttachRefusedWhenFolderDisallowed checks that attach refuses the matched session's own cwd,
+// not just the request's cwd.
+func TestAttachRefusedWhenFolderDisallowed(t *testing.T) {
+	d := newTestDaemon(t, codexFake(adapter.ChannelHook))
+	call[HookResult](t, d, &fakeConn{id: 1}, "hook", HookArgs{Agent: "codex", Event: adapter.EventPrompt, SessionID: "x1", Cwd: "/src/web"})
+	d.opts.FolderAllowed = func(string) bool { return false }
+
+	raw, _ := json.Marshal(AttachArgs{Agent: "codex", Cwd: "/src/web"})
+	if _, err := d.Handle(context.Background(), &fakeConn{id: 2}, "attach", raw); err == nil {
+		t.Fatal("expected attach refused for a disallowed folder")
 	}
 }
 
@@ -144,26 +205,26 @@ func TestAttachFallsBackAnywhereThenErrorsOnAmbiguity(t *testing.T) {
 	}
 }
 
-// TestWhoListsBusyAndMarksCaller checks "who"'s status and You fields.
+// TestWhoListsBusyAndMarksCaller checks "who"'s status and You fields, including that a
+// hook-only session with no conn and no mcpPush is reported idle, not offline.
 func TestWhoListsBusyAndMarksCaller(t *testing.T) {
 	d := newTestDaemon(t, codexFake(adapter.ChannelHook), claudeFake(adapter.ChannelPull))
 	call[HookResult](t, d, &fakeConn{id: 1}, "hook", HookArgs{Agent: "codex", Event: adapter.EventPrompt, SessionID: "x1", Cwd: "/src/web"})
+	call[HookResult](t, d, &fakeConn{id: 4}, "hook", HookArgs{Agent: "codex", Event: adapter.EventStop, SessionID: "x2", Cwd: "/src/web2"})
 	reg := register(t, d, &fakeConn{id: 2}, "claude-code", "c1", "/src/api", false)
 
 	res := call[WhoResult](t, d, &fakeConn{id: 3}, "who", WhoArgs{Key: reg.Key})
-	var sawBusy, sawYou bool
+	byAddr := map[string]WhoEntry{}
 	for _, e := range res.Sessions {
-		if e.Status == "busy" {
-			sawBusy = true
-		}
-		if e.You {
-			sawYou = true
-			if e.Address != reg.Address {
-				t.Fatalf("You entry address = %q, want %q", e.Address, reg.Address)
-			}
-		}
+		byAddr[e.Address] = e
 	}
-	if !sawBusy || !sawYou {
-		t.Fatalf("who = %+v", res.Sessions)
+	if got := byAddr["alex/web-codex"].Status; got != "busy" {
+		t.Fatalf("busy session status = %q, want busy", got)
+	}
+	if got := byAddr["alex/web2-codex"].Status; got != "idle" {
+		t.Fatalf("hook-only, no-conn session status = %q, want idle (not offline)", got)
+	}
+	if you := byAddr[reg.Address]; !you.You {
+		t.Fatalf("caller entry not marked You: %+v", you)
 	}
 }

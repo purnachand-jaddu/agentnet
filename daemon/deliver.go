@@ -148,11 +148,10 @@ func (d *Daemon) deliver(key, name string, msgs []message.Message, wake bool) me
 	to := d.opts.Person + "/" + name
 	d.mu.Lock()
 	waiting := d.waiting[key] > 0
-	close(d.arrived) // broadcast arrival to every long-polling "inbox" call, for any key, then replace for the next one
-	d.arrived = make(chan struct{})
+	d.broadcastArrived()
 	if waiting {
 		d.mu.Unlock()
-		return message.Receipt{To: to, State: message.StateDelivered, Note: "delivered: the session was waiting for messages"}
+		return message.Receipt{To: to, State: message.StateDelivered, Note: "delivered: the session is waiting for messages"}
 	}
 	l := d.live[key]
 	if l == nil {
@@ -201,6 +200,12 @@ func (d *Daemon) deliver(key, name string, msgs []message.Message, wake bool) me
 	default: // ChannelPull
 		return message.Receipt{To: to, State: message.StateQueued, Note: pullNote}
 	}
+}
+
+// broadcastArrived wakes every long-polling "inbox" call, for any key, then replaces d.arrived for the next one. Caller holds mu.
+func (d *Daemon) broadcastArrived() {
+	close(d.arrived)
+	d.arrived = make(chan struct{})
 }
 
 // clearInFlight drops ids from in-flight tracking, e.g. after a push attempt that never reached the session.

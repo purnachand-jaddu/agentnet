@@ -72,6 +72,17 @@ func (d *Daemon) hook(c ipc.Conn, a HookArgs) (HookResult, error) {
 		return HookResult{Key: key}, nil
 	}
 
+	// Only claim (in-flight) and return ids once there's printable output for them: the hook client
+	// prints Out if non-empty and then confirms with "delivered", which would mark unshown mail read.
+	adp, ok := d.opts.Adapters.Get(a.Agent)
+	if !ok {
+		return HookResult{Key: key}, nil
+	}
+	out, ok := adp.HookOutput(a.Event, message.ForAgent(msgs))
+	if !ok {
+		return HookResult{Key: key}, nil
+	}
+
 	ids := idsOf(msgs)
 	d.mu.Lock()
 	now := d.opts.Now()
@@ -79,22 +90,14 @@ func (d *Daemon) hook(c ipc.Conn, a HookArgs) (HookResult, error) {
 		d.inFlight[id] = now
 	}
 	d.mu.Unlock()
-
-	adp, ok := d.opts.Adapters.Get(a.Agent)
-	if !ok {
-		return HookResult{Key: key, IDs: ids}, nil
-	}
-	out, ok := adp.HookOutput(a.Event, message.ForAgent(msgs))
-	if !ok {
-		return HookResult{Key: key, IDs: ids}, nil
-	}
 	return HookResult{Out: out, Key: key, IDs: ids}, nil
 }
 
 // AttachArgs is the "attach" op's arguments: a multiplexed agent's one MCP process finding its live session.
 type AttachArgs struct {
-	Agent string `json:"agent"`
-	Cwd   string `json:"cwd"`
+	Agent   string `json:"agent"`
+	Cwd     string `json:"cwd"`
+	MCPPush bool   `json:"mcp_push"`
 }
 
 // attach handles the "attach" op: the caller's conn becomes the pushable one for the sole busy, hook-seen session it matches.
@@ -108,8 +111,13 @@ func (d *Daemon) attach(c ipc.Conn, a AttachArgs) (Registered, error) {
 	if l == nil {
 		return Registered{}, fmt.Errorf("no single busy %s session to attach to", a.Agent)
 	}
+	if !d.opts.FolderAllowed(l.s.Cwd) {
+		return Registered{}, fmt.Errorf("agentnet is off for this folder; run agentnet folder add %s", l.s.Cwd)
+	}
 	l.conn = c
-	l.mcpPush = true
+	if a.MCPPush {
+		l.mcpPush = true
+	}
 	return Registered{Key: l.s.Key, Address: d.opts.Person + "/" + l.name, Name: l.name}, nil
 }
 
@@ -157,7 +165,6 @@ type whoSnap struct {
 	key, name string
 	s         adapter.Session
 	busy      bool
-	hasConn   bool
 	st        adapter.State
 }
 
@@ -170,7 +177,7 @@ func (d *Daemon) who(a WhoArgs) WhoResult {
 			continue
 		}
 		snaps = append(snaps, whoSnap{
-			key: key, name: l.name, s: l.s, busy: l.busy, hasConn: l.conn != nil,
+			key: key, name: l.name, s: l.s, busy: l.busy,
 			st: adapter.State{MCPPush: l.mcpPush, HookSeen: l.hookSeen, PushFailed: l.pushFailed},
 		})
 	}
@@ -180,12 +187,11 @@ func (d *Daemon) who(a WhoArgs) WhoResult {
 	var res WhoResult
 	for _, sn := range snaps {
 		repo, branch := d.gitInfoFor(sn.s.Cwd, now)
+		// who only lists live sessions, and a hook-only session never gets a conn by design
+		// (decision 3), so status comes from busy alone, not from conn/mcpPush presence.
 		status := "idle"
-		switch {
-		case sn.busy:
+		if sn.busy {
 			status = "busy"
-		case !sn.hasConn && !sn.st.MCPPush:
-			status = "offline"
 		}
 		var tier adapter.Tier
 		if adp, ok := d.opts.Adapters.Get(sn.s.Agent); ok {

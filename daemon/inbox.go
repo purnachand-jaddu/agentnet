@@ -36,6 +36,9 @@ type DeliveredArgs struct {
 }
 
 // inbox handles the "inbox" op: long-polls up to wait_secs (capped at maxWaitSecs) for mail at key.
+// It subscribes to arrivals before checking pending(), not after: checking first would leave a
+// window where a message stored (and its broadcast) between the check and the subscribe is missed,
+// and the call would then sleep out the full wait instead of waking at once.
 func (d *Daemon) inbox(ctx context.Context, a InboxArgs) (InboxResult, error) {
 	wait := a.WaitSecs
 	if wait > maxWaitSecs {
@@ -47,22 +50,25 @@ func (d *Daemon) inbox(ctx context.Context, a InboxArgs) (InboxResult, error) {
 	deadline := d.opts.Now().Add(time.Duration(wait) * time.Second)
 
 	for {
-		msgs, err := d.pending(a.Key)
-		if err != nil {
-			return InboxResult{}, err
-		}
-		if len(msgs) > 0 {
-			return d.inboxResult(a, msgs)
-		}
-		remaining := deadline.Sub(d.opts.Now())
-		if remaining <= 0 {
-			return InboxResult{}, nil
-		}
-
 		d.mu.Lock()
 		d.waiting[a.Key]++
 		arrived := d.arrived
 		d.mu.Unlock()
+
+		msgs, err := d.pending(a.Key)
+		if err != nil {
+			d.stopWaiting(a.Key)
+			return InboxResult{}, err
+		}
+		if len(msgs) > 0 {
+			d.stopWaiting(a.Key)
+			return d.inboxResult(a, msgs)
+		}
+		remaining := deadline.Sub(d.opts.Now())
+		if remaining <= 0 {
+			d.stopWaiting(a.Key)
+			return InboxResult{}, nil
+		}
 
 		timer := time.NewTimer(remaining)
 		select {
@@ -71,18 +77,22 @@ func (d *Daemon) inbox(ctx context.Context, a InboxArgs) (InboxResult, error) {
 		case <-ctx.Done():
 		}
 		timer.Stop()
-
-		d.mu.Lock()
-		d.waiting[a.Key]--
-		if d.waiting[a.Key] <= 0 {
-			delete(d.waiting, a.Key)
-		}
-		d.mu.Unlock()
+		d.stopWaiting(a.Key)
 
 		if ctx.Err() != nil {
 			return InboxResult{}, nil
 		}
 	}
+}
+
+// stopWaiting decrements key's long-poll count, clearing the entry once it reaches zero.
+func (d *Daemon) stopWaiting(key string) {
+	d.mu.Lock()
+	d.waiting[key]--
+	if d.waiting[key] <= 0 {
+		delete(d.waiting, key)
+	}
+	d.mu.Unlock()
 }
 
 // inboxResult marks msgs read (unless a.Peek) and formats them for the agent.

@@ -14,13 +14,14 @@ import (
 )
 
 type fakeAdapter struct {
-	name, short string
-	channel     adapter.Channel
-	clientNames []string
-	mu          sync.Mutex
-	pushed      []string
-	running     bool
-	failPush    bool // Push returns an error instead of recording text
+	name, short  string
+	channel      adapter.Channel
+	clientNames  []string
+	mu           sync.Mutex
+	pushed       []string
+	running      bool
+	failPush     bool // Push returns an error instead of recording text
+	noHookOutput bool // HookOutput returns ok=false instead of formatting text
 }
 
 func (f *fakeAdapter) ClientNames() []string { return f.clientNames }
@@ -48,6 +49,9 @@ func (f *fakeAdapter) Push(_ context.Context, _ adapter.Session, text string) er
 	return nil
 }
 func (f *fakeAdapter) HookOutput(_ adapter.HookEvent, text string) (string, bool) {
+	if f.noHookOutput {
+		return "", false
+	}
 	return "HOOK:" + text, true
 }
 func (f *fakeAdapter) Tier(adapter.Session, adapter.State) adapter.Tier { return adapter.Push }

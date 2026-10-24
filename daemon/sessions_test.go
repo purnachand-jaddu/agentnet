@@ -213,6 +213,72 @@ func TestHookReRegisterDoesNotClearMCPConn(t *testing.T) {
 	}
 }
 
+// failAfterNStore lets the first n SessionByName calls through, then fails every one after, so an
+// early (setup) naming attempt succeeds and a later one fails deterministically.
+type failAfterNStore struct {
+	store.Store
+	n     int
+	calls int
+}
+
+func (f *failAfterNStore) SessionByName(name string) (*store.SessionRecord, error) {
+	f.calls++
+	if f.calls > f.n {
+		return nil, errors.New("boom")
+	}
+	return f.Store.SessionByName(name)
+}
+
+// TestReverseJoinNamingFailureLeavesPlaceholderLive checks that when naming the incoming hook
+// session fails, the reverse join never ran: the MCP placeholder is still live with its conn,
+// not stranded without one.
+func TestReverseJoinNamingFailureLeavesPlaceholderLive(t *testing.T) {
+	st := &failAfterNStore{Store: storetest.SQLite(t), n: 1} // 1 call: the placeholder's own naming succeeds; the hook's fails
+	d := New(Options{Person: "alex", Machine: "mbp", Store: st, Adapters: adapter.NewRegistry(claudeFake(adapter.ChannelPull)),
+		FolderAllowed: func(string) bool { return true }, Now: time.Now, Log: t.Logf})
+
+	procConn := &fakeConn{id: 1}
+	call[Registered](t, d, procConn, "register", RegisterArgs{Session: adapter.Session{Key: "proc:999", Agent: "claude-code", Cwd: "/src/api"}, MCPPush: true, MCPPID: 4242})
+
+	raw, _ := json.Marshal(RegisterArgs{Session: adapter.Session{Key: "claude-code:c1", Agent: "claude-code", ID: "c1", Cwd: "/src/api", PID: 4242}, Hook: true})
+	if _, err := d.Handle(context.Background(), &fakeConn{id: 2}, "register", raw); err == nil {
+		t.Fatal("expected the naming failure to surface as an error")
+	}
+
+	d.mu.Lock()
+	proc, stillLive := d.live["proc:999"]
+	d.mu.Unlock()
+	if !stillLive || proc.conn != procConn {
+		t.Fatalf("naming failure stranded the placeholder: live=%v, %+v", stillLive, proc)
+	}
+}
+
+// TestRehomeWakesWaitingInboxOnNewKey checks that the reverse join's Rehome broadcasts arrival,
+// so an "inbox" long poll already waiting on the new key wakes promptly instead of only finding
+// the rehomed mail after its own wait_secs times out.
+func TestRehomeWakesWaitingInboxOnNewKey(t *testing.T) {
+	d := newTestDaemon(t, claudeFake(adapter.ChannelPull))
+	call[Registered](t, d, &fakeConn{id: 1}, "register", RegisterArgs{Session: adapter.Session{Key: "proc:999", Agent: "claude-code", Cwd: "/src/api"}, MCPPush: true, MCPPID: 4242})
+	call[SendResult](t, d, &fakeConn{id: 2}, "send", SendArgs{From: "cli:terminal", To: "alex/api-claude", Body: "hi", Wake: true})
+
+	done := make(chan InboxResult, 1)
+	go func() {
+		done <- call[InboxResult](t, d, &fakeConn{id: 3}, "inbox", InboxArgs{Key: "claude-code:c1", WaitSecs: 5})
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	call[Registered](t, d, &fakeConn{id: 4}, "register", RegisterArgs{Session: adapter.Session{Key: "claude-code:c1", Agent: "claude-code", ID: "c1", Cwd: "/src/api", PID: 4242}, Hook: true})
+
+	select {
+	case r := <-done:
+		if !strings.Contains(r.Text, "hi") {
+			t.Fatalf("got %q", r.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("inbox on the new key was not woken promptly after the rehome")
+	}
+}
+
 func TestFromClientExactMatch(t *testing.T) {
 	claude := claudeFake(adapter.ChannelPull)
 	codex := codexFake(adapter.ChannelPull)

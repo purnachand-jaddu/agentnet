@@ -110,19 +110,12 @@ func (d *Daemon) register(c ipc.Conn, a RegisterArgs) (Registered, error) {
 		}
 	}
 
-	// Reverse join: a hook registration folds in a live MCP-only placeholder for the same process,
-	// freeing its name before the incoming key is named. Its unread mail moves with it, or the
-	// join fails rather than silently stranding that mail in the placeholder's mailbox.
-	var joinedConn ipc.Conn
-	var joinedMCPPush bool
+	// Reverse join: a hook registration folds in a live MCP-only placeholder for the same process.
+	// Only find it here; the fold itself (freeing its name, moving its mail) waits until the
+	// incoming key is successfully named, so a naming failure doesn't strand the MCP conn or mail.
+	var proc *live
 	if a.Hook && a.Session.PID != 0 {
-		if proc := d.findProcSession(a.Session.Agent, a.Session.PID); proc != nil {
-			if err := d.opts.Store.Rehome(proc.s.Key, a.Session.Key); err != nil {
-				return Registered{}, err
-			}
-			joinedConn, joinedMCPPush = proc.conn, proc.mcpPush
-			delete(d.live, proc.s.Key)
-		}
+		proc = d.findProcSession(a.Session.Agent, a.Session.PID)
 	}
 
 	key := a.Session.Key
@@ -146,7 +139,18 @@ func (d *Daemon) register(c ipc.Conn, a RegisterArgs) (Registered, error) {
 	} else {
 		l.s = mergeSession(l.s, a.Session)
 	}
-	// A hook re-register must not touch conn/mcpPush: only an MCP register (or the reverse join below) owns those.
+
+	var joinedConn ipc.Conn
+	var joinedMCPPush bool
+	if proc != nil {
+		if err := d.opts.Store.Rehome(proc.s.Key, key); err != nil {
+			return Registered{}, err
+		}
+		joinedConn, joinedMCPPush = proc.conn, proc.mcpPush
+		delete(d.live, proc.s.Key)
+		d.broadcastArrived() // the placeholder's mail just moved to key; wake anyone long-polling it
+	}
+	// A hook re-register must not touch conn/mcpPush: only an MCP register (or the reverse join above) owns those.
 	if !a.Hook || a.MCPPush || a.MCPPID != 0 {
 		l.conn = c
 		if a.MCPPush {
@@ -239,9 +243,11 @@ func (d *Daemon) assignName(key, agentName, cwd string) (string, error) {
 }
 
 // nameFree reports whether name is unused by any live session or remembered record of a different key. Caller holds mu.
+// A proc: placeholder's claim on a name never blocks: it's never persisted, and now that the reverse
+// join frees it only after the real session is named, the real session must still be able to reuse it.
 func (d *Daemon) nameFree(key, name string) (bool, error) {
 	for k, l := range d.live {
-		if k != key && l.name == name {
+		if k != key && !isPlaceholder(k) && l.name == name {
 			return false, nil
 		}
 	}

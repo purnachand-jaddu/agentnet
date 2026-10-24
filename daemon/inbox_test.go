@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -55,10 +56,31 @@ func TestDeliverToWaitingInboxReturnsDeliveredReceipt(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	res := call[SendResult](t, d, &fakeConn{id: 3}, "send", SendArgs{From: "codex:b", To: "alex/a-codex", Body: "now", Wake: true})
-	if res.Receipts[0].State != message.StateDelivered || !strings.Contains(res.Receipts[0].Note, "delivered: the session was waiting for messages") {
+	if res.Receipts[0].State != message.StateDelivered || !strings.Contains(res.Receipts[0].Note, "delivered: the session is waiting for messages") {
 		t.Fatalf("receipt = %+v", res.Receipts[0])
 	}
 	<-done
+}
+
+// TestInboxNoLostWakeupUnderConcurrentSend checks that subscribing happens before the pending()
+// check: a message stored concurrently, right as the long poll is about to wait, must still wake
+// it at once rather than being missed until the full wait_secs elapses.
+func TestInboxNoLostWakeupUnderConcurrentSend(t *testing.T) {
+	d := newTestDaemon(t, codexFake(adapter.ChannelPull))
+	register(t, d, &fakeConn{id: 1}, "codex", "a", "/src/a", false)
+	for i := 0; i < 200; i++ {
+		done := make(chan InboxResult, 1)
+		go func() {
+			done <- call[InboxResult](t, d, &fakeConn{id: 1}, "inbox", InboxArgs{Key: "codex:a", WaitSecs: 5})
+		}()
+		// from "cli:terminal": a session sender would trip the loop guard well before 200 sends.
+		call[SendResult](t, d, &fakeConn{id: 3}, "send", SendArgs{From: "cli:terminal", To: "alex/a-codex", Body: fmt.Sprintf("hi%d", i), Wake: true})
+		select {
+		case <-done:
+		case <-time.After(1 * time.Second):
+			t.Fatalf("iteration %d: inbox did not wake within 1s (lost wakeup)", i)
+		}
+	}
 }
 
 // TestDeliveredClearsInFlight checks that "delivered" removes ids from in-flight tracking, not just MarkRead,
