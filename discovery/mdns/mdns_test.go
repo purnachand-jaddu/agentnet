@@ -30,13 +30,13 @@ func TestTag(t *testing.T) {
 }
 
 func TestParseTXT(t *testing.T) {
-	k, tg := parseTXT([]string{"k=abc123", "t=deadbeef", "x=ignored"})
-	if k != "abc123" || tg != "deadbeef" {
-		t.Fatalf("got k=%q t=%q", k, tg)
+	k, tg, a := parseTXT([]string{"k=abc123", "t=deadbeef", "a=10.0.0.5,192.168.1.20", "x=ignored"})
+	if k != "abc123" || tg != "deadbeef" || a != "10.0.0.5,192.168.1.20" {
+		t.Fatalf("got k=%q t=%q a=%q", k, tg, a)
 	}
-	k, tg = parseTXT(nil)
-	if k != "" || tg != "" {
-		t.Fatalf("want empty on no fields, got k=%q t=%q", k, tg)
+	k, tg, a = parseTXT(nil)
+	if k != "" || tg != "" || a != "" {
+		t.Fatalf("want empty on no fields, got k=%q t=%q a=%q", k, tg, a)
 	}
 }
 
@@ -104,6 +104,50 @@ func TestNewZoneAdvertisesInjectedIPs(t *testing.T) {
 		}
 		if svc.IPs[i].IsLoopback() {
 			t.Errorf("IP %d = %v is a loopback address", i, svc.IPs[i])
+		}
+	}
+}
+
+// TestNewZoneCarriesAllIPsInTXT guards against hashicorp/mdns v1.0.7's client keeping only the LAST
+// A record it sees: every announced IP must also ride in the a= TXT value, not just svc.IPs.
+func TestNewZoneCarriesAllIPsInTXT(t *testing.T) {
+	ips := []net.IP{net.ParseIP("10.0.0.5"), net.ParseIP("192.168.1.20")}
+	svc, err := newZone(bytes32(1), "team-a", 4000, ips)
+	if err != nil {
+		t.Fatalf("newZone: %v", err)
+	}
+	_, _, a := parseTXT(svc.TXT)
+	if want := "10.0.0.5,192.168.1.20"; a != want {
+		t.Errorf("a= TXT = %q, want %q", a, want)
+	}
+}
+
+// TestReportEmitsAllTXTAddrs checks report() reports every address in a=, deduped against AddrV4.
+func TestReportEmitsAllTXTAddrs(t *testing.T) {
+	goodKey := bytes32(5)
+	wantTag := tag("team-a")
+	e := &hmdns.ServiceEntry{
+		AddrV4: net.ParseIP("10.0.0.5"), // same as the first a= address: must not be duplicated
+		Port:   4000,
+		InfoFields: []string{
+			"k=" + base64.RawURLEncoding.EncodeToString(goodKey),
+			"t=" + wantTag,
+			"a=10.0.0.5,192.168.1.20",
+		},
+	}
+	d := &Discoverer{}
+	var got *discovery.Found
+	d.report(e, wantTag, func(f discovery.Found) { got = &f })
+	if got == nil {
+		t.Fatal("want a report")
+	}
+	want := []string{"lan://10.0.0.5:4000", "lan://192.168.1.20:4000"}
+	if len(got.Addrs) != len(want) {
+		t.Fatalf("Addrs = %v, want %v", got.Addrs, want)
+	}
+	for i := range want {
+		if got.Addrs[i] != want[i] {
+			t.Errorf("Addrs[%d] = %q, want %q", i, got.Addrs[i], want[i])
 		}
 	}
 }
@@ -185,8 +229,8 @@ func TestAnnounceBrowse(t *testing.T) {
 	}
 	if f, ok := found[string(peerKey)]; !ok {
 		t.Error("browse did not report the same-team peer")
-	} else if len(f.Addrs) != 1 {
-		t.Errorf("peer: want 1 addr, got %v", f.Addrs)
+	} else if len(f.Addrs) < 1 {
+		t.Errorf("peer: want at least 1 addr, got %v", f.Addrs)
 	}
 }
 

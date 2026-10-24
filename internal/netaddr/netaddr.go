@@ -1,9 +1,25 @@
 // Package netaddr finds this machine's own LAN-reachable IPv4 addresses.
 package netaddr
 
-import "net"
+import (
+	"net"
+	"strings"
+)
 
-// LocalIPv4 lists this machine's IPv4 addresses on up, non-loopback interfaces, skipping link-local (169.254/16).
+// virtualPrefixes are interface name prefixes LocalIPv4 skips: containers, VMs and VPNs rarely reach real LAN peers.
+var virtualPrefixes = []string{"docker", "br-", "veth", "virbr", "vmnet", "utun", "tailscale", "zt"}
+
+// isVirtual reports whether name looks like a container, VM or VPN interface rather than a real LAN NIC.
+func isVirtual(name string) bool {
+	for _, p := range virtualPrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// LocalIPv4 lists this machine's IPv4 addresses on up, non-loopback, non-virtual interfaces, skipping link-local (169.254/16).
 func LocalIPv4() ([]net.IP, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
@@ -12,6 +28,9 @@ func LocalIPv4() ([]net.IP, error) {
 	var ips []net.IP
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if isVirtual(iface.Name) {
 			continue
 		}
 		addrs, err := iface.Addrs()

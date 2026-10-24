@@ -34,6 +34,9 @@ const defaultInterval = 30 * time.Second
 // queryTimeout is how long each mDNS query waits for responses.
 const queryTimeout = time.Second
 
+// maxTXTBytes is a DNS TXT record string's byte limit (RFC 1035 character-string).
+const maxTXTBytes = 255
+
 // discardLogger silences hashicorp/mdns's std-log output so the daemon log isn't spammed.
 var discardLogger = log.New(io.Discard, "", 0)
 
@@ -56,16 +59,69 @@ func tag(team string) string {
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
-// parseTXT extracts the k= and t= values from an entry's TXT fields.
-func parseTXT(fields []string) (k, t string) {
+// parseTXT extracts the k=, t= and a= values from an entry's TXT fields.
+func parseTXT(fields []string) (k, t, a string) {
 	for _, f := range fields {
-		if v, ok := strings.CutPrefix(f, "k="); ok {
-			k = v
-		} else if v, ok := strings.CutPrefix(f, "t="); ok {
-			t = v
+		switch {
+		case strings.HasPrefix(f, "k="):
+			k = f[2:]
+		case strings.HasPrefix(f, "t="):
+			t = f[2:]
+		case strings.HasPrefix(f, "a="):
+			a = f[2:]
 		}
 	}
-	return k, t
+	return k, t, a
+}
+
+// formatAddrs builds the "a=ip1,ip2,..." TXT value from ips, dropping non-IPv4 entries and truncating
+// the list so the string (including the "a=" prefix) stays within maxTXTBytes.
+func formatAddrs(ips []net.IP) string {
+	var b strings.Builder
+	b.WriteString("a=")
+	for _, ip := range ips {
+		ip4 := ip.To4()
+		if ip4 == nil {
+			continue
+		}
+		add := ip4.String()
+		if b.Len() > 2 {
+			add = "," + add
+		}
+		if b.Len()+len(add) > maxTXTBytes {
+			break
+		}
+		b.WriteString(add)
+	}
+	return b.String()
+}
+
+// parseAddrs4 splits a comma-separated a= TXT value into valid IPv4 addresses, dropping anything else.
+func parseAddrs4(a string) []net.IP {
+	if a == "" {
+		return nil
+	}
+	var ips []net.IP
+	for _, s := range strings.Split(a, ",") {
+		ip := net.ParseIP(s)
+		if ip == nil {
+			continue
+		}
+		if ip4 := ip.To4(); ip4 != nil {
+			ips = append(ips, ip4)
+		}
+	}
+	return ips
+}
+
+// containsIP reports whether ips already has ip.
+func containsIP(ips []net.IP, ip net.IP) bool {
+	for _, x := range ips {
+		if x.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // Announce starts an mDNS responder advertising key on port for team, shutting down once ctx is done.
@@ -108,6 +164,7 @@ func newZone(key []byte, team string, port int, ips []net.IP) (*hmdns.MDNSServic
 	txt := []string{
 		"k=" + base64.RawURLEncoding.EncodeToString(key),
 		"t=" + tag(team),
+		formatAddrs(ips),
 	}
 	return hmdns.NewMDNSService(instance, service, "", "", port, ips, txt)
 }
@@ -153,12 +210,12 @@ func (d *Discoverer) query(ctx context.Context, want string, found func(discover
 	}
 }
 
-// report calls found for e if its AddrV4 is set, its t= tag matches want, and its k= decodes to a 32-byte key other than Self.
+// report calls found for e if its t= tag matches want and its k= decodes to a 32-byte key other than Self.
+// Addrs carries every address from the a= TXT field plus e.AddrV4 as a fallback (deduped): hashicorp/mdns
+// v1.0.7's client keeps only the LAST A record it sees, so on a multi-NIC host (Docker, a VPN) AddrV4 alone
+// can be the wrong interface; the a= TXT value is this package's own record of every address it announced on.
 func (d *Discoverer) report(e *hmdns.ServiceEntry, want string, found func(discovery.Found)) {
-	if e.AddrV4 == nil {
-		return
-	}
-	k, t := parseTXT(e.InfoFields)
+	k, t, a := parseTXT(e.InfoFields)
 	if t != want {
 		return
 	}
@@ -169,5 +226,18 @@ func (d *Discoverer) report(e *hmdns.ServiceEntry, want string, found func(disco
 	if d.Self != nil && bytes.Equal(key, d.Self) {
 		return
 	}
-	found(discovery.Found{Key: key, Addrs: []string{fmt.Sprintf("lan://%s:%d", e.AddrV4, e.Port)}})
+
+	ips := parseAddrs4(a)
+	if e.AddrV4 != nil && !containsIP(ips, e.AddrV4) {
+		ips = append(ips, e.AddrV4)
+	}
+	if len(ips) == 0 {
+		return
+	}
+
+	addrs := make([]string, len(ips))
+	for i, ip := range ips {
+		addrs[i] = fmt.Sprintf("lan://%s:%d", ip, e.Port)
+	}
+	found(discovery.Found{Key: key, Addrs: addrs})
 }
