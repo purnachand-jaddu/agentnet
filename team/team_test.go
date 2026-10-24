@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/purnachand-jaddu/agentnet/identity"
+	"github.com/purnachand-jaddu/agentnet/store"
 	"github.com/purnachand-jaddu/agentnet/store/storetest"
 )
 
@@ -211,8 +212,8 @@ func TestAcceptRefusesDifferentFounder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := Accept(js, jkeys, bundle, now); err == nil {
-		t.Fatal("accept while already a member of another network should fail")
+	if _, err := Accept(js, jkeys, bundle, now); !errors.Is(err, ErrOtherNetwork) {
+		t.Fatalf("err = %v, want ErrOtherNetwork", err)
 	}
 }
 
@@ -325,5 +326,43 @@ func TestCreateRejectsBadPersonOrMachine(t *testing.T) {
 	}
 	if _, err := Create(fs, fkeys, fpriv, "alex", "my mac", time.Now()); err == nil {
 		t.Fatal("Create should reject a bad machine name")
+	}
+}
+
+// failPutAfterN wraps a store.Store and fails the Nth and every later Put call, to test partial-write behavior.
+type failPutAfterN struct {
+	store.Store
+	n     int
+	calls int
+}
+
+func (f *failPutAfterN) Put(ns, key string, val []byte) error {
+	f.calls++
+	if f.calls >= f.n {
+		return errors.New("forced put failure")
+	}
+	return f.Store.Put(ns, key, val)
+}
+
+// save writes "self", then each member cert, then "founder" last. Failing the 2nd Put (the lone member
+// cert, since Create's self cert is also its only member) must leave "founder" unwritten, so a partially
+// written Create never reads back as an existing team.
+func TestCreatePartialFailureNeverReadsAsATeam(t *testing.T) {
+	now := time.Now()
+	real := storetest.SQLite(t)
+	_, fpriv := genFounder(t)
+	fkeys, _ := identity.GenerateKeys()
+
+	failing := &failPutAfterN{Store: real, n: 2}
+	if _, err := Create(failing, fkeys, fpriv, "alex", "mbp", now); err == nil {
+		t.Fatal("Create should have failed")
+	}
+
+	st, err := Load(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != nil {
+		t.Fatal("a partially-written Create must not read back as an existing team")
 	}
 }

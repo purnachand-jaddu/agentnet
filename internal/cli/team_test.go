@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -113,6 +114,39 @@ func TestAcceptDenialLeavesNoTeam(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, "agentnet.db")); !os.IsNotExist(err) {
 		t.Fatalf("agentnet.db exists or stat failed: %v", err)
+	}
+}
+
+// A config-save failure after team.Create has already succeeded must not strand the network: the founder
+// key must survive, init must still report success (the person/machine already live in the self cert),
+// and a later init must see the existing network rather than trying to create a second one.
+func TestInitConfigSaveFailureKeepsFounderKeyAndWarns(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AGENTNET_HOME", home)
+	withApprover(t, fakeApprover{})
+
+	old := saveConfigPersonMachine
+	saveConfigPersonMachine = func(person, machine string) error { return errors.New("forced config save failure") }
+	t.Cleanup(func() { saveConfigPersonMachine = old })
+
+	out, errOut := withIO(t)
+	if code := Main([]string{"init", "--person", "alex", "--machine", "mbp"}, "v0"); code != 0 {
+		t.Fatalf("init should exit 0 even when config save fails; stdout %q, stderr %q", out.String(), errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "warning") {
+		t.Fatalf("stderr = %q, want a warning", errOut.String())
+	}
+	if _, err := os.Stat(filepath.Join(home, "founder.key")); err != nil {
+		t.Fatalf("founder.key should still exist: %v", err)
+	}
+
+	saveConfigPersonMachine = old // restore before the second init, which only needs to see the existing team
+	out2, errOut2 := withIO(t)
+	if code := Main([]string{"init", "--person", "alex", "--machine", "other"}, "v0"); code == 0 {
+		t.Fatalf("second init should refuse: already in network; stdout %q", out2.String())
+	}
+	if !strings.Contains(errOut2.String(), "already in network") {
+		t.Fatalf("stderr = %q, want \"already in network\"", errOut2.String())
 	}
 }
 

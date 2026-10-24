@@ -12,13 +12,15 @@ import (
 	"time"
 
 	"github.com/purnachand-jaddu/agentnet/identity"
-	"github.com/purnachand-jaddu/agentnet/internal/paths"
 	"github.com/purnachand-jaddu/agentnet/message"
 	"github.com/purnachand-jaddu/agentnet/store"
 )
 
 // ErrPersonTaken means another key already holds that person name.
 var ErrPersonTaken = errors.New("that person name is already held by another machine")
+
+// ErrOtherNetwork means this store already belongs to a different network; the CLI names where to look.
+var ErrOtherNetwork = errors.New("team: already in another network")
 
 const (
 	nsTeam  = "team"
@@ -91,11 +93,10 @@ func Load(s store.Store) (*State, error) {
 	return st, nil
 }
 
-// save writes st's founder key, self cert, members and blocks to s, dropping any stored cert for a now-blocked key.
+// save writes st's self cert, members and blocks to s, dropping any stored cert for a now-blocked key, and
+// writes the founder key LAST: Load treats its presence as "this store belongs to a team", so a save that
+// fails partway through must never leave it set — that would read back as a team with no self cert/members.
 func (st *State) save(s store.Store) error {
-	if err := s.Put(nsTeam, "founder", st.Founder); err != nil {
-		return err
-	}
 	selfB, err := json.Marshal(st.Self)
 	if err != nil {
 		return err
@@ -124,7 +125,7 @@ func (st *State) save(s store.Store) error {
 			return err
 		}
 	}
-	return nil
+	return s.Put(nsTeam, "founder", st.Founder)
 }
 
 // Create makes s the founder store of a new network: an admin cert for person@machine, signed by founder.
@@ -229,7 +230,7 @@ func Accept(s store.Store, keys identity.Keys, b identity.Bundle, now time.Time)
 		return nil, err
 	}
 	if existing != nil && !existing.Founder.Equal(founderPub) {
-		return nil, fmt.Errorf("team: already in another network; leave first (remove %s)", paths.Home())
+		return nil, ErrOtherNetwork
 	}
 
 	st := existing

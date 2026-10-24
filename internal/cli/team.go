@@ -50,8 +50,8 @@ func personMachine(person, machine *string) (p, m string, err error) {
 	return p, m, nil
 }
 
-// saveConfigPersonMachine updates and saves person/machine to config.json.
-func saveConfigPersonMachine(person, machine string) error {
+// saveConfigPersonMachine updates and saves person/machine to config.json; a var so tests can force a failure.
+var saveConfigPersonMachine = func(person, machine string) error {
 	cfgPath := paths.Config()
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
@@ -81,6 +81,7 @@ func loadOrGenerateMachineKeys() (identity.Keys, error) {
 
 // saveFounderKeyOnce writes priv's seed to path, 0600, refusing to overwrite an existing file. O_EXCL makes
 // the create-and-check one atomic step (no link/rename trick needed, so this also works on exFAT/FAT media).
+// A write or sync failure removes the partial file rather than leaving it behind.
 func saveFounderKeyOnce(path string, priv ed25519.PrivateKey) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
@@ -89,11 +90,17 @@ func saveFounderKeyOnce(path string, priv ed25519.PrivateKey) error {
 		}
 		return err
 	}
-	defer f.Close()
 	if _, err := f.Write([]byte(base64.RawURLEncoding.EncodeToString(priv.Seed()))); err != nil {
+		f.Close()
+		os.Remove(path)
 		return err
 	}
-	return f.Sync()
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(path)
+		return err
+	}
+	return f.Close()
 }
 
 // loadFounderKey reads a founder key written by saveFounderKeyOnce, refusing one whose mode allows group or other access.
@@ -208,11 +215,14 @@ func cmdInit(args []string) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	if err := saveConfigPersonMachine(p, m); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
-	}
+	// The network now exists in the store: keep the founder key regardless of what happens below.
+	// person/machine already live in the self cert, so a config-save failure here is a warning, not fatal —
+	// stranding a network with no founder key (because cleanup ran after Create had already succeeded) is worse.
 	committed = true
+
+	if err := saveConfigPersonMachine(p, m); err != nil {
+		fmt.Fprintf(stderr, "warning: could not save person/machine to config: %v\n", err)
+	}
 
 	fmt.Fprintln(stdout, identity.TeamCode(founderPriv.Public().(ed25519.PublicKey)))
 	fmt.Fprintf(stdout, "Add people with `agentnet admit <request>`. The founder key is at %s; keep it safe (moving it offline with --founder-key is recommended).\n", founderKeyPath)
@@ -408,6 +418,10 @@ func cmdAccept(args []string) int {
 	defer st.Close()
 
 	if _, err := team.Accept(st, keys, b, time.Now()); err != nil {
+		if errors.Is(err, team.ErrOtherNetwork) {
+			fmt.Fprintf(stderr, "already in another network; leave first (remove %s)\n", paths.Home())
+			return 1
+		}
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
