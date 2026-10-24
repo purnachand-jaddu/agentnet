@@ -12,8 +12,18 @@ import (
 	"github.com/purnachand-jaddu/agentnet/adapter"
 )
 
+// sockPath creates a short Unix socket path within macOS's 104-byte sun_path limit.
+func sockPath(t *testing.T) string {
+	dir, err := os.MkdirTemp("/tmp", "an")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return filepath.Join(dir, "s.sock")
+}
+
 func TestPostInboxWritesAuthThenUserFrame(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "in.sock")
+	sock := sockPath(t)
 	l, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatal(err)
@@ -65,7 +75,7 @@ func TestChannelOrder(t *testing.T) {
 
 func TestPushUsesTheSessionsOwnToken(t *testing.T) {
 	t.Setenv("CLAUDE_CODE_MESSAGING_TOKEN", "daemon-token-must-not-leak")
-	sock := filepath.Join(t.TempDir(), "in.sock")
+	sock := sockPath(t)
 	l, _ := net.Listen("unix", sock)
 	got := make(chan string, 1)
 	go func() {
