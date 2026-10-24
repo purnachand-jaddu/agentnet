@@ -22,6 +22,9 @@ const (
 	loopMax    = 12
 )
 
+// pullNote is the receipt note for a session that will pick its mail up on its own, with no push channel reaching it right now.
+const pullNote = "it sees it when it checks its inbox"
+
 // SendArgs is the "send" op's arguments.
 type SendArgs struct {
 	From    string `json:"from"` // session key, or "cli:terminal"
@@ -63,7 +66,7 @@ func (d *Daemon) send(a SendArgs) (SendResult, error) {
 	var res SendResult
 	for _, tg := range targets {
 		to := d.opts.Person + "/" + tg.name
-		if a.From != "cli:terminal" && !d.loopAllowed(a.From, tg.name) {
+		if a.From != "cli:terminal" && !d.loopAllowed(a.From, tg.key) {
 			res.Receipts = append(res.Receipts, message.Receipt{To: to, State: message.StateRefused,
 				Note: "too many messages between these two sessions; is this a loop?"})
 			continue
@@ -72,11 +75,13 @@ func (d *Daemon) send(a SendArgs) (SendResult, error) {
 			ID: message.NewID(), From: fromAddr, To: to, FromAgent: fromAgent,
 			ReplyTo: a.ReplyTo, Body: a.Body, Wake: a.Wake, SentAt: d.opts.Now(),
 		}
-		if _, err := d.opts.Store.PutMessage(msg, tg.name, false); err != nil {
-			return SendResult{}, err
+		if _, err := d.opts.Store.PutMessage(msg, tg.key, false); err != nil {
+			res.Receipts = append(res.Receipts, message.Receipt{To: to, State: message.StateRefused,
+				Note: fmt.Sprintf("could not store the message: %v", err)})
+			continue
 		}
 		res.IDs = append(res.IDs, msg.ID)
-		res.Receipts = append(res.Receipts, d.deliver(tg.name, []message.Message{msg}, a.Wake))
+		res.Receipts = append(res.Receipts, d.deliver(tg.key, tg.name, []message.Message{msg}, a.Wake))
 	}
 	return res, nil
 }
@@ -138,11 +143,11 @@ func (d *Daemon) pending(mailbox string) ([]message.Message, error) {
 	return out, nil
 }
 
-// deliver gets msgs (all addressed to the session named name) to it now, returning a receipt for the recipient.
-func (d *Daemon) deliver(name string, msgs []message.Message, wake bool) message.Receipt {
+// deliver gets msgs (all addressed to the session keyed by key) to it now, returning a receipt for the recipient (shown as name).
+func (d *Daemon) deliver(key, name string, msgs []message.Message, wake bool) message.Receipt {
 	to := d.opts.Person + "/" + name
 	d.mu.Lock()
-	l := d.liveByName(name)
+	l := d.live[key]
 	if l == nil {
 		d.mu.Unlock()
 		return message.Receipt{To: to, State: message.StateQueued, Note: "it reaches that session when it's back"}
@@ -154,7 +159,7 @@ func (d *Daemon) deliver(name string, msgs []message.Message, wake bool) message
 	a, ok := d.opts.Adapters.Get(l.s.Agent)
 	if !ok {
 		d.mu.Unlock()
-		return message.Receipt{To: to, State: message.StateQueued, Note: "it sees it when it checks its inbox"}
+		return message.Receipt{To: to, State: message.StateQueued, Note: pullNote}
 	}
 	st := adapter.State{MCPPush: l.mcpPush, HookSeen: l.hookSeen, PushFailed: l.pushFailed}
 	sess, conn := l.s, l.conn
@@ -170,10 +175,14 @@ func (d *Daemon) deliver(name string, msgs []message.Message, wake bool) message
 
 	switch ch {
 	case adapter.ChannelMCP:
-		if conn != nil {
-			if err := conn.Push(ipc.Event{Event: "deliver", Key: sess.Key, IDs: ids, Text: message.ForAgent(msgs)}); err != nil {
-				d.opts.Log("daemon: push event to %s: %v", sess.Key, err)
-			}
+		if conn == nil {
+			d.clearInFlight(ids)
+			return message.Receipt{To: to, State: message.StateQueued, Note: pullNote}
+		}
+		if err := conn.Push(ipc.Event{Event: "deliver", Key: sess.Key, IDs: ids, Text: message.ForAgent(msgs)}); err != nil {
+			d.opts.Log("daemon: push event to %s: %v", sess.Key, err)
+			d.clearInFlight(ids)
+			return message.Receipt{To: to, State: message.StateQueued, Note: pullNote}
 		}
 		return message.Receipt{To: to, State: message.StatePushed}
 	case adapter.ChannelCommand:
@@ -183,7 +192,16 @@ func (d *Daemon) deliver(name string, msgs []message.Message, wake bool) message
 		// Task 6 starts a TurnWatcher poll here when the adapter reports a running turn.
 		return message.Receipt{To: to, State: message.StateQueued, Note: "it sees it at its next tool call or when its turn ends"}
 	default: // ChannelPull
-		return message.Receipt{To: to, State: message.StateQueued, Note: "it sees it when it checks its inbox"}
+		return message.Receipt{To: to, State: message.StateQueued, Note: pullNote}
+	}
+}
+
+// clearInFlight drops ids from in-flight tracking, e.g. after a push attempt that never reached the session.
+func (d *Daemon) clearInFlight(ids []string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, id := range ids {
+		delete(d.inFlight, id)
 	}
 }
 
@@ -207,6 +225,9 @@ func (d *Daemon) pushInBackground(a adapter.Adapter, sess adapter.Session, text 
 		if l, ok := d.live[sess.Key]; ok {
 			l.pushFailed = err != nil
 		}
+		for _, id := range ids {
+			delete(d.inFlight, id) // either it's read below, or the fallback (hook/pull) must see it right away
+		}
 		d.mu.Unlock()
 
 		if err != nil {
@@ -215,13 +236,7 @@ func (d *Daemon) pushInBackground(a adapter.Adapter, sess adapter.Session, text 
 		}
 		if err := d.opts.Store.MarkRead(ids, d.opts.Now()); err != nil {
 			d.opts.Log("daemon: mark read %v: %v", ids, err)
-			return
 		}
-		d.mu.Lock()
-		for _, id := range ids {
-			delete(d.inFlight, id)
-		}
-		d.mu.Unlock()
 	})
 }
 

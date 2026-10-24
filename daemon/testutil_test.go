@@ -58,15 +58,19 @@ func (f *fakeAdapter) Pushed() []string {
 }
 
 type fakeConn struct {
-	id     uint64
-	mu     sync.Mutex
-	events []ipc.Event
+	id       uint64
+	mu       sync.Mutex
+	events   []ipc.Event
+	failPush bool // Push returns an error instead of recording the event
 }
 
 func (c *fakeConn) ID() uint64 { return c.id }
 func (c *fakeConn) Push(ev ipc.Event) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.failPush {
+		return errors.New("conn push failed")
+	}
 	c.events = append(c.events, ev)
 	return nil
 }

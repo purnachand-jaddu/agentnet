@@ -6,9 +6,10 @@ import (
 	"github.com/purnachand-jaddu/agentnet/message"
 )
 
-// target is one resolved recipient of a send: its session name, live or remembered.
+// target is one resolved recipient of a send: its mailbox key (the session's stable key, never reused) and display name.
 type target struct {
 	name string
+	key  string
 }
 
 // resolveTo parses to and resolves it to the target(s) a send from fromKey should reach.
@@ -17,6 +18,9 @@ func (d *Daemon) resolveTo(fromKey, to string) ([]target, error) {
 	if err != nil {
 		return nil, err
 	}
+	if addr.Machine != "" && addr.Machine != d.opts.Machine {
+		return nil, fmt.Errorf("no such machine here (remote delivery comes later)")
+	}
 	if addr.Person != "" && addr.Person != d.opts.Person {
 		return nil, fmt.Errorf("no such person on this machine (remote delivery comes later)")
 	}
@@ -24,13 +28,17 @@ func (d *Daemon) resolveTo(fromKey, to string) ([]target, error) {
 		if fromKey != "cli:terminal" {
 			return nil, fmt.Errorf("only the terminal can message a group")
 		}
-		return d.liveTargetsExcept(fromKey), nil
+		targets := d.liveTargetsExcept(fromKey)
+		if len(targets) == 0 {
+			return nil, fmt.Errorf("no live sessions to message")
+		}
+		return targets, nil
 	}
 	d.mu.Lock()
 	l := d.liveByName(addr.Session)
 	d.mu.Unlock()
 	if l != nil {
-		return []target{{name: l.name}}, nil
+		return []target{{name: l.name, key: l.s.Key}}, nil
 	}
 	rec, err := d.opts.Store.SessionByName(addr.Session)
 	if err != nil {
@@ -39,10 +47,10 @@ func (d *Daemon) resolveTo(fromKey, to string) ([]target, error) {
 	if rec == nil {
 		return nil, fmt.Errorf("no such session %q", addr.Session)
 	}
-	return []target{{name: rec.Name}}, nil
+	return []target{{name: rec.Name, key: rec.Key}}, nil
 }
 
-// liveTargetsExcept returns every live session's name except exceptKey.
+// liveTargetsExcept returns every live session except exceptKey.
 func (d *Daemon) liveTargetsExcept(exceptKey string) []target {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -51,7 +59,7 @@ func (d *Daemon) liveTargetsExcept(exceptKey string) []target {
 		if key == exceptKey {
 			continue
 		}
-		targets = append(targets, target{name: l.name})
+		targets = append(targets, target{name: l.name, key: key})
 	}
 	return targets
 }
