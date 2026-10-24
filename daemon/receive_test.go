@@ -74,7 +74,7 @@ func storedMsg(t *testing.T, s store.Store, id string) *message.Message {
 
 func TestReceiveDeliversOverLAN(t *testing.T) {
 	f := newTeamFixture(t)
-	a, b, _ := startRemotePair(t, f)
+	a, b, _, _ := startRemotePair(t, f)
 	r := sendOne(t, a, "cli:terminal", "sam/web-codex").Receipts[0]
 	if r.State != message.StateQueued || r.Note != acceptedNote {
 		t.Fatalf("receipt %+v, want queued/accepted", r)
@@ -90,7 +90,7 @@ func TestReceiveDeliversOverLAN(t *testing.T) {
 
 func TestReceiveRetryAfterLostAckIsReAcked(t *testing.T) {
 	f := newTeamFixture(t)
-	a, b, _ := startRemotePair(t, f)
+	a, b, _, _ := startRemotePair(t, f)
 	bk := peerKey(f.bKeys.Public())
 	m := newMsg("alex/terminal", "sam/web-codex")
 	want := []struct {

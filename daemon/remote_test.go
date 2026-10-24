@@ -72,14 +72,15 @@ func startB(t *testing.T, f teamFixture, port, aPort int) *remoteB {
 // got is how many verified msg envelopes reached B's store.
 func (r *remoteB) got() int32 { return r.st.got.Load() }
 
-// startRemotePair runs A and B and waits until A lists B's web-codex.
-func startRemotePair(t *testing.T, f teamFixture) (a *Daemon, b *remoteB, aPort int) {
+// startRemotePair runs A and B and waits until A lists B's web-codex. stopA ends A's own gossip/outbox
+// loop early, for a test that must stop A's background re-flushing from racing with its own assertions.
+func startRemotePair(t *testing.T, f teamFixture) (a *Daemon, b *remoteB, aPort int, stopA func()) {
 	aPort, bPort := freePort(t), freePort(t)
 	a = newNetDaemon(t, "alex", "mbp", f.aStore, f.aTeam, f.aKeys, aPort, lanAddr(bPort))
 	b = startB(t, f, bPort, aPort)
-	runDaemon(t, a)
+	stopA = runDaemon(t, a)
 	waitUntil(t, 5*time.Second, "A lists sam/web-codex", func() bool { return statusOf(a, "sam/web-codex") == "idle" })
-	return a, b, aPort
+	return a, b, aPort, stopA
 }
 
 func outboxLen(t *testing.T, s store.Store, peer string) int {
@@ -105,7 +106,7 @@ func sendOne(t *testing.T, d *Daemon, from, to string) SendResult {
 
 func TestRemoteSendQueuedThenFlushedOnPresence(t *testing.T) {
 	f := newTeamFixture(t)
-	a, b, aPort := startRemotePair(t, f)
+	a, b, aPort, _ := startRemotePair(t, f)
 	bk := peerKey(f.bKeys.Public())
 
 	res := sendOne(t, a, "cli:terminal", "sam/web-codex")
@@ -140,7 +141,7 @@ func TestRemoteSendQueuedThenFlushedOnPresence(t *testing.T) {
 
 func TestRemoteRetryKeepsRefusedRemoves(t *testing.T) {
 	f := newTeamFixture(t)
-	a, b, _ := startRemotePair(t, f)
+	a, b, _, stopA := startRemotePair(t, f)
 	bk := peerKey(f.bKeys.Public())
 
 	res, err := a.send(context.Background(), SendArgs{From: "cli:terminal", To: "sam/web-codex", Body: retryBody, Wake: true})
@@ -153,6 +154,18 @@ func TestRemoteRetryKeepsRefusedRemoves(t *testing.T) {
 	if n := outboxLen(t, f.aStore, bk); n != 1 {
 		t.Fatalf("outbox holds %d after a retry ack, want 1", n)
 	}
+
+	// A's own presence gossip re-flushes B's whole queue on every round (daemon/directory.go's
+	// "it is reachable: flush its whole queue"), which would race with the assertions below by
+	// re-attempting the still-queued retry entry after B is paused. Wait for that background
+	// flushing to go idle, then stop A's gossip/outbox loop so no further round can start one.
+	waitUntil(t, 2*time.Second, "A's outbox flusher for B is idle", func() bool {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		_, dirty := a.dirty[bk]
+		return !dirty && !a.flushing[bk]
+	})
+	stopA()
 
 	b.paused.Store(true)
 	if r := sendOne(t, a, "cli:terminal", "sam/web-codex").Receipts[0]; r.State != message.StateRefused || r.Note != "paused" {
