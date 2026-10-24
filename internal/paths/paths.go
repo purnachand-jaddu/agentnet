@@ -59,9 +59,7 @@ func SocketDir() error {
 		return fmt.Errorf("%s: owned by uid %d, not %d", dir, stat.Uid, os.Getuid())
 	}
 	if st.Mode().Perm() != 0o700 {
-		if err := os.Chmod(dir, 0o700); err != nil {
-			return fmt.Errorf("chmod %s to 0700: %w", dir, err)
-		}
+		return fmt.Errorf("%s: mode %03o, want 0700", dir, st.Mode().Perm())
 	}
 	return nil
 }

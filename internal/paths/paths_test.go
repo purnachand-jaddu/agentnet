@@ -47,12 +47,14 @@ func TestEnsureCreatesPrivateDir(t *testing.T) {
 }
 
 func TestSocketDirPrivate(t *testing.T) {
-	long := filepath.Join(t.TempDir(), strings.Repeat("d", 120))
+	tmpdir := t.TempDir()
+	t.Setenv("TMPDIR", tmpdir)
+	long := filepath.Join(tmpdir, strings.Repeat("d", 120))
 	t.Setenv("AGENTNET_HOME", long)
 	if err := SocketDir(); err != nil {
 		t.Fatal(err)
 	}
-	sockDir := filepath.Join(os.TempDir(), "agentnet-"+strconv.Itoa(os.Getuid()))
+	sockDir := filepath.Join(tmpdir, "agentnet-"+strconv.Itoa(os.Getuid()))
 	st, err := os.Lstat(sockDir)
 	if err != nil {
 		t.Fatal(err)
@@ -66,18 +68,37 @@ func TestSocketDirPrivate(t *testing.T) {
 	}
 }
 
-func TestSocketDirRejectsWorldWritable(t *testing.T) {
-	long := filepath.Join(t.TempDir(), strings.Repeat("d", 120))
+func TestSocketDirRefusesLoosePerms(t *testing.T) {
+	tmpdir := t.TempDir()
+	t.Setenv("TMPDIR", tmpdir)
+	long := filepath.Join(tmpdir, strings.Repeat("d", 120))
 	t.Setenv("AGENTNET_HOME", long)
-	sockDir := filepath.Join(os.TempDir(), "agentnet-"+strconv.Itoa(os.Getuid()))
-	if err := os.MkdirAll(sockDir, 0o777); err != nil {
+	sockDir := filepath.Join(tmpdir, "agentnet-"+strconv.Itoa(os.Getuid()))
+	if err := os.MkdirAll(sockDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := SocketDir(); err != nil {
-		t.Fatalf("SocketDir should fix 0777 but got error: %v", err)
+	if err := os.Chmod(sockDir, 0o777); err != nil {
+		t.Fatal(err)
 	}
-	st, _ := os.Stat(sockDir)
-	if st.Mode().Perm() != 0o700 {
-		t.Fatalf("socket dir mode = %v after SocketDir, want 0700", st.Mode().Perm())
+	if err := SocketDir(); err == nil {
+		t.Fatal("SocketDir should refuse 0777 but succeeded")
+	}
+}
+
+func TestSocketDirRefusesSymlink(t *testing.T) {
+	tmpdir := t.TempDir()
+	t.Setenv("TMPDIR", tmpdir)
+	long := filepath.Join(tmpdir, strings.Repeat("d", 120))
+	t.Setenv("AGENTNET_HOME", long)
+	sockDir := filepath.Join(tmpdir, "agentnet-"+strconv.Itoa(os.Getuid()))
+	linkTarget := filepath.Join(tmpdir, "target")
+	if err := os.Mkdir(linkTarget, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(linkTarget, sockDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := SocketDir(); err == nil {
+		t.Fatal("SocketDir should refuse symlink but succeeded")
 	}
 }
