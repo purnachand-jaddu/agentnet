@@ -14,15 +14,16 @@ for you. Don't treat an approval as proof of informed consent; treat it as a rem
 
 ## What any local, same-user process can do
 
-The daemon's Unix socket lives under `paths.Home()` (`~/.agentnet` by default, mode 0700), so a
-different user on the same machine can't reach it. Any process running *as you*, agent or not,
-can:
+The daemon's Unix socket lives under `paths.Home()` (`~/.agentnet` by default, mode 0700) — or,
+when that path is too long for a Unix socket, under a `$TMPDIR/agentnet-<uid>` fallback directory
+that's created 0700 and checked to still be owned by you before use. Either way, a different user
+on the same machine can't reach it. Any process running *as you*, agent or not, can:
 
 - Dial the socket and call `send` with `From: "cli:terminal"`. That string is the daemon's own
   marker for "a human typed this at a prompt" — it bypasses the loop guard and the "only the
   terminal can message a group" restriction by design, because the daemon has no way to tell a
-  real terminal from a script that spoofs it. Only agentnet's own `agentnet send` CLI command
-  used to set this value; anything else on your machine can set it too.
+  real terminal from a script that spoofs it. Only agentnet's own `agentnet send` CLI command is
+  meant to set this value; anything else on your machine can set it too.
 - Call the `approve` and `refuse_person` IPC operations directly, with no consent check — the CLI
   (`agentnet approve`/`agentnet refuse`) asks for consent before calling them, but the daemon
   itself does not gate the operations. Consent for holds is enforced CLI-side only.
@@ -35,11 +36,18 @@ agentnet as you.
 Claude Code session messaging tokens (used to push a message into a live Claude session) are held
 in memory only, for as long as the daemon runs, and are never written to disk.
 
-A session identified only by its process id, with no agent-reported stable session id (the
-placeholder keys the daemon uses before an MCP or hook registration supplies a real one), does not
-carry mail forward to whatever process reuses that pid next. If that process exits and a new,
-unrelated one starts later, any mail addressed to the old placeholder is not handed to it — there
-is no linkage beyond the pid matching while the original process is still the one running.
+A session that never reports a stable id is tracked under a placeholder key tied to its process
+id (`proc:<pid>`), until an MCP or hook registration supplies a real one. The real limitation is
+the common case: if that process restarts, the new process gets a new pid and a new placeholder,
+and never sees the old one's unread mail — it's stranded under the old key.
+
+The rarer case cuts the other way, and is not currently guarded against: nothing clears a
+placeholder's mailbox when its session unregisters (`daemon/sessions.go`'s `unregister` only
+drops the in-memory `live` entry, not the stored mail). If the OS reuses that exact pid for an
+unrelated process before the old mail is read, and that process also registers under the same
+agent and pid, it can see the previous process's leftover unread mail. This is a real, not
+theoretical, leak path; it just requires the specific pid to be reused for the same agent name
+before anything else claims it.
 
 ## What's visible on the LAN
 
@@ -53,8 +61,8 @@ and presence update, an observer on the LAN can see:
 
 They cannot see the message body or any session content — bodies are HPKE-sealed
 (X25519 + HKDF-SHA256 + ChaCha20-Poly1305, RFC 9180) to the recipient's encryption key, and the
-seal's AAD binds it to both parties' signing keys so it can't be stripped and re-sent as someone
-else's message. What leaks is metadata: who is talking to whom, how often, and how much.
+HPKE info binds the seal to both parties' signing keys so it can't be stripped and re-sent as
+someone else's message. What leaks is metadata: who is talking to whom, how often, and how much.
 
 mDNS discovery broadcasts, in clear, on the local network: the machine's public signing key, an
 HMAC-derived tag of the team id (not the team id itself, but a fixed value per team so machines on
@@ -81,18 +89,27 @@ judgment). agentnet doesn't grant a sender any new capability on the receiver's 
 
 ## `install.sh`'s own trust chain
 
-`install.sh` is fetched from `main` over TLS (`curl -fsSL --proto '=https' ... | sh`) — that step
-trusts GitHub and your network path to it, same as any curl-pipe-to-shell installer. From there:
+`install.sh` is fetched from `main` over TLS
+(`curl -fsSL https://raw.githubusercontent.com/purnachand-jaddu/agentnet/main/install.sh | sh -s -- up`)
+— that step trusts GitHub and your network path to it, same as any curl-pipe-to-shell installer.
+From there:
 
 - the release archive's sha256 checksum is verified against `checksums.txt` from the same GitHub
   release — this proves the download wasn't corrupted or substituted *in transit*, but both files
   come from the same place, so it's integrity, not provenance;
-- if `gh` is installed, `install.sh` additionally runs `gh attestation verify` against the
-  archive, which checks GitHub's Sigstore-backed proof that the binary was built by this repo's
-  own release workflow — that's provenance. Without `gh`, you get integrity only.
+- if `gh` is installed and logged in, `install.sh` additionally runs `gh attestation verify`
+  against the archive, which checks GitHub's Sigstore-backed proof that the binary was built by
+  this repo's own release workflow — that's provenance. Without `gh` installed and logged in, you
+  get integrity only (and `install.sh` says so on stderr rather than failing).
 
 If you don't trust the network path or GitHub itself, don't pipe this to `sh`: download the
 release, verify it the same way by hand, or build from source.
+
+The release workflow publishes the archives and `checksums.txt` first, then runs the attestation
+step as a separate, later step. If attestation fails or the workflow is interrupted between the
+two, the release stays live with checksums but no attestation for a window of time — every
+`gh`-authenticated install during that window fails closed (checksum passes, attestation doesn't
+exist yet, so verification fails) rather than silently skipping the check.
 
 ## Reporting a vulnerability
 

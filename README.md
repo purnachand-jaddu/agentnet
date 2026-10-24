@@ -40,11 +40,12 @@ Every adapter ranks how a message can currently reach a session:
 |---|---|---|---|
 | **push** | its MCP connection is live, or its inbox socket is known | `codex queue --thread` while idle | never (pull only) |
 | **turn** | delivered via its next hook (SessionStart/UserPromptSubmit/PostToolUse/Stop) | delivered via hook while a turn is running | never |
-| **pull** | the session calls `check_inbox` | the session calls `check_inbox` | the session calls `check_inbox`, or a person runs `agentnet listen`/`agentnet who` |
+| **pull** | the session calls `check_inbox` | the session calls `check_inbox` | the session calls `check_inbox`, or a person runs `agentnet listen` |
 
 A session is addressed as `person/session[@machine]` (e.g. `alex/web-codex@laptop`); `person/*`
 addresses every live session for that person, and only the terminal (`cli:terminal`) may send to
-a group.
+a group. `agentnet who` lists every live session it knows of — local and remote — but doesn't read
+mail itself.
 
 ## Security model
 
@@ -74,7 +75,7 @@ a group.
 | `agentnet revoke <person\|key> [--founder-key path]` | founder only: cuts a member off the network |
 | `agentnet doctor` | read-only health report: daemon, service, team, peers, agent wiring, folders |
 | `agentnet send <to> <message...> [--fyi]` | sends a message as the terminal (`--fyi` doesn't wake the recipient) |
-| `agentnet who` | lists live sessions on this machine |
+| `agentnet who` | lists live sessions, local and remote |
 | `agentnet listen [--as name]` | registers a named mailbox and prints mail as it arrives |
 | `agentnet folder add\|remove\|list [path]` | opts a folder in or out of agentnet (defaults to the current directory) |
 | `agentnet held` | lists messages held pending approval |
@@ -119,11 +120,12 @@ signature against the team's founder key, exactly as with an mDNS-discovered pee
 
 ### Sessions without a stable id
 
-A session is first registered under a placeholder key tied to its process id, until its agent (an
-MCP connection or a hook) reports a real session id and the daemon rehomes its mail to that id. If
-a session never reports a stable id and its process exits, a later, unrelated process that
-happens to reuse the same pid does **not** inherit the earlier session's mail — the placeholder
-only tracks the process that was actually running, not the pid number in the abstract.
+A session is first registered under a placeholder key tied to its process id (`proc:<pid>`),
+until its agent (an MCP connection or a hook) reports a real session id and the daemon rehomes its
+mail to that id. If a session never reports a stable id and its process restarts, the new process
+gets a new pid and a new placeholder — it does not see the previous process's unread mail, which
+is stranded under the old `proc:<pid>` key. See `SECURITY.md` for what happens in the rarer case
+where the OS reuses that same pid for an unrelated process.
 
 ## Extending
 

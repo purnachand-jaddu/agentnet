@@ -8,8 +8,9 @@ service, not a relay. Two machines that have joined the same team talk directly 
 
 - **The daemon** (`agentnet daemon`, usually started by `agentnet setup`'s launchd/systemd
   service) holds everything in memory and in its sqlite store: the session registry, mailboxes,
-  the outbox, team state, and the LAN listener. It's the only process that touches the network or
-  the store.
+  the outbox, team state, and the LAN listener. It's the only process that touches the network.
+  The CLI opens the same sqlite store directly too, for commands that don't need the daemon
+  running (e.g. `init`/`join`/`admit`/`accept`/`revoke`, `agentnet up`'s status check).
 - **The MCP server** (`agentnet mcp`) is what Claude Code/Codex/any MCP client runs as a child
   process. It registers the calling session with the daemon and exposes three tools
   (`list_team`, `send_message`, `check_inbox`), dialing the daemon's socket (`ipc`) for each call.

@@ -1,8 +1,9 @@
 # Extending agentnet
 
-agentnet is built around five small interfaces. Each one has exactly one job, and swapping an
-implementation never touches the others. Every implementation is wired up in one place:
-`internal/cli/daemon.go`.
+agentnet is built around five small interfaces, plus `consent.Approver` for the human-in-the-loop
+boundary. Each one has exactly one job, and swapping an implementation never touches the others.
+The five daemon-facing interfaces are wired up in `internal/cli/daemon.go`; the approver is wired
+up in `internal/cli/cli.go`.
 
 ## `adapter.Adapter` — a coding agent
 
