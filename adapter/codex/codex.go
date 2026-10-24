@@ -75,7 +75,7 @@ func (a *Adapter) Channel(s adapter.Session, st adapter.State) adapter.Channel {
 
 // Push sends text to the session via codex queue command.
 func (a *Adapter) Push(ctx context.Context, s adapter.Session, text string) error {
-	return a.run(ctx, "codex", "queue", "--thread", s.ID, "--message", text)
+	return a.run(ctx, "codex", "queue", "--thread", s.ID, "--message="+text)
 }
 
 // HookOutput formats text for a hook event as JSON.
@@ -144,12 +144,12 @@ func (*Adapter) TurnRunning(s adapter.Session) (running, known bool) {
 	return TurnRunning(s.Transcript)
 }
 
-// ExecRunner runs a command with exec.CommandContext, capturing stderr.
+// ExecRunner runs a command with exec.CommandContext, capturing output.
 func ExecRunner(ctx context.Context, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
-	stderr, err := cmd.CombinedOutput()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("%s: %w: %s", name, err, strings.TrimSpace(string(stderr)))
+		return fmt.Errorf("%s: %w: %s", name, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

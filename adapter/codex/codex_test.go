@@ -19,7 +19,7 @@ func TestPushRunsCodexQueueWithArgv(t *testing.T) {
 	if err := a.Push(context.Background(), adapter.Session{ID: "th-1"}, `x"; rm -rf ~`); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"codex", "queue", "--thread", "th-1", "--message", `x"; rm -rf ~`}
+	want := []string{"codex", "queue", "--thread", "th-1", "--message=" + `x"; rm -rf ~`}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("argv = %q", got)
 	}
