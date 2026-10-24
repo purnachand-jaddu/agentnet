@@ -22,23 +22,40 @@ type testEnv struct {
 	allowed func(string) bool
 }
 
+// testAdapters is the daemon-side adapter registry shared by every test in this package.
+// Beyond the plain generic adapter, it carries claude.New() (so a claude-code session can be
+// registered and pushed to) and the two fake adapters below (so assignName can name their
+// placeholder/attached sessions): none of this affects the plain generic-adapter tests, since
+// none of them set CLAUDE_CODE_SESSION_ID or declare an MCP client name those fakes claim.
+func testAdapters() *adapter.Registry {
+	return adapter.NewRegistry(
+		generic.WithEnv("mcp", "AGENTNET_TEST_SESSION"),
+		claude.New(),
+		newFakeMultiplexedAdapter(),
+		newFakeMetaAdapter(),
+	)
+}
+
+// newTestDaemon builds a daemon.Daemon with a fresh in-memory store and the shared test registry.
+func newTestDaemon(t *testing.T, allowed func(string) bool) *daemon.Daemon {
+	return daemon.New(daemon.Options{
+		Person:        "alex",
+		Machine:       "mbp",
+		Store:         storetest.SQLite(t),
+		Adapters:      testAdapters(),
+		FolderAllowed: allowed,
+		Now:           time.Now,
+		Log:           t.Logf,
+	})
+}
+
 // startDaemon runs a real daemon behind a short Unix socket for the life of the test.
 func startDaemon(t *testing.T) *testEnv {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
 	env := &testEnv{allowed: func(string) bool { return true }}
-	d := daemon.New(daemon.Options{
-		Person:  "alex",
-		Machine: "mbp",
-		Store:   storetest.SQLite(t),
-		// claude.New() is here too (beyond the brief's bare generic registry) so a
-		// claude-code session can be registered and pushed to in the push-loop test.
-		Adapters:      adapter.NewRegistry(generic.WithEnv("mcp", "AGENTNET_TEST_SESSION"), claude.New()),
-		FolderAllowed: func(dir string) bool { return env.allowed(dir) },
-		Now:           time.Now,
-		Log:           t.Logf,
-	})
+	d := newTestDaemon(t, func(dir string) bool { return env.allowed(dir) })
 
 	dir, err := os.MkdirTemp("/tmp", "an")
 	if err != nil {
@@ -81,4 +98,30 @@ func connect(t *testing.T, ctx context.Context, o Options) *mcp.ClientSession {
 	}
 	t.Cleanup(func() { cs.Close() })
 	return cs
+}
+
+// fakeMultiplexedAdapter is a minimal multiplexed test adapter (no push capability, pull tier),
+// selected via FromClient because connect's client always declares itself as "test-client".
+type fakeMultiplexedAdapter struct{ *generic.Adapter }
+
+func newFakeMultiplexedAdapter() *fakeMultiplexedAdapter {
+	return &fakeMultiplexedAdapter{Adapter: generic.WithEnv("fakemux", "")}
+}
+func (f *fakeMultiplexedAdapter) Multiplexed() bool     { return true }
+func (f *fakeMultiplexedAdapter) ClientNames() []string { return []string{"test-client"} }
+
+// fakeMetaAdapter is a multiplexed test adapter whose session id always comes from the call's
+// _meta, to prove meta-id resolution takes priority over an attach call.
+type fakeMetaAdapter struct{ *generic.Adapter }
+
+func newFakeMetaAdapter() *fakeMetaAdapter {
+	return &fakeMetaAdapter{Adapter: generic.WithEnv("fakemeta", "")}
+}
+func (f *fakeMetaAdapter) Multiplexed() bool     { return true }
+func (f *fakeMetaAdapter) ClientNames() []string { return []string{"test-client"} }
+func (f *fakeMetaAdapter) MetaSessionID(meta map[string]any) string {
+	if v, ok := meta["session_id"].(string); ok {
+		return v
+	}
+	return ""
 }

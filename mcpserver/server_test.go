@@ -3,10 +3,13 @@ package mcpserver
 import (
 	"bufio"
 	"context"
+	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,10 +17,61 @@ import (
 	"github.com/purnachand-jaddu/agentnet/adapter"
 	"github.com/purnachand-jaddu/agentnet/adapter/claude"
 	"github.com/purnachand-jaddu/agentnet/adapter/generic"
+	"github.com/purnachand-jaddu/agentnet/daemon"
 	"github.com/purnachand-jaddu/agentnet/ipc"
 )
 
 func text(r *mcp.CallToolResult) string { return r.Content[0].(*mcp.TextContent).Text }
+
+// startFakeInbox runs a fake Claude inbox listener on a short Unix socket, returning its path
+// and a channel of every line (frame) it receives.
+func startFakeInbox(t *testing.T) (sock string, lines chan string) {
+	dir, err := os.MkdirTemp("/tmp", "an")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock = filepath.Join(dir, "inbox.sock")
+
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	lines = make(chan string, 8)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				sc := bufio.NewScanner(c)
+				for sc.Scan() {
+					lines <- sc.Text()
+				}
+			}(c)
+		}
+	}()
+	return sock, lines
+}
+
+// waitForUserFrame blocks until lines produces a `"type":"user"` frame, or fails the test.
+func waitForUserFrame(t *testing.T, lines chan string, timeout time.Duration) {
+	deadline := time.After(timeout)
+	for {
+		select {
+		case line := <-lines:
+			if strings.Contains(line, `"type":"user"`) {
+				return
+			}
+		case <-deadline:
+			t.Fatal("inbox listener never received a user frame")
+		}
+	}
+}
 
 func TestSendAndReceiveBetweenTwoMCPSessions(t *testing.T) {
 	ctx := context.Background()
@@ -79,36 +133,7 @@ func TestSendToUnknownSessionIsToolError(t *testing.T) {
 func TestPushToClaudeInbox(t *testing.T) {
 	ctx := context.Background()
 	env := startDaemon(t)
-
-	dir, err := os.MkdirTemp("/tmp", "an")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
-	inboxSock := filepath.Join(dir, "inbox.sock")
-
-	ln, err := net.Listen("unix", inboxSock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { ln.Close() })
-
-	lines := make(chan string, 8)
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				sc := bufio.NewScanner(c)
-				for sc.Scan() {
-					lines <- sc.Text()
-				}
-			}(c)
-		}
-	}()
+	inboxSock, lines := startFakeInbox(t)
 
 	bOpts := Options{
 		Dial:     func() (*ipc.Client, error) { return ipc.Dial(env.sock) },
@@ -135,20 +160,9 @@ func TestPushToClaudeInbox(t *testing.T) {
 		t.Fatalf("send: %v %+v", err, res)
 	}
 
-	deadline := time.After(5 * time.Second)
-	for {
-		select {
-		case line := <-lines:
-			if strings.Contains(line, `"type":"user"`) {
-				goto delivered
-			}
-		case <-deadline:
-			t.Fatal("inbox listener never received a user frame")
-		}
-	}
-delivered:
+	waitForUserFrame(t, lines, 5*time.Second)
 
-	deadline = time.After(5 * time.Second)
+	deadline := time.After(5 * time.Second)
 	for {
 		got, err := b.CallTool(ctx, &mcp.CallToolParams{Name: "list_team"})
 		if err != nil {
@@ -162,5 +176,290 @@ delivered:
 			t.Fatalf("message still unread: %q", text(got))
 		case <-time.After(50 * time.Millisecond):
 		}
+	}
+}
+
+// TestProcPlaceholderReverseJoinsWithHook: a generic client with no env id registers under a
+// bare "proc:<ppid>" key (not "<adapter>:proc:<ppid>" — the daemon only recognises a
+// placeholder by that exact key prefix). A hook register with the same PID must then fold it
+// into one session instead of leaving two live entries behind.
+func TestProcPlaceholderReverseJoinsWithHook(t *testing.T) {
+	ctx := context.Background()
+	env := startDaemon(t)
+	const ppid = 4242
+
+	opts := Options{
+		Dial:      func() (*ipc.Client, error) { return ipc.Dial(env.sock) },
+		Adapters:  adapter.NewRegistry(generic.WithEnv("mcp", "AGENTNET_TEST_SESSION")),
+		Getenv:    func(string) string { return "" },
+		Cwd:       "/src/a",
+		ParentPID: ppid,
+	}
+	a := connect(t, ctx, opts)
+	if _, err := a.CallTool(ctx, &mcp.CallToolParams{Name: "list_team"}); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := ipc.Dial(env.sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	var hr daemon.HookResult
+	err = c.Call(ctx, "hook", daemon.HookArgs{Agent: "mcp", Event: adapter.EventStart, SessionID: "s1", Cwd: "/src/a", PID: ppid}, &hr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var who daemon.WhoResult
+	if err := c.Call(ctx, "who", daemon.WhoArgs{}, &who); err != nil {
+		t.Fatal(err)
+	}
+	if len(who.Sessions) != 1 {
+		t.Fatalf("want 1 joined session, got %d: %+v", len(who.Sessions), who.Sessions)
+	}
+}
+
+// TestClaudeSessionReResolvesAfterRegistryChange: Claude's session id is re-read from the
+// registry file every call, not cached for the process lifetime. When it changes (as after
+// /clear), the new call must register the new id and drop the stale one.
+func TestClaudeSessionReResolvesAfterRegistryChange(t *testing.T) {
+	ctx := context.Background()
+	env := startDaemon(t)
+
+	dir := t.TempDir()
+	const ppid = 5151
+	writeRegistry := func(sessionID string) {
+		b, _ := json.Marshal(map[string]any{"sessionId": sessionID})
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%d.json", ppid)), b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeRegistry("old")
+
+	opts := Options{
+		Dial:     func() (*ipc.Client, error) { return ipc.Dial(env.sock) },
+		Adapters: adapter.NewRegistry(claude.New()),
+		// A nonzero CLAUDE_CODE_SESSION_ID only picks the claude-code adapter (via FromEnv);
+		// the registry file above always wins for the actual id, per resolveClaudeSession.
+		Getenv: func(k string) string {
+			if k == "CLAUDE_CODE_SESSION_ID" {
+				return "env-placeholder"
+			}
+			return ""
+		},
+		Cwd:       "/src/c",
+		ParentPID: ppid,
+		ClaudeDir: dir,
+	}
+	c := connect(t, ctx, opts)
+	if _, err := c.CallTool(ctx, &mcp.CallToolParams{Name: "list_team"}); err != nil {
+		t.Fatal(err)
+	}
+
+	writeRegistry("new")
+
+	a := connect(t, ctx, env.options("A", "/src/a"))
+	if _, err := a.CallTool(ctx, &mcp.CallToolParams{Name: "list_team"}); err != nil {
+		t.Fatal(err)
+	}
+	sres, err := c.CallTool(ctx, &mcp.CallToolParams{Name: "send_message", Arguments: map[string]any{"to": "alex/a-mcp", "message": "hi after clear"}})
+	if err != nil || sres.IsError {
+		t.Fatalf("send: %v %+v", err, sres)
+	}
+
+	got, err := a.CallTool(ctx, &mcp.CallToolParams{Name: "check_inbox", Arguments: map[string]any{"wait_secs": 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// the new claude session reclaims the "c-claude" name freed by unregistering the old one.
+	if !strings.Contains(text(got), "alex/c-claude") {
+		t.Fatalf("expected send from the re-resolved session, got %q", text(got))
+	}
+
+	var who daemon.WhoResult
+	raw, err := ipc.Dial(env.sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if err := raw.Call(ctx, "who", daemon.WhoArgs{}, &who); err != nil {
+		t.Fatal(err)
+	}
+	claudeSessions := 0
+	for _, s := range who.Sessions {
+		if s.Agent == "claude-code" {
+			claudeSessions++
+		}
+	}
+	if claudeSessions != 1 {
+		t.Fatalf("want exactly 1 live claude-code session after re-resolving, got %d: %+v", claudeSessions, who.Sessions)
+	}
+}
+
+// TestMultiplexedAttachFailureFallsBackToPlaceholder: a multiplexed adapter with no meta id
+// and no attachable session must not error on every call; it falls back to a placeholder.
+func TestMultiplexedAttachFailureFallsBackToPlaceholder(t *testing.T) {
+	ctx := context.Background()
+	env := startDaemon(t)
+	opts := Options{
+		Dial:      func() (*ipc.Client, error) { return ipc.Dial(env.sock) },
+		Adapters:  adapter.NewRegistry(newFakeMultiplexedAdapter()),
+		Getenv:    func(string) string { return "" },
+		Cwd:       "/src/fm",
+		ParentPID: 9001,
+	}
+	c := connect(t, ctx, opts)
+	for i := 0; i < 2; i++ {
+		res, err := c.CallTool(ctx, &mcp.CallToolParams{Name: "list_team"})
+		if err != nil || res.IsError {
+			t.Fatalf("call %d: %v %+v", i, err, res)
+		}
+	}
+}
+
+// TestMetaSessionIDTakesPriorityOverAttach: a multiplexed adapter given a meta session id must
+// use it directly rather than calling attach (which would fail: nothing is attachable here).
+func TestMetaSessionIDTakesPriorityOverAttach(t *testing.T) {
+	ctx := context.Background()
+	env := startDaemon(t)
+	opts := Options{
+		Dial:      func() (*ipc.Client, error) { return ipc.Dial(env.sock) },
+		Adapters:  adapter.NewRegistry(newFakeMetaAdapter()),
+		Getenv:    func(string) string { return "" },
+		Cwd:       "/src/meta",
+		ParentPID: 9002,
+	}
+	c := connect(t, ctx, opts)
+	res, err := c.CallTool(ctx, &mcp.CallToolParams{Name: "list_team", Meta: mcp.Meta{"session_id": "m1"}})
+	if err != nil || res.IsError {
+		t.Fatalf("call: %v %+v", err, res)
+	}
+	if !strings.Contains(text(res), "← you") {
+		t.Fatalf("expected the meta-resolved session to show itself: %q", text(res))
+	}
+
+	res2, err := c.CallTool(ctx, &mcp.CallToolParams{Name: "list_team", Meta: mcp.Meta{"session_id": "m1"}})
+	if err != nil || res2.IsError {
+		t.Fatalf("call2: %v %+v", err, res2)
+	}
+	if text(res) != text(res2) {
+		t.Fatalf("expected a stable single session across calls with the same meta id: first=%q second=%q", text(res), text(res2))
+	}
+}
+
+// TestProactiveRedialAfterDaemonRestart: the push loop notices a dead connection on its own
+// (no tool call involved) and reconnects to a fresh daemon on the same socket path, replaying
+// its registration so a push still reaches the fake Claude inbox.
+func TestProactiveRedialAfterDaemonRestart(t *testing.T) {
+	ctx := context.Background()
+
+	dir, err := os.MkdirTemp("/tmp", "an")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "s.sock")
+
+	ctx1, cancel1 := context.WithCancel(ctx)
+	d1 := newTestDaemon(t, func(string) bool { return true })
+	l1, err := ipc.Listen(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go ipc.Serve(ctx1, l1, d1.Handle, d1.ConnClosed)
+
+	inboxSock, lines := startFakeInbox(t)
+
+	var mu sync.Mutex
+	var lastClient *ipc.Client
+	dial := func() (*ipc.Client, error) {
+		c, err := ipc.Dial(sock)
+		if err != nil {
+			return nil, err
+		}
+		mu.Lock()
+		lastClient = c
+		mu.Unlock()
+		return c, nil
+	}
+
+	bOpts := Options{
+		Dial:     dial,
+		Adapters: adapter.NewRegistry(claude.New(), generic.WithEnv("mcp", "AGENTNET_TEST_SESSION")),
+		Getenv: func(k string) string {
+			switch k {
+			case "CLAUDE_CODE_SESSION_ID":
+				return "B"
+			case "CLAUDE_CODE_MESSAGING_SOCKET":
+				return inboxSock
+			}
+			return ""
+		},
+		Cwd: "/src/b",
+	}
+	b := connect(t, ctx, bOpts)
+	if _, err := b.CallTool(ctx, &mcp.CallToolParams{Name: "list_team"}); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	c1 := lastClient
+	mu.Unlock()
+
+	// Simulate a daemon restart: kill daemon #1's listener and B's live connection to it,
+	// then start daemon #2 on the same socket path.
+	cancel1()
+	l1.Close()
+	c1.Close()
+
+	ctx2, cancel2 := context.WithCancel(ctx)
+	t.Cleanup(cancel2)
+	d2 := newTestDaemon(t, func(string) bool { return true })
+	l2, err := ipc.Listen(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go ipc.Serve(ctx2, l2, d2.Handle, d2.ConnClosed)
+
+	// Poll daemon #2 directly (never through a tool call on b) until B reappears on its own.
+	raw, err := ipc.Dial(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	deadline := time.After(5 * time.Second)
+poll:
+	for {
+		var who daemon.WhoResult
+		if err := raw.Call(ctx, "who", daemon.WhoArgs{}, &who); err == nil {
+			for _, s := range who.Sessions {
+				if s.Agent == "claude-code" {
+					break poll
+				}
+			}
+		}
+		select {
+		case <-deadline:
+			t.Fatal("B never reappeared on the new daemon without a tool call")
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+
+	env2 := &testEnv{sock: sock}
+	a := connect(t, ctx, env2.options("A", "/src/a"))
+	res, err := a.CallTool(ctx, &mcp.CallToolParams{Name: "send_message", Arguments: map[string]any{"to": "alex/b-claude", "message": "after restart"}})
+	if err != nil || res.IsError {
+		t.Fatalf("send: %v %+v", err, res)
+	}
+	waitForUserFrame(t, lines, 5*time.Second)
+}
+
+// TestDefaultLoggerIsStderr: Options.Logger defaults to a non-nil stderr logger, so
+// check_inbox's "delivered" error logging never panics on a nil logger.
+func TestDefaultLoggerIsStderr(t *testing.T) {
+	sm := newSessionManager(context.Background(), Options{})
+	if sm.o.Logger == nil {
+		t.Fatal("expected a default logger")
 	}
 }

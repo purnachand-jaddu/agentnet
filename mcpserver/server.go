@@ -5,6 +5,8 @@ package mcpserver
 import (
 	"context"
 	"fmt"
+	"log"
+	"os"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -19,9 +21,13 @@ type Options struct {
 	Adapters  *adapter.Registry
 	Getenv    func(string) string
 	Cwd       string
-	ParentPID int    // os.Getppid(): the agent process
-	ClaudeDir string // ~/.claude/sessions, for the undocumented fallback
+	ParentPID int         // os.Getppid(): the agent process
+	ClaudeDir string      // ~/.claude/sessions, for the undocumented fallback
+	Logger    *log.Logger // defaults to stderr; never stdout, which is the MCP stream
 }
+
+// defaultLogger writes to stderr, since stdout carries the MCP protocol stream.
+func defaultLogger() *log.Logger { return log.New(os.Stderr, "agentnet-mcp: ", 0) }
 
 // ListArgs is the list_team tool's arguments.
 type ListArgs struct {
@@ -42,7 +48,7 @@ type InboxArgs struct {
 
 // Run starts the agentnet MCP server on t and blocks until the client disconnects or ctx is done.
 func Run(ctx context.Context, t mcp.Transport, o Options) error {
-	sm := newSessionManager(o)
+	sm := newSessionManager(ctx, o)
 	s := mcp.NewServer(&mcp.Implementation{Name: "agentnet", Version: "0.1.0"}, &mcp.ServerOptions{Instructions: instructions})
 
 	mcp.AddTool(s, &mcp.Tool{Name: "list_team", Description: "List the other agentnet sessions on this machine"}, sm.listTeam)
@@ -116,7 +122,9 @@ func (sm *sessionManager) checkInbox(ctx context.Context, req *mcp.CallToolReque
 		text = "No messages."
 	}
 	if len(res.IDs) > 0 {
-		sm.call(ctx, "delivered", daemon.DeliveredArgs{Key: key, IDs: res.IDs}, nil)
+		if err := sm.call(ctx, "delivered", daemon.DeliveredArgs{Key: key, IDs: res.IDs}, nil); err != nil {
+			sm.o.Logger.Printf("delivered %v: %v", res.IDs, err)
+		}
 	}
 	return textResult(text), nil, nil
 }
