@@ -2,6 +2,7 @@ package claude
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"net"
 	"os"
@@ -125,5 +126,23 @@ newline`
 	}
 	if result["reason"] != text {
 		t.Fatalf("reason mismatch: got %q, want %q", result["reason"], text)
+	}
+}
+
+func TestInboxFromEnv(t *testing.T) {
+	t.Setenv("CLAUDE_CODE_MESSAGING_SOCKET", "/tmp/sock")
+	t.Setenv("CLAUDE_CODE_MESSAGING_TOKEN", "tok123")
+	sock, tok := InboxFromEnv(os.Getenv)
+	if sock != "/tmp/sock" || tok != "tok123" {
+		t.Fatalf("got %q %q", sock, tok)
+	}
+}
+
+func TestPostInboxContextCancelledReturnsError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := PostInboxContext(ctx, "/tmp/nonexistent.sock", "tok", "text")
+	if err == nil {
+		t.Fatal("cancelled context should return error")
 	}
 }

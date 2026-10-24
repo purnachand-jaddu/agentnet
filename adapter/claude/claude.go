@@ -1,3 +1,4 @@
+// Package claude is the Claude Code adapter: inbox-socket push, hook output and session lookup.
 package claude
 
 import (
@@ -51,7 +52,7 @@ func (*Adapter) Channel(s adapter.Session, st adapter.State) adapter.Channel {
 
 // Push sends text to the session's inbox socket with its own token.
 func (*Adapter) Push(ctx context.Context, s adapter.Session, text string) error {
-	return PostInbox(s.Inbox, s.InboxToken, text)
+	return PostInboxContext(ctx, s.Inbox, s.InboxToken, text)
 }
 
 // HookOutput formats text for a hook event as JSON.
@@ -115,17 +116,30 @@ func (a *Adapter) Tier(s adapter.Session, st adapter.State) adapter.Tier {
 // ClientNames reports the MCP client names this adapter serves.
 func (*Adapter) ClientNames() []string { return []string{"claude-code"} }
 
-// PostInbox dials the inbox socket, writes auth and user frames, and closes.
-func PostInbox(socket string, token string, text string) error {
+// InboxFromEnv returns the inbox socket and token from environment variables.
+func InboxFromEnv(getenv func(string) string) (socket, token string) {
+	return getenv("CLAUDE_CODE_MESSAGING_SOCKET"), getenv("CLAUDE_CODE_MESSAGING_TOKEN")
+}
+
+// PostInboxContext dials the inbox socket using the provided context and writes frames.
+func PostInboxContext(ctx context.Context, socket string, token string, text string) error {
 	if socket == "" {
 		return fmt.Errorf("empty socket path")
 	}
-	conn, err := net.DialTimeout("unix", socket, 5*time.Second)
+	d := net.Dialer{Timeout: 5 * time.Second}
+	conn, err := d.DialContext(ctx, "unix", socket)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+
+	deadline := time.Now().Add(5 * time.Second)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	if err := conn.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
 
 	if token != "" {
 		authFrame := map[string]any{
@@ -148,6 +162,11 @@ func PostInbox(socket string, token string, text string) error {
 	b, _ := json.Marshal(userFrame)
 	_, err = conn.Write(append(b, '\n'))
 	return err
+}
+
+// PostInbox dials the inbox socket, writes auth and user frames, and closes.
+func PostInbox(socket string, token string, text string) error {
+	return PostInboxContext(context.Background(), socket, token, text)
 }
 
 // Compile-time check that Adapter implements adapter.Adapter and adapter.ClientNamer.
