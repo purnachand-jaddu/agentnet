@@ -97,12 +97,12 @@ func (d *Daemon) sendRemote(ctx context.Context, tg target, msg message.Message)
 		return r, true
 	}
 	r.State, r.Note, _ = d.attempt(ctx, cert, msg)
+	d.audit("out", msg.ID, msg.From, msg.To, r.State, msg.Body)
 	return r, true
 }
 
 // attempt sends queued msg to cert once, removing it from the outbox unless no valid ack came back or the ack says retry. Caller holds the peer's lock.
 func (d *Daemon) attempt(ctx context.Context, cert identity.Cert, msg message.Message) (st message.State, note string, done bool) {
-	defer func() { d.audit("out", msg.ID, msg.From, msg.To, st, msg.Body) }()
 	payload, err := json.Marshal(msg)
 	if err != nil {
 		d.opts.Log("daemon: encode message %s: %v", msg.ID, err)
@@ -242,7 +242,11 @@ func (d *Daemon) flushPeer(ctx context.Context, peer string, cutoff time.Time) {
 		return
 	}
 	for _, m := range msgs[:min(len(msgs), outboxBatch)] {
-		if st, _, done := d.attempt(ctx, cert, m); !done && st != message.StateRetry {
+		st, _, done := d.attempt(ctx, cert, m)
+		if done {
+			d.audit("out", m.ID, m.From, m.To, st, m.Body) // the first attempt was audited by sendRemote; retries only on the final outcome
+		}
+		if !done && st != message.StateRetry {
 			return // no valid ack: the rest would fail the same way
 		}
 	}

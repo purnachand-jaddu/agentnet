@@ -6,14 +6,18 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/purnachand-jaddu/agentnet/adapter"
 	"github.com/purnachand-jaddu/agentnet/config"
+	"github.com/purnachand-jaddu/agentnet/envelope"
 	"github.com/purnachand-jaddu/agentnet/identity"
 	"github.com/purnachand-jaddu/agentnet/message"
 	"github.com/purnachand-jaddu/agentnet/store"
@@ -279,5 +283,100 @@ func TestAuditInboundPreDecryptionRefusalHasReasonNoBody(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "body_sha256") {
 		t.Fatal("audit line includes body_sha256 for a pre-decryption refusal")
+	}
+}
+
+// logLines captures d's log lines.
+func logLines(d *Daemon) func() []string {
+	var mu sync.Mutex
+	var lines []string
+	d.opts.Log = func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		lines = append(lines, fmt.Sprintf(format, args...))
+	}
+	return func() []string { mu.Lock(); defer mu.Unlock(); return slices.Clone(lines) }
+}
+
+// An unverified cert.machine with a newline must not forge a line in daemon.log.
+func TestRefusalLogQuotesUnverifiedMachine(t *testing.T) {
+	f := newTeamFixture(t)
+	b := newB(t, f, 0)
+	lines := logLines(b.d)
+	for _, kind := range []string{"msg", "presence"} {
+		e := sealMsg(t, f.aKeys, f.aTeam.Self, f.bTeam.Self, newMsg("alex/terminal", "sam/web-codex"))
+		e.Kind = kind
+		e.Cert.Machine = "mbp\nFORGED"
+		b.d.refusedAt = time.Time{} // let each refusal through the once-a-minute limit
+		if ack := handle(t, f, b, e); ack.State != message.StateRefused {
+			t.Fatalf("%s: ack %+v, want refused", kind, ack)
+		}
+	}
+	got := lines()
+	if len(got) != 2 {
+		t.Fatalf("log = %q, want 2 lines", got)
+	}
+	for _, l := range got {
+		if strings.Contains(l, "\nFORGED") {
+			t.Fatalf("log line carries a raw newline: %q", l)
+		}
+	}
+}
+
+// Refused envelopes are logged and audited at most once a minute; the next report counts the ones skipped.
+func TestRefusalsLoggedAndAuditedOncePerMinute(t *testing.T) {
+	f := newTeamFixture(t)
+	au, path := newAuditor(t)
+	b := newB(t, f, 0)
+	b.d.opts.Auditor = au
+	lines := logLines(b.d)
+	clk := &fakeClock{now: time.Now()}
+	b.d.opts.Now = clk.Now
+	garbage := func() envelope.Envelope {
+		e := sealMsg(t, f.aKeys, f.aTeam.Self, f.bTeam.Self, newMsg("alex/terminal", "sam/web-codex"))
+		e.Sig[0] ^= 1
+		return e
+	}
+	for range 5 {
+		handle(t, f, b, garbage())
+	}
+	if n := len(readAudit(t, path)); n != 1 {
+		t.Fatalf("audit lines = %d, want 1", n)
+	}
+	if n := len(lines()); n != 1 {
+		t.Fatalf("log lines = %q, want 1", lines())
+	}
+	clk.Set(clk.Now().Add(time.Minute + time.Second))
+	handle(t, f, b, garbage())
+	entries := readAudit(t, path)
+	if len(entries) != 2 || !strings.Contains(entries[1].Reason, "4 more") {
+		t.Fatalf("entries = %+v, want a second one counting 4 skipped", entries)
+	}
+	if l := lines(); len(l) != 2 || !strings.Contains(l[1], "4 more") {
+		t.Fatalf("log = %q, want a second line counting 4 skipped", l)
+	}
+}
+
+// Outbox retries that still fail are not audited; the final outcome is.
+func TestAuditRetriesOnlyFinalOutcome(t *testing.T) {
+	f := newTeamFixture(t)
+	au, path := newAuditor(t)
+	aPort, bPort := freePort(t), freePort(t)
+	a := idleA(t, f, lanAddr(bPort)) // B isn't listening yet
+	a.opts.Auditor = au
+	bk := peerKey(f.bKeys.Public())
+	m := queue(t, f.aStore, bk, "later", time.Now().Add(-time.Minute))
+
+	for range 3 {
+		a.flushPeer(context.Background(), bk, time.Now())
+	}
+	if entries := readAudit(t, path); len(entries) != 0 {
+		t.Fatalf("failed retries audited: %+v", entries)
+	}
+	startB(t, f, bPort, aPort)
+	a.flushPeer(context.Background(), bk, time.Now())
+	entries := readAudit(t, path)
+	if len(entries) != 1 || entries[0].ID != m.ID || entries[0].State != message.StateQueued {
+		t.Fatalf("entries = %+v, want one final outcome for %s", entries, m.ID)
 	}
 }

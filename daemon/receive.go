@@ -31,17 +31,42 @@ const (
 func (d *Daemon) receiveMsg(e envelope.Envelope) (message.State, string) {
 	m, to, err := d.openMsg(e)
 	if err != nil {
-		d.opts.Log("daemon: refused message from %s: %v", e.Cert.Machine, err)
 		if errors.Is(err, envelope.ErrClockSkew) { // signature already verified; a real time-window miss
 			d.recordTimeRefusal(peerKey(e.Cert.Key))
 		}
 		reason := publicReason(err)
-		d.auditRefused(e.ID, peerKey(e.Cert.Key), reason)
+		if skipped, ok := d.refusalDue(); ok {
+			d.opts.Log("daemon: refused message from %q: %v%s", e.Cert.Machine, err, skippedNote(skipped))
+			d.auditRefused(e.ID, peerKey(e.Cert.Key), reason+skippedNote(skipped))
+		}
 		return message.StateRefused, reason
 	}
 	st, note := d.admitMsg(e.Cert, m, to)
 	d.audit("in", m.ID, m.From, m.To, st, m.Body)
 	return st, note
+}
+
+// refusalDue reports whether a refused envelope may be logged now (the first each minute), and how many were skipped before it.
+// ponytail: one limit for all senders, since the source IP isn't visible here and the claimed key is forgeable.
+func (d *Daemon) refusalDue() (skipped int, ok bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := d.opts.Now()
+	if now.Sub(d.refusedAt) < time.Minute {
+		d.refusedSkipped++
+		return 0, false
+	}
+	skipped = d.refusedSkipped
+	d.refusedAt, d.refusedSkipped = now, 0
+	return skipped, true
+}
+
+// skippedNote is the suffix telling a log or audit reader how many refusals weren't recorded before this one.
+func skippedNote(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (%d more refused since the last one recorded)", n)
 }
 
 // openMsg verifies e (without the in-memory replay set), decodes its message and checks it against the envelope and sender cert.

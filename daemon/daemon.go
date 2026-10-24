@@ -85,12 +85,14 @@ type Daemon struct {
 	unsaved      atomic.Bool                // a merged team change hasn't reached the store yet
 	netWG        sync.WaitGroup             // network goroutines Run waits for
 
-	sendMu   map[string]*sync.Mutex // per-peer lock serialising message sends; guarded by mu
-	flushing map[string]bool        // peers with a flusher running; guarded by mu
-	dirty    map[string]time.Time   // peers with a flush requested, and the newest cutoff asked for; guarded by mu
-	kick     chan struct{}          // wakes the outbox loop to start flushers for dirty peers
-	rate     map[string][]time.Time // recent incoming message times per sender peerKey; guarded by mu
-	admitMu  [64]sync.Mutex         // admission locks for incoming messages, sharded by id hash; taken before mu, never inside it
+	sendMu         map[string]*sync.Mutex // per-peer lock serialising message sends; guarded by mu
+	flushing       map[string]bool        // peers with a flusher running; guarded by mu
+	dirty          map[string]time.Time   // peers with a flush requested, and the newest cutoff asked for; guarded by mu
+	kick           chan struct{}          // wakes the outbox loop to start flushers for dirty peers
+	rate           map[string][]time.Time // recent incoming message times per sender peerKey; guarded by mu
+	refusedAt      time.Time              // when a refused envelope was last logged; guarded by mu
+	refusedSkipped int                    // refused envelopes not logged since refusedAt; guarded by mu
+	admitMu        [64]sync.Mutex         // admission locks for incoming messages, sharded by id hash; taken before mu, never inside it
 
 	policyMu sync.RWMutex // guards a policy change against admission still mid-flight under the old policy
 }

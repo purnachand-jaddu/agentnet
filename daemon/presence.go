@@ -278,7 +278,9 @@ func (d *Daemon) handleEnvelope(_ context.Context, e envelope.Envelope) envelope
 	switch e.Kind {
 	case "presence":
 		if err := d.receivePresence(e); err != nil {
-			d.opts.Log("daemon: refused presence from %s: %v", e.Cert.Machine, err)
+			if skipped, ok := d.refusalDue(); ok {
+				d.opts.Log("daemon: refused presence from %q: %v%s", e.Cert.Machine, err, skippedNote(skipped))
+			}
 			ack.State, ack.Note = message.StateRefused, publicReason(err)
 		}
 	case "msg":
