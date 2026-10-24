@@ -3,6 +3,7 @@ package envelope
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"strings"
 	"testing"
 	"time"
 
@@ -261,7 +262,7 @@ func TestSealedWithDifferentInfoFailsToOpen(t *testing.T) {
 	s := seal.HPKE{}
 
 	id := message.NewID()
-	wrongInfo := []byte("agentnet/v1/presence/" + id) // envelope below will claim kind "msg" for the same id
+	wrongInfo := sealInfo("presence", id, a.cert.Key, b.cert.Key) // envelope below will claim kind "msg" for the same id
 	sealed, err := s.Seal(b.cert.Enc, wrongInfo, []byte("hello"))
 	if err != nil {
 		t.Fatal(err)
@@ -293,5 +294,103 @@ func TestVerifyAck(t *testing.T) {
 	}
 	if err := VerifyAck(ack, c.cert, id); err == nil {
 		t.Fatal("VerifyAck should reject an ack signed by a different key")
+	}
+}
+
+// A member who observes another sender's Sealed bytes and re-signs them as its own must not be able
+// to forward them: the HPKE info binds the ciphertext to the original sender's key, so decryption fails.
+func TestForwardedSealedFailsEvenWhenResignedByAnotherMember(t *testing.T) {
+	now := time.Now()
+	_, _, a, b, c := setup(t, now)
+	s := seal.HPKE{}
+
+	e, err := Build("msg", message.NewID(), a.keys, a.cert, b.cert, []byte("hello"), s, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// c (M) observes A's envelope to B and re-signs the same Sealed bytes as its own.
+	forged := Envelope{V: e.V, Kind: e.Kind, ID: e.ID, TS: e.TS, Cert: c.cert, To: e.To, Sealed: e.Sealed}
+	forged.Sig = ed25519.Sign(c.keys.Sign, envelopeSignBytes(forged))
+
+	v := newVerifier(b.team, now, 5*time.Minute)
+	if _, err := v.Open(forged, b.keys, s); err == nil {
+		t.Fatal("re-signing another sender's Sealed bytes as a different sender should fail to decrypt")
+	}
+}
+
+// The size guard runs before any cert or signature work, so an oversized Sealed fails immediately.
+func TestOversizedSealedFailsAtTheTop(t *testing.T) {
+	now := time.Now()
+	_, _, a, b, _ := setup(t, now)
+	s := seal.HPKE{}
+
+	e := Envelope{V: 1, Kind: "msg", ID: message.NewID(), TS: now.UnixMilli(), Cert: a.cert, To: b.cert.Key, Sealed: make([]byte, maxSealed+1)}
+	// No valid Sig: the size guard must reject this before signature verification is ever reached.
+
+	v := newVerifier(b.team, now, 5*time.Minute)
+	_, err := v.Open(e, b.keys, s)
+	if err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("err = %v, want a size-guard error", err)
+	}
+}
+
+// A tampered envelope must fail the same way every time it's opened, and never report "replayed":
+// the signature check runs before the replay check, so a bad signature is never recorded as seen.
+func TestTamperedEnvelopeFailsSameWayTwice(t *testing.T) {
+	now := time.Now()
+	_, _, a, b, _ := setup(t, now)
+	s := seal.HPKE{}
+
+	e, err := Build("msg", message.NewID(), a.keys, a.cert, b.cert, []byte("hello"), s, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.Sealed[0] ^= 0xFF
+
+	v := newVerifier(b.team, now, 5*time.Minute)
+	_, err1 := v.Open(e, b.keys, s)
+	_, err2 := v.Open(e, b.keys, s)
+	if err1 == nil || err2 == nil {
+		t.Fatal("a tampered envelope should fail both times")
+	}
+	if strings.Contains(err1.Error(), "replayed") || strings.Contains(err2.Error(), "replayed") {
+		t.Fatal("a tampered envelope should never be reported as replayed")
+	}
+	if err1.Error() != err2.Error() {
+		t.Fatalf("expected the same error both times, got %q then %q", err1, err2)
+	}
+}
+
+// Replay is keyed by sender+id, so two different senders using the same id are not replays of each other.
+func TestSameIDFromDifferentSendersIsNotAReplay(t *testing.T) {
+	now := time.Now()
+	_, _, a, b, c := setup(t, now)
+	s := seal.HPKE{}
+	id := message.NewID()
+
+	e1, err := Build("msg", id, a.keys, a.cert, b.cert, []byte("from a"), s, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e2, err := Build("msg", id, c.keys, c.cert, b.cert, []byte("from c"), s, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	v := newVerifier(b.team, now, 5*time.Minute)
+	got1, err := v.Open(e1, b.keys, s)
+	if err != nil {
+		t.Fatalf("first sender: %v", err)
+	}
+	if string(got1) != "from a" {
+		t.Fatalf("got %q, want %q", got1, "from a")
+	}
+	got2, err := v.Open(e2, b.keys, s)
+	if err != nil {
+		t.Fatalf("second sender with same id: %v", err)
+	}
+	if string(got2) != "from c" {
+		t.Fatalf("got %q, want %q", got2, "from c")
 	}
 }

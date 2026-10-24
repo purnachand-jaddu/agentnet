@@ -4,6 +4,7 @@ package envelope
 import (
 	"bytes"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,12 +49,15 @@ func envelopeSignBytes(e Envelope) []byte {
 	return append([]byte("agentnet/envelope/v1\n"), b...)
 }
 
-// sealInfo is the HPKE info bound to one kind+id pair.
-func sealInfo(kind, id string) []byte { return []byte("agentnet/v1/" + kind + "/" + id) }
+// sealInfo is the HPKE info bound to kind+id and both parties' signing keys, so a ciphertext
+// can't be re-signed and forwarded by another member as if it were theirs (surreptitious forwarding).
+func sealInfo(kind, id string, senderKey, recipientKey []byte) []byte {
+	return []byte("agentnet/v1/" + kind + "/" + id + "/" + base64.RawURLEncoding.EncodeToString(senderKey) + "/" + base64.RawURLEncoding.EncodeToString(recipientKey))
+}
 
 // Build seals payload to to's encryption key and signs the envelope with self.
 func Build(kind, id string, self identity.Keys, selfCert identity.Cert, to identity.Cert, payload []byte, s seal.Sealer, now time.Time) (Envelope, error) {
-	sealed, err := s.Seal(to.Enc, sealInfo(kind, id), payload)
+	sealed, err := s.Seal(to.Enc, sealInfo(kind, id, selfCert.Key, to.Key), payload)
 	if err != nil {
 		return Envelope{}, err
 	}
@@ -62,7 +66,7 @@ func Build(kind, id string, self identity.Keys, selfCert identity.Cert, to ident
 	return e, nil
 }
 
-// Replay remembers envelope ids for the time window.
+// Replay remembers keys (sender+id) for the time window.
 type Replay struct {
 	mu     sync.Mutex
 	window time.Duration
@@ -74,8 +78,9 @@ func NewReplay(window time.Duration) *Replay {
 	return &Replay{window: window, seen: map[string]time.Time{}}
 }
 
-// Check reports true the first time id is seen, prunes entries older than the window.
-func (r *Replay) Check(id string, now time.Time) bool {
+// Check reports true the first time key is seen, prunes entries older than the window.
+// ponytail: full prune per Check; prune on a ticker if n grows
+func (r *Replay) Check(key string, now time.Time) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for k, t := range r.seen {
@@ -83,10 +88,10 @@ func (r *Replay) Check(id string, now time.Time) bool {
 			delete(r.seen, k)
 		}
 	}
-	if _, ok := r.seen[id]; ok {
+	if _, ok := r.seen[key]; ok {
 		return false
 	}
-	r.seen[id] = now
+	r.seen[key] = now
 	return true
 }
 
@@ -105,6 +110,9 @@ func (v Verifier) Open(e Envelope, self identity.Keys, s seal.Sealer) ([]byte, e
 	}
 	if e.Kind != "msg" && e.Kind != "presence" {
 		return nil, fmt.Errorf("envelope: unknown kind %q", e.Kind)
+	}
+	if len(e.Sealed) > maxSealed {
+		return nil, fmt.Errorf("envelope: sealed payload too large (%d bytes)", len(e.Sealed))
 	}
 	if err := v.Team.Verify(e.Cert, v.Now()); err != nil {
 		return nil, fmt.Errorf("envelope: sender cert: %w", err)
@@ -125,13 +133,11 @@ func (v Verifier) Open(e Envelope, self identity.Keys, s seal.Sealer) ([]byte, e
 	if !message.ValidID(e.ID) {
 		return nil, fmt.Errorf("envelope: bad id %q", e.ID)
 	}
-	if !v.Replay.Check(e.ID, now) {
+	replayKey := base64.RawURLEncoding.EncodeToString(e.Cert.Key) + "/" + e.ID
+	if !v.Replay.Check(replayKey, now) {
 		return nil, errors.New("envelope: replayed")
 	}
-	if len(e.Sealed) > maxSealed {
-		return nil, fmt.Errorf("envelope: sealed payload too large (%d bytes)", len(e.Sealed))
-	}
-	return s.Open(self.Enc, sealInfo(e.Kind, e.ID), e.Sealed)
+	return s.Open(self.Enc, sealInfo(e.Kind, e.ID, e.Cert.Key, self.Public()), e.Sealed)
 }
 
 // ackSignBytes is what the receiver signs and the verifier checks, with a.Sig cleared.
