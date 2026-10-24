@@ -1,0 +1,103 @@
+package identity
+
+import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
+const maxEnvelope = 64 * 1024
+
+// JoinRequest is what a joining machine hands to the founder.
+type JoinRequest struct {
+	V       int    `json:"v"`
+	Person  string `json:"person"`
+	Machine string `json:"machine"`
+	Key     []byte `json:"key"`
+	Enc     []byte `json:"enc"`
+	Nonce   []byte `json:"nonce"`
+}
+
+// PairingCode is "123-456-789" from sha256 of the encoded request: what the joiner reads to the founder.
+func (r JoinRequest) PairingCode() string {
+	sum := sha256.Sum256([]byte(r.Encode()))
+	n := binary.BigEndian.Uint64(sum[:8]) % 1_000_000_000
+	s := fmt.Sprintf("%09d", n)
+	return s[:3] + "-" + s[3:6] + "-" + s[6:9]
+}
+
+// Encode is the wire form: "agentnet-join1:" + base64url(no padding)(json).
+func (r JoinRequest) Encode() string { return encodeEnvelope("agentnet-join1:", r) }
+
+// DecodeJoinRequest parses the wire form Encode produces.
+func DecodeJoinRequest(s string) (JoinRequest, error) {
+	b, err := decodeEnvelope(s, "agentnet-join1:")
+	if err != nil {
+		return JoinRequest{}, err
+	}
+	var r JoinRequest
+	if err := json.Unmarshal(b, &r); err != nil {
+		return JoinRequest{}, fmt.Errorf("join request: bad json: %w", err)
+	}
+	if r.V != 1 {
+		return JoinRequest{}, fmt.Errorf("join request: unsupported version %d", r.V)
+	}
+	if len(r.Nonce) < 8 {
+		return JoinRequest{}, fmt.Errorf("join request: nonce too short")
+	}
+	return r, nil
+}
+
+// Bundle is what the founder hands back: the joiner's cert and the team.
+type Bundle struct {
+	V       int     `json:"v"`
+	Founder []byte  `json:"founder"`
+	Cert    Cert    `json:"cert"`
+	Members []Cert  `json:"members"`
+	Blocks  []Block `json:"blocks"`
+}
+
+// Encode is the wire form: "agentnet-bundle1:" + base64url(no padding)(json).
+func (b Bundle) Encode() string { return encodeEnvelope("agentnet-bundle1:", b) }
+
+// DecodeBundle parses the wire form Encode produces.
+func DecodeBundle(s string) (Bundle, error) {
+	data, err := decodeEnvelope(s, "agentnet-bundle1:")
+	if err != nil {
+		return Bundle{}, err
+	}
+	var b Bundle
+	if err := json.Unmarshal(data, &b); err != nil {
+		return Bundle{}, fmt.Errorf("bundle: bad json: %w", err)
+	}
+	if b.V != 1 {
+		return Bundle{}, fmt.Errorf("bundle: unsupported version %d", b.V)
+	}
+	return b, nil
+}
+
+// encodeEnvelope is prefix + base64url(no padding)(json(v)).
+func encodeEnvelope(prefix string, v any) string {
+	b, _ := json.Marshal(v) // v is always a plain struct; never fails
+	return prefix + base64.RawURLEncoding.EncodeToString(b)
+}
+
+// decodeEnvelope trims whitespace, checks the prefix, caps input at 64 KiB, and base64url-decodes the rest.
+func decodeEnvelope(s, prefix string) ([]byte, error) {
+	s = strings.TrimSpace(s)
+	name := strings.TrimSuffix(prefix, ":")
+	if !strings.HasPrefix(s, prefix) {
+		return nil, fmt.Errorf("%s: missing prefix", name)
+	}
+	if len(s) > maxEnvelope {
+		return nil, fmt.Errorf("%s: input too large", name)
+	}
+	b, err := base64.RawURLEncoding.DecodeString(s[len(prefix):])
+	if err != nil {
+		return nil, fmt.Errorf("%s: bad encoding: %w", name, err)
+	}
+	return b, nil
+}
