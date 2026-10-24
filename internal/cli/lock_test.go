@@ -2,6 +2,8 @@ package cli
 
 import (
 	"errors"
+	"io"
+	"log"
 	"path/filepath"
 	"testing"
 	"time"
@@ -51,5 +53,42 @@ func TestAcquireLockWaitBlocksUntilReleased(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("waiting acquire never returned after release")
+	}
+}
+
+func TestRunOrRetryServiceModeRetriesUntilSuccess(t *testing.T) {
+	oldInitial, oldMax := retryInitialDelay, retryMaxDelay
+	retryInitialDelay, retryMaxDelay = 2*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { retryInitialDelay, retryMaxDelay = oldInitial, oldMax })
+
+	logger := log.New(io.Discard, "", 0)
+	attempts := 0
+	err := runOrRetry(true, logger, "test step", func() error {
+		attempts++
+		if attempts < 3 {
+			return errors.New("boom")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("runOrRetry: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+}
+
+func TestRunOrRetryNonServiceModeFailsOnce(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	attempts := 0
+	err := runOrRetry(false, logger, "test step", func() error {
+		attempts++
+		return errors.New("boom")
+	})
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 (no retry without --service)", attempts)
 	}
 }

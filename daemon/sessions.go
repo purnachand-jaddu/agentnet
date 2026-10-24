@@ -9,6 +9,7 @@ import (
 
 	"github.com/purnachand-jaddu/agentnet/adapter"
 	"github.com/purnachand-jaddu/agentnet/ipc"
+	"github.com/purnachand-jaddu/agentnet/message"
 	"github.com/purnachand-jaddu/agentnet/store"
 )
 
@@ -125,7 +126,7 @@ func (d *Daemon) register(c ipc.Conn, a RegisterArgs) (Registered, error) {
 	key := a.Session.Key
 	l, exists := d.live[key]
 	if !exists {
-		name, err := d.assignName(key, a.Session.Agent, a.Session.Cwd, allowKey)
+		name, err := d.pickName(key, a, allowKey)
 		if err != nil {
 			return Registered{}, err
 		}
@@ -134,7 +135,8 @@ func (d *Daemon) register(c ipc.Conn, a RegisterArgs) (Registered, error) {
 		// A proc: placeholder (no hook has joined it yet) isn't remembered: it's transient, and
 		// persisting its name would block the real session from claiming it later.
 		if !isPlaceholder(key) {
-			rec := store.SessionRecord{Name: name, Key: key, Agent: a.Session.Agent, Cwd: a.Session.Cwd, LastSeen: d.opts.Now()}
+			rec := store.SessionRecord{Name: name, Key: key, Agent: a.Session.Agent, Cwd: a.Session.Cwd,
+				LastSeen: d.opts.Now(), Kept: strings.HasPrefix(key, "cli:")}
 			if err := d.opts.Store.UpsertSession(rec); err != nil {
 				delete(d.live, key)
 				return Registered{}, err
@@ -222,6 +224,21 @@ func (d *Daemon) findProcSession(agent string, pid int) *live {
 		}
 	}
 	return nil
+}
+
+// pickName picks key's name: a.Name if it's a valid, free slug (e.g. `listen --as`), else assignName's
+// derived name. Caller holds mu.
+func (d *Daemon) pickName(key string, a RegisterArgs, allowKey string) (string, error) {
+	if a.Name != "" && message.Slug(a.Name) {
+		free, err := d.nameFree(key, a.Name, "")
+		if err != nil {
+			return "", err
+		}
+		if free {
+			return a.Name, nil
+		}
+	}
+	return d.assignName(key, a.Session.Agent, a.Session.Cwd, allowKey)
 }
 
 // assignName picks the name for key: its remembered name if still free, else the first free <base>-<short>[-N].

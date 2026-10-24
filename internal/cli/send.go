@@ -125,15 +125,20 @@ func cmdListen(args []string) int {
 	defer stop()
 	for ctx.Err() == nil {
 		var res daemon.InboxResult
-		if err := client.Call(ctx, "inbox", daemon.InboxArgs{Key: key, WaitSecs: listenWaitSecs}, &res); err != nil {
+		if err := client.Call(ctx, "inbox", daemon.InboxArgs{Key: key, WaitSecs: listenWaitSecs, Peek: true}, &res); err != nil {
 			if ctx.Err() != nil {
 				break
 			}
 			fmt.Fprintln(stderr, err)
 			return 1
 		}
-		if res.Text != "" {
-			fmt.Fprintln(stdout, res.Text)
+		if res.Text == "" {
+			continue
+		}
+		// Only confirm delivery once the mail was actually shown; a print failure must leave it unread.
+		if _, err := fmt.Fprintln(stdout, res.Text); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
 		}
 		if len(res.IDs) > 0 {
 			client.Call(context.Background(), "delivered", daemon.DeliveredArgs{Key: key, IDs: res.IDs}, nil)

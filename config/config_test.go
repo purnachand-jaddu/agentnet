@@ -27,6 +27,27 @@ func TestLoadDefaultsWhenAbsent(t *testing.T) {
 	}
 }
 
+func TestLoadFillsMissingFieldDefaults(t *testing.T) {
+	t.Setenv("USER", "alex")
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"person":"sam","machine":"box","folders":["/x"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Person != "sam" || c.Machine != "box" || len(c.Folders) != 1 || c.Folders[0] != "/x" {
+		t.Fatalf("existing fields were overwritten: %+v", c)
+	}
+	if c.Inbound != Hold {
+		t.Errorf("Inbound = %q, want hold", c.Inbound)
+	}
+	if c.Port != 7777 {
+		t.Errorf("Port = %d, want 7777", c.Port)
+	}
+}
+
 func TestAllowed(t *testing.T) {
 	dir := t.TempDir()
 	root := filepath.Join(dir, "a", "b")

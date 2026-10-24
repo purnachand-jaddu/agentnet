@@ -31,12 +31,12 @@ type Config struct {
 	Paused  bool              `json:"paused"`
 }
 
-// Load reads path, defaulting Person/Machine/Inbound/Port when the file doesn't exist yet.
+// Load reads path, defaulting Person/Machine/Inbound/Port when the file doesn't exist yet, or when it
+// exists but leaves any of those fields zero (e.g. a config.json written before Port existed).
 func Load(path string) (Config, error) {
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		host, _ := os.Hostname()
-		return Config{Person: slugify(os.Getenv("USER")), Machine: slugify(host), Inbound: Hold, Port: 7777}, nil
+		return defaults(), nil
 	}
 	if err != nil {
 		return Config{}, err
@@ -45,7 +45,31 @@ func Load(path string) (Config, error) {
 	if err := json.Unmarshal(b, &c); err != nil {
 		return Config{}, err
 	}
+	fillDefaults(&c)
 	return c, nil
+}
+
+// defaults is Config's zero-file starting point: Person/Machine from the environment, Inbound hold, Port 7777.
+func defaults() Config {
+	host, _ := os.Hostname()
+	return Config{Person: slugify(os.Getenv("USER")), Machine: slugify(host), Inbound: Hold, Port: 7777}
+}
+
+// fillDefaults sets any of c's Person/Machine/Inbound/Port left zero to defaults()'s value.
+func fillDefaults(c *Config) {
+	d := defaults()
+	if c.Person == "" {
+		c.Person = d.Person
+	}
+	if c.Machine == "" {
+		c.Machine = d.Machine
+	}
+	if c.Inbound == "" {
+		c.Inbound = d.Inbound
+	}
+	if c.Port == 0 {
+		c.Port = d.Port
+	}
 }
 
 // Save writes c to path atomically (temp file + rename), mode 0600.

@@ -22,6 +22,52 @@ func TestNamesAndCollisions(t *testing.T) {
 	}
 }
 
+// TestListenNameIsHonoredAndKept checks that a `listen --as terminal` registration is named "terminal"
+// (not a cwd-derived name), that it's reachable as alex/terminal, that its reply round-trips back to
+// the sender, and that its remembered record is Kept (never forgotten).
+func TestListenNameIsHonoredAndKept(t *testing.T) {
+	d := newTestDaemon(t, codexFake(adapter.ChannelPull))
+
+	reg := call[Registered](t, d, &fakeConn{id: 1}, "register", RegisterArgs{
+		Session: adapter.Session{Key: "cli:terminal", Agent: "cli", ID: "terminal", Cwd: "/src/api"},
+		Name:    "terminal",
+	})
+	if reg.Name != "terminal" {
+		t.Fatalf("Name = %q, want terminal", reg.Name)
+	}
+
+	agentReg := register(t, d, &fakeConn{id: 2}, "codex", "1", "/src/api", false)
+
+	sendToTerminal := call[SendResult](t, d, &fakeConn{id: 2}, "send",
+		SendArgs{From: agentReg.Key, To: "alex/terminal", Body: "hi", Wake: true})
+	if len(sendToTerminal.IDs) != 1 {
+		t.Fatalf("send to alex/terminal: %+v", sendToTerminal)
+	}
+
+	inboxTerminal := call[InboxResult](t, d, &fakeConn{id: 1}, "inbox", InboxArgs{Key: "cli:terminal", Peek: true})
+	if inboxTerminal.Text == "" {
+		t.Fatal("cli:terminal has no mail")
+	}
+
+	replyRes := call[SendResult](t, d, &fakeConn{id: 1}, "send",
+		SendArgs{From: "cli:terminal", To: "alex/" + agentReg.Name, Body: "hey back", Wake: true})
+	if len(replyRes.IDs) != 1 {
+		t.Fatalf("cli reply send: %+v", replyRes)
+	}
+	inboxAgent := call[InboxResult](t, d, &fakeConn{id: 2}, "inbox", InboxArgs{Key: agentReg.Key, Peek: true})
+	if inboxAgent.Text == "" {
+		t.Fatal("agent session did not receive the cli's reply")
+	}
+
+	rec, err := d.opts.Store.SessionByKey("cli:terminal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec == nil || !rec.Kept {
+		t.Fatalf("remembered record Kept = %+v, want true", rec)
+	}
+}
+
 func TestReturningSessionGetsItsNameBack(t *testing.T) {
 	d := newTestDaemon(t, codexFake(adapter.ChannelPull))
 	c := &fakeConn{id: 1}

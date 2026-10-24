@@ -5,7 +5,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -53,6 +55,48 @@ func acquireLock(path string, wait bool) (*os.File, error) {
 	return f, nil
 }
 
+// retryInitialDelay and retryMaxDelay bound --service's startup retry backoff; tests shrink them.
+var (
+	retryInitialDelay = time.Second
+	retryMaxDelay     = 30 * time.Second
+)
+
+// runOrRetry calls fn once and returns its error, unless service is true, in which case it retries fn
+// with exponential backoff (doubling from retryInitialDelay up to retryMaxDelay), logging each failure,
+// until fn succeeds. A --service daemon must never give up on a startup error (Apple TN3179: a launchd
+// agent that exits quickly can get its local network access silently denied).
+func runOrRetry(service bool, logger *log.Logger, label string, fn func() error) error {
+	if !service {
+		return fn()
+	}
+	delay := retryInitialDelay
+	for {
+		if err := fn(); err == nil {
+			return nil
+		} else {
+			logger.Printf("daemon: %s: %v; retrying in %s", label, err, delay)
+		}
+		time.Sleep(delay)
+		delay *= 2
+		if delay > retryMaxDelay {
+			delay = retryMaxDelay
+		}
+	}
+}
+
+// ensureHome runs paths.Ensure(), adding a socket-dir removal hint when that's the actual cause.
+func ensureHome() error {
+	if err := paths.Ensure(); err != nil {
+		// Ensure only does real work for the socket dir when Home's own socket path is too long for sun_path.
+		if len(filepath.Join(paths.Home(), "agentnet.sock")) > 100 {
+			dir := filepath.Join(os.TempDir(), "agentnet-"+strconv.Itoa(os.Getuid()))
+			return fmt.Errorf("%w; remove %s and retry", err, dir)
+		}
+		return err
+	}
+	return nil
+}
+
 // cmdDaemon runs `agentnet daemon [--service]`.
 func cmdDaemon(args []string) int {
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
@@ -61,14 +105,10 @@ func cmdDaemon(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	logger := log.New(stderr, "", log.LstdFlags)
 
-	if err := paths.Ensure(); err != nil {
+	if err := runOrRetry(*service, logger, "paths.Ensure", ensureHome); err != nil {
 		fmt.Fprintln(stderr, err)
-		// Ensure only does real work for the socket dir when Home's own socket path is too long for sun_path.
-		if len(filepath.Join(paths.Home(), "agentnet.sock")) > 100 {
-			dir := filepath.Join(os.TempDir(), "agentnet-"+strconv.Itoa(os.Getuid()))
-			fmt.Fprintf(stderr, "remove %s and retry\n", dir)
-		}
 		return 1
 	}
 
@@ -82,19 +122,32 @@ func cmdDaemon(args []string) int {
 	}
 	defer lockFile.Close()
 
-	l, err := ipc.Listen(paths.Socket())
-	if err != nil {
+	var l net.Listener
+	if err := runOrRetry(*service, logger, "ipc.Listen", func() error {
+		ll, e := ipc.Listen(paths.Socket())
+		if e == nil {
+			l = ll
+		}
+		return e
+	}); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
 
-	logger := log.New(stderr, "", log.LstdFlags)
-	d, err := newDaemon(logger)
-	if err != nil {
+	var d *daemon.Daemon
+	var st io.Closer
+	if err := runOrRetry(*service, logger, "newDaemon", func() error {
+		dd, s, e := newDaemon(logger)
+		if e == nil {
+			d, st = dd, s
+		}
+		return e
+	}); err != nil {
 		fmt.Fprintln(stderr, err)
 		l.Close()
 		return 1
 	}
+	defer st.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -115,20 +168,23 @@ func cmdDaemon(args []string) int {
 }
 
 // newDaemon builds the Daemon this process serves, reading its identity and folder opt-in from config.json.
-func newDaemon(logger *log.Logger) (*daemon.Daemon, error) {
+// It also returns the sqlite store so the caller can close it on shutdown.
+func newDaemon(logger *log.Logger) (*daemon.Daemon, io.Closer, error) {
 	st, err := sqlite.Open(paths.DB())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	cfg, err := config.Load(paths.Config())
 	if err != nil {
-		return nil, err
+		st.Close()
+		return nil, nil, err
 	}
-	return daemon.New(daemon.Options{
+	d := daemon.New(daemon.Options{
 		Person: cfg.Person, Machine: cfg.Machine, Store: st, Adapters: adapters(),
 		FolderAllowed: folderAllowed(paths.Config()), Now: time.Now,
 		Log: func(format string, args ...any) { logger.Printf(format, args...) },
-	}), nil
+	})
+	return d, st, nil
 }
 
 // folderAllowed returns a FolderAllowed func that reloads cfgPath at most once every 2s, so `folder add` takes
