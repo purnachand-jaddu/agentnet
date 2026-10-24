@@ -434,3 +434,63 @@ func TestApprovePersonNeverStrandsConcurrentlyAdmittedMessage(t *testing.T) {
 		t.Fatal("message still held after approve")
 	}
 }
+
+// Past maxHeldPerPerson held messages from one person, more are refused with no tombstone, so they can be resent after approval.
+func TestHeldCapPerSenderPerson(t *testing.T) {
+	d := newTestDaemon(t, codexFake(adapter.ChannelCommand))
+	withPolicy(d, config.Hold)
+	register(t, d, &fakeConn{id: 1}, "codex", "a", "/src/a", false)
+	for range maxHeldPerPerson {
+		m := newMsg("sam/terminal", "alex/a-codex")
+		if _, err := d.opts.Store.Accept(m, "elsewhere", true, "p/sam/terminal", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	over := newMsg("sam/terminal", "alex/a-codex")
+	st, note := d.admitMsg(samCert("sam", "xps"), over, mustAddr(t, over.To))
+	if st != message.StateRefused || note != "too many held messages; ask alex to approve" {
+		t.Fatalf("admitMsg = %s/%q", st, note)
+	}
+	if ok, _ := d.opts.Store.Has(over.ID); ok {
+		t.Fatal("over-cap message stored")
+	}
+	if _, _, ok, _ := d.opts.Store.Received(over.ID); ok {
+		t.Fatal("over-cap message left a tombstone")
+	}
+	other := newMsg("pat/terminal", "alex/a-codex")
+	if st, _ := d.admitMsg(samCert("pat", "tp"), other, mustAddr(t, other.To)); st != message.StateHeld {
+		t.Fatalf("another person's message = %s, want held", st)
+	}
+}
+
+// The hourly prune drops held mail after heldKeep and read mail after readKeep, and never unread mail.
+func TestPruneMessagesHorizons(t *testing.T) {
+	d := newTestDaemon(t)
+	now := time.Now()
+	day := 24 * time.Hour
+	d.opts.Now = func() time.Time { return now }
+	for id, c := range map[string]struct {
+		held bool
+		age  time.Duration
+	}{"held-old": {true, heldKeep + time.Hour}, "held-new": {true, heldKeep - time.Hour}, "unread-old": {false, 90 * day},
+		"read-old": {false, 90 * day}, "read-new": {false, 90 * day}} {
+		m := newMsg("sam/terminal", "alex/a-codex")
+		m.ID = id
+		if _, err := d.opts.Store.Accept(m, "x", c.held, "p", now.Add(-c.age)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	must := func(err error) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(d.opts.Store.MarkRead([]string{"read-old"}, now.Add(-readKeep-time.Hour)))
+	must(d.opts.Store.MarkRead([]string{"read-new"}, now.Add(-readKeep+time.Hour)))
+	d.pruneMessages()
+	for id, want := range map[string]bool{"held-old": false, "held-new": true, "unread-old": true, "read-old": false, "read-new": true} {
+		if ok, _ := d.opts.Store.Has(id); ok != want {
+			t.Fatalf("Has(%s) = %v, want %v", id, ok, want)
+		}
+	}
+}

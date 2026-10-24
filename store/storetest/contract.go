@@ -130,6 +130,62 @@ func Run(t *testing.T, open func(t *testing.T) store.Store) {
 			t.Fatalf("pruned %d, old kept %v, new kept %v", n, oldOK, newOK)
 		}
 	})
+	t.Run("held from counts only that person's held messages", func(t *testing.T) {
+		s := open(t)
+		at := time.Unix(1000, 0)
+		from := func(id, sender string) message.Message { m := msg(id, "bob/x"); m.From = sender; return m }
+		for _, c := range []struct {
+			m    message.Message
+			held bool
+		}{
+			{from("1", "sam/a"), true}, {from("2", "sam/terminal"), true}, {from("3", "samuel/a"), true},
+			{from("4", "sam/a"), false}, {from("5", "sam/b"), true},
+		} {
+			_, err := s.Accept(c.m, "x", c.held, "p", at)
+			must(t, err)
+		}
+		_, err := s.ReleaseHeld([]string{"5"})
+		must(t, err)
+		for person, want := range map[string]int{"sam": 2, "samuel": 1, "bob": 0} {
+			n, err := s.HeldFrom(person)
+			must(t, err)
+			if n != want {
+				t.Fatalf("HeldFrom(%q) = %d, want %d", person, n, want)
+			}
+		}
+	})
+	t.Run("prune messages drops old held and old read mail, never unread mail", func(t *testing.T) {
+		s := open(t)
+		now := time.Unix(100*86400, 0)
+		day := 24 * time.Hour
+		for _, c := range []struct {
+			id   string
+			held bool
+			at   time.Time
+		}{
+			{"held-old", true, now.Add(-9 * day)}, {"held-new", true, now.Add(-7 * day)},
+			{"read-old", false, now.Add(-60 * day)}, {"read-new", false, now.Add(-60 * day)},
+			{"unread-old", false, now.Add(-60 * day)},
+		} {
+			_, err := s.Accept(msg(c.id, "bob/x"), "x", c.held, "p", c.at)
+			must(t, err)
+		}
+		must(t, s.MarkRead([]string{"read-old"}, now.Add(-31*day)))
+		must(t, s.MarkRead([]string{"read-new"}, now.Add(-29*day)))
+		n, err := s.PruneMessages(now.Add(-8*day), now.Add(-30*day))
+		must(t, err)
+		if n != 2 {
+			t.Fatalf("pruned %d, want 2", n)
+		}
+		for id, want := range map[string]bool{"held-old": false, "held-new": true, "read-old": false, "read-new": true, "unread-old": true} {
+			if ok, err := s.Has(id); err != nil || ok != want {
+				t.Fatalf("Has(%s) = %v, %v; want %v", id, ok, err, want)
+			}
+		}
+		if _, _, ok, _ := s.Received("held-old"); !ok {
+			t.Fatal("pruning a message removed its tombstone")
+		}
+	})
 	t.Run("read messages leave pending", func(t *testing.T) {
 		s := open(t)
 		_, err := s.PutMessage(msg("1", "bob/x"), "x", false)

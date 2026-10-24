@@ -15,13 +15,16 @@ import (
 )
 
 const (
-	rateWindow    = time.Minute
-	rateMax       = 60                 // messages one machine may send per rateWindow before it is told to retry
-	receivedKeep  = 8 * 24 * time.Hour // tombstones outlive the sender's 7-day outbox
-	noSessionNote = "no such session"
-	storeRetry    = "could not store it here right now; try again"
-	acceptedNote  = "accepted; delivering"
-	alreadyNote   = "already received"
+	rateWindow       = time.Minute
+	rateMax          = 60                 // messages one machine may send per rateWindow before it is told to retry
+	receivedKeep     = 8 * 24 * time.Hour // tombstones outlive the sender's 7-day outbox
+	heldKeep         = 8 * 24 * time.Hour // held mail nobody approved is dropped after this
+	readKeep         = 30 * 24 * time.Hour
+	maxHeldPerPerson = 100 // held messages one sender person may have waiting here
+	noSessionNote    = "no such session"
+	storeRetry       = "could not store it here right now; try again"
+	acceptedNote     = "accepted; delivering"
+	alreadyNote      = "already received"
 )
 
 // receiveMsg verifies, checks and stores one "msg" envelope; delivery runs in the background, so the ack never waits on agent I/O.
@@ -113,6 +116,17 @@ func (d *Daemon) admitMsg(cert identity.Cert, m message.Message, to message.Addr
 	if st == message.StateRefused {
 		return st, note
 	}
+	if st == message.StateHeld {
+		// ponytail: count then insert isn't atomic, so concurrent admissions can overshoot the cap by a few.
+		n, err := d.opts.Store.HeldFrom(cert.Person)
+		if err != nil {
+			d.opts.Log("daemon: count held from %s: %v", cert.Person, err)
+			return message.StateRetry, storeRetry
+		}
+		if n >= maxHeldPerPerson {
+			return message.StateRefused, fmt.Sprintf("too many held messages; ask %s to approve", d.opts.Person)
+		}
+	}
 	if !terminal && !d.loopAllowed(sender, tg.key) {
 		return message.StateRefused, loopNote
 	}
@@ -163,6 +177,19 @@ func (d *Daemon) duplicateAck(cert identity.Cert, id string, same bool) (message
 func (d *Daemon) pruneReceived() {
 	if _, err := d.opts.Store.PruneReceived(d.opts.Now().Add(-receivedKeep)); err != nil {
 		d.opts.Log("daemon: prune received: %v", err)
+	}
+}
+
+// pruneMessages drops held mail older than heldKeep and read mail older than readKeep; unread mail is kept.
+func (d *Daemon) pruneMessages() {
+	now := d.opts.Now()
+	n, err := d.opts.Store.PruneMessages(now.Add(-heldKeep), now.Add(-readKeep))
+	if err != nil {
+		d.opts.Log("daemon: prune messages: %v", err)
+		return
+	}
+	if n > 0 {
+		d.opts.Log("daemon: pruned %d old held or read messages", n)
 	}
 }
 

@@ -39,8 +39,10 @@ type Store interface {
 	Received(id string) (sender, recipient string, ok bool, err error)                                       // the tombstone; it survives MarkRead and Drop
 	PruneReceived(before time.Time) (int, error)
 	Held() ([]Held, error)
-	IsHeld(id string) (bool, error)                      // false, nil when absent or not held
-	ReleaseHeld(ids []string) ([]message.Message, error) // one transaction; returns only ids that were actually held
+	HeldFrom(person string) (int, error)                         // held messages whose From is one of person's sessions
+	PruneMessages(heldBefore, readBefore time.Time) (int, error) // held stored before heldBefore, read before readBefore; never unread mail
+	IsHeld(id string) (bool, error)                              // false, nil when absent or not held
+	ReleaseHeld(ids []string) ([]message.Message, error)         // one transaction; returns only ids that were actually held
 	Release(ids []string) error
 	Drop(ids []string) error
 	Rehome(from, to string) error // moves from's unread mail (pending and held) to to; read mail stays put

@@ -152,6 +152,7 @@ func (d *Daemon) Run(ctx context.Context) {
 			d.touchLive()
 		case <-forget.C:
 			d.pruneReceived()
+			d.pruneMessages()
 			if d.opts.Now().Sub(d.started) >= forgetAfter {
 				d.forgetOld()
 			}

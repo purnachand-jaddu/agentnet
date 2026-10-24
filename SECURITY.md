@@ -33,6 +33,13 @@ agentnet as you.
 
 ## What the daemon keeps, and for how long
 
+Messages are stored in `~/.agentnet/agentnet.db` (mode 0600), unencrypted at rest. Held messages
+nobody approves are deleted after 8 days, read messages 30 days after they were read, and at most
+100 messages per sending person can be held at once (further ones are refused, not stored). Unread
+mail that isn't held is never deleted automatically, so a member you accept messages from can
+still fill your disk at up to 60 messages (64 KiB each) a minute per machine until you
+`agentnet refuse` them or `agentnet pause`.
+
 Claude Code session messaging tokens (used to push a message into a live Claude session) are held
 in memory only, for as long as the daemon runs, and are never written to disk.
 

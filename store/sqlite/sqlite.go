@@ -4,6 +4,7 @@ package sqlite
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"os"
 	"time"
@@ -17,8 +18,9 @@ import (
 const schema = `
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY, mailbox TEXT NOT NULL, msg TEXT NOT NULL,
-  held INTEGER NOT NULL DEFAULT 0, read_at INTEGER, seq INTEGER NOT NULL);
+  held INTEGER NOT NULL DEFAULT 0, read_at INTEGER, seq INTEGER NOT NULL, at INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS messages_mailbox ON messages(mailbox, read_at, held, seq);
+CREATE INDEX IF NOT EXISTS messages_held ON messages(seq) WHERE held = 1;
 CREATE TABLE IF NOT EXISTS outbox (
   id TEXT PRIMARY KEY, peer TEXT NOT NULL, msg TEXT NOT NULL, at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions (
@@ -77,7 +79,21 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := addMessagesAt(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
+}
+
+// addMessagesAt adds messages.at to a database created before it existed, stamping existing rows with now.
+func addMessagesAt(db *sql.DB) error {
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'at'`).Scan(&n); err != nil || n > 0 {
+		return err
+	}
+	_, err := db.Exec(fmt.Sprintf(`ALTER TABLE messages ADD COLUMN at INTEGER NOT NULL DEFAULT %d`, toMillis(time.Now())))
+	return err
 }
 
 // Close closes the underlying database.
@@ -87,16 +103,16 @@ func toMillis(t time.Time) int64 { return t.UnixMilli() }
 
 func fromMillis(ms int64) time.Time { return time.UnixMilli(ms).UTC() }
 
-// PutMessage inserts m into mailbox, ignoring a duplicate id.
+// PutMessage inserts m into mailbox, stamped with the current time, ignoring a duplicate id.
 func (s *Store) PutMessage(m message.Message, mailbox string, held bool) (bool, error) {
 	body, err := json.Marshal(m)
 	if err != nil {
 		return false, err
 	}
 	res, err := s.db.Exec(
-		`INSERT OR IGNORE INTO messages (id, mailbox, msg, held, seq)
-		 VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(seq),0)+1 FROM messages))`,
-		m.ID, mailbox, body, held)
+		`INSERT OR IGNORE INTO messages (id, mailbox, msg, held, seq, at)
+		 VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(seq),0)+1 FROM messages), ?)`,
+		m.ID, mailbox, body, held, toMillis(time.Now()))
 	if err != nil {
 		return false, err
 	}
@@ -195,9 +211,9 @@ func (s *Store) Accept(m message.Message, mailbox string, held bool, sender stri
 		return 0, err
 	}
 	res, err := tx.Exec(
-		`INSERT OR IGNORE INTO messages (id, mailbox, msg, held, seq)
-		 VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(seq),0)+1 FROM messages))`,
-		m.ID, mailbox, body, held)
+		`INSERT OR IGNORE INTO messages (id, mailbox, msg, held, seq, at)
+		 VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(seq),0)+1 FROM messages), ?)`,
+		m.ID, mailbox, body, held, toMillis(at))
 	if err != nil {
 		return 0, err
 	}
@@ -223,6 +239,26 @@ func (s *Store) Received(id string) (sender, recipient string, ok bool, err erro
 // PruneReceived deletes tombstones recorded before before, returning the count removed.
 func (s *Store) PruneReceived(before time.Time) (int, error) {
 	res, err := s.db.Exec(`DELETE FROM received WHERE at < ?`, toMillis(before))
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}
+
+// HeldFrom counts held messages whose From is one of person's sessions.
+func (s *Store) HeldFrom(person string) (int, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM messages WHERE held = 1 AND substr(json_extract(CAST(msg AS TEXT), '$.from'), 1, length(?1)) = ?1`,
+		person+"/").Scan(&n)
+	return n, err
+}
+
+// PruneMessages deletes held messages stored before heldBefore and read messages read before readBefore; unread mail stays.
+func (s *Store) PruneMessages(heldBefore, readBefore time.Time) (int, error) {
+	res, err := s.db.Exec(`DELETE FROM messages WHERE (held = 1 AND at < ?) OR read_at < ?`,
+		toMillis(heldBefore), toMillis(readBefore))
 	if err != nil {
 		return 0, err
 	}

@@ -105,6 +105,17 @@ Settings live in `~/.agentnet/config.json` (`$AGENTNET_HOME` to change the state
 There's no bind-address setting: the daemon always listens on `0.0.0.0:<port>` on every machine
 in the network — there's no way to restrict it to one interface.
 
+### Limits and retention
+
+These are fixed, not configurable:
+
+- Each sending machine may deliver up to 60 messages a minute; a message body is at most 64 KiB.
+- At most 100 messages from one person can wait in `agentnet held`. Past that, further messages
+  are refused with "too many held messages; ask <you> to approve", and can be resent once you
+  approve or refuse that person.
+- Held messages nobody approves are deleted after 8 days; read messages are deleted 30 days after
+  they were read. Unread mail that isn't held is never deleted automatically.
+
 ### Static peers
 
 mDNS discovery only works on a LAN that allows multicast. For machines reachable over a VPN mesh
