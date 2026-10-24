@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -299,5 +300,32 @@ func TestPushFailedClearsMCPPush(t *testing.T) {
 	defer d.mu.Unlock()
 	if d.liveByName("api-claude").mcpPush {
 		t.Fatal("expected mcpPush false after push_failed")
+	}
+}
+
+// Removing a live session's folder stops pushes to it, local or remote, without waiting for it to re-register.
+func TestFolderRemovalStopsDeliveryToLiveSession(t *testing.T) {
+	cx := codexFake(adapter.ChannelCommand)
+	d := newTestDaemon(t, cx)
+	var removed atomic.Bool
+	d.opts.FolderAllowed = func(dir string) bool { return !(removed.Load() && dir == "/src/web") }
+	register(t, d, &fakeConn{id: 1}, "codex", "x1", "/src/web", false)
+	removed.Store(true)
+
+	res := call[SendResult](t, d, &fakeConn{id: 2}, "send", SendArgs{From: "cli:terminal", To: "alex/web-codex", Body: "ping", Wake: true})
+	if r := res.Receipts[0]; r.State == message.StatePushed {
+		t.Fatalf("receipt %+v: pushed to a session whose folder was removed", r)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if p := cx.Pushed(); len(p) != 0 {
+		t.Fatalf("pushed %q", p)
+	}
+
+	m := newMsg("sam/terminal", "alex/web-codex")
+	if st, note := d.admitMsg(samCert("sam", "xps"), m, mustAddr(t, m.To)); st != message.StateRefused || note != noSessionNote {
+		t.Fatalf("remote admitMsg = %s/%q, want refused/%q", st, note, noSessionNote)
+	}
+	if ok, _ := d.opts.Store.Has(m.ID); ok {
+		t.Fatal("remote message stored for a session whose folder was removed")
 	}
 }

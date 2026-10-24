@@ -177,6 +177,9 @@ func (d *Daemon) pending(mailbox string) ([]message.Message, error) {
 // deliver gets msgs (all addressed to the session keyed by key) to it now, returning a receipt for the recipient (shown as name).
 func (d *Daemon) deliver(key, name string, msgs []message.Message, wake bool) message.Receipt {
 	to := d.opts.Person + "/" + name
+	if !d.liveFolderAllowed(key) {
+		return message.Receipt{To: to, State: message.StateQueued, Note: "its folder is no longer opted in to agentnet"}
+	}
 	d.mu.Lock()
 	waiting := d.waiting[key] > 0
 	d.broadcastArrived()
@@ -231,6 +234,18 @@ func (d *Daemon) deliver(key, name string, msgs []message.Message, wake bool) me
 	default: // ChannelPull
 		return message.Receipt{To: to, State: message.StateQueued, Note: pullNote}
 	}
+}
+
+// liveFolderAllowed reports whether key's live session, if there is one, is still in an opted-in folder.
+func (d *Daemon) liveFolderAllowed(key string) bool {
+	d.mu.Lock()
+	l := d.live[key]
+	var cwd string
+	if l != nil {
+		cwd = l.s.Cwd
+	}
+	d.mu.Unlock()
+	return l == nil || d.opts.FolderAllowed(cwd)
 }
 
 // broadcastArrived wakes every long-polling "inbox" call, for any key, then replaces d.arrived for the next one. Caller holds mu.

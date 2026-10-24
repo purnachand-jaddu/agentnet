@@ -218,25 +218,29 @@ func (d *Daemon) pruneMessages() {
 	}
 }
 
-// localSession returns to's session on this machine, live or remembered, or nil if there is none.
+// localSession returns to's session on this machine, live or remembered, or nil if there is none or its folder is opted out.
 func (d *Daemon) localSession(to message.Address) (*target, error) {
 	if to.Person != d.opts.Person || (to.Machine != "" && to.Machine != d.opts.Machine) {
 		return nil, nil
 	}
 	var tg *target
+	var cwd string
 	d.mu.Lock()
 	if l := d.liveByName(to.Session); l != nil {
-		tg = &target{name: l.name, key: l.s.Key}
+		tg, cwd = &target{name: l.name, key: l.s.Key}, l.s.Cwd
 	}
 	d.mu.Unlock()
-	if tg != nil {
-		return tg, nil
+	if tg == nil {
+		rec, err := d.opts.Store.SessionByName(to.Session)
+		if err != nil || rec == nil {
+			return nil, err
+		}
+		tg, cwd = &target{name: rec.Name, key: rec.Key}, rec.Cwd
 	}
-	rec, err := d.opts.Store.SessionByName(to.Session)
-	if err != nil || rec == nil {
-		return nil, err
+	if !d.opts.FolderAllowed(cwd) {
+		return nil, nil // its folder was opted out since it registered
 	}
-	return &target{name: rec.Name, key: rec.Key}, nil
+	return tg, nil
 }
 
 // rateAllowed reports whether machine sender (a peerKey) may send another message within rateWindow, recording it if so.
