@@ -482,3 +482,98 @@ func TestExtremePayloadTimestampsRefused(t *testing.T) {
 		})
 	}
 }
+
+// addrTransport is a lan-scheme transport whose current addresses the test sets; Send only counts presence sends.
+type addrTransport struct {
+	mu    sync.Mutex
+	addrs []string
+	sends atomic.Int32
+}
+
+func (a *addrTransport) Schemes() []string { return []string{"lan"} }
+func (a *addrTransport) Listen(context.Context, transport.Handler) ([]string, error) {
+	return a.Addrs()
+}
+func (a *addrTransport) Addrs() ([]string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return slices.Clone(a.addrs), nil
+}
+func (a *addrTransport) set(addrs ...string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.addrs = addrs
+}
+func (a *addrTransport) Send(context.Context, string, envelope.Envelope) (envelope.Ack, error) {
+	a.sends.Add(1)
+	return envelope.Ack{}, fmt.Errorf("fake")
+}
+func (a *addrTransport) Close() error { return nil }
+
+// announceRecorder records each Announce's port and context.
+type announceRecorder struct {
+	mu   sync.Mutex
+	port []int
+	ctx  []context.Context
+}
+
+func (r *announceRecorder) Announce(ctx context.Context, _ []byte, _ string, port int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.port, r.ctx = append(r.port, port), append(r.ctx, ctx)
+	return nil
+}
+func (r *announceRecorder) Browse(ctx context.Context, _ string, _ func(discovery.Found)) error {
+	<-ctx.Done()
+	return nil
+}
+func (r *announceRecorder) snapshot() ([]int, []context.Context) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.port), slices.Clone(r.ctx)
+}
+
+// A machine that boots with no IPv4, then gets one, then moves network must advertise, announce and gossip each new set.
+func TestAddressChangeReannouncesAndGossips(t *testing.T) {
+	f := newTeamFixture(t)
+	tr := &addrTransport{}
+	rec := &announceRecorder{}
+	d := New(Options{Person: "alex", Machine: "mbp", Store: f.aStore, Adapters: adapter.NewRegistry(),
+		FolderAllowed: func(string) bool { return true }, Now: time.Now, Log: quietLog(t),
+		Team: f.aTeam, Keys: f.aKeys, Transports: []transport.Transport{tr},
+		Discoverers:   []discovery.Discoverer{rec, static.New([]string{"lan://192.0.2.99:1"})},
+		PresenceEvery: time.Hour, Debounce: 20 * time.Millisecond})
+	runDaemon(t, d)
+
+	waitUntil(t, 2*time.Second, "boot presence sent", func() bool { return tr.sends.Load() >= 1 })
+	time.Sleep(100 * time.Millisecond)
+	if ports, _ := rec.snapshot(); len(ports) != 0 || len(d.status().Addrs) != 0 {
+		t.Fatalf("no IPv4 yet: announces %v, addrs %v; want none", ports, d.status().Addrs)
+	}
+
+	sent := tr.sends.Load()
+	tr.set("lan://192.0.2.10:4000")
+	waitUntil(t, 2*time.Second, "first address announced", func() bool { p, _ := rec.snapshot(); return len(p) == 1 })
+	if got := d.status().Addrs; !slices.Equal(got, []string{"lan://192.0.2.10:4000"}) {
+		t.Fatalf("addrs = %v", got)
+	}
+	waitUntil(t, 2*time.Second, "presence re-gossiped", func() bool { return tr.sends.Load() > sent })
+
+	sent = tr.sends.Load()
+	tr.set("lan://198.51.100.7:4000")
+	waitUntil(t, 2*time.Second, "new address announced", func() bool { p, _ := rec.snapshot(); return len(p) == 2 })
+	ports, ctxs := rec.snapshot()
+	if ports[1] != 4000 {
+		t.Fatalf("announced port %d, want 4000", ports[1])
+	}
+	if ctxs[0].Err() == nil {
+		t.Fatal("old announcement was not shut down")
+	}
+	if ctxs[1].Err() != nil {
+		t.Fatal("new announcement already shut down")
+	}
+	if got := d.status().Addrs; !slices.Equal(got, []string{"lan://198.51.100.7:4000"}) {
+		t.Fatalf("addrs = %v", got)
+	}
+	waitUntil(t, 2*time.Second, "presence re-gossiped", func() bool { return tr.sends.Load() > sent })
+}

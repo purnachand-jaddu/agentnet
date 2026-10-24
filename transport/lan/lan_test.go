@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -298,5 +299,23 @@ func TestSendRetryAfter(t *testing.T) {
 				t.Fatalf("After = %v, want %v", rae.After, c.want)
 			}
 		})
+	}
+}
+
+// Addrs re-reads the interfaces on each call, so a network change shows up without a re-Listen.
+func TestAddrsFollowInterfaceChanges(t *testing.T) {
+	tr := New("", 0)
+	ips := []net.IP{net.ParseIP("192.0.2.10")}
+	tr.IPs = func() ([]net.IP, error) { return ips, nil }
+	if got, err := tr.Addrs(); err != nil || got != nil {
+		t.Fatalf("before Listen: %v, %v; want none", got, err)
+	}
+	tr.bound = 4321 // stands in for Listen, which would bind every interface
+	if got, _ := tr.Addrs(); !slices.Equal(got, []string{"lan://192.0.2.10:4321"}) {
+		t.Fatalf("addrs = %v", got)
+	}
+	ips = []net.IP{net.ParseIP("198.51.100.7")}
+	if got, _ := tr.Addrs(); !slices.Equal(got, []string{"lan://198.51.100.7:4321"}) {
+		t.Fatalf("after change: addrs = %v", got)
 	}
 }

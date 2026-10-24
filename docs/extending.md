@@ -83,6 +83,9 @@ type Transport interface {
   now reachable at.
 - `Send` delivers one envelope to `addr` and returns the peer's signed `Ack`.
 - Return `*transport.RetryAfterError` from `Send` when the peer asked to be retried later.
+- Optionally add `Addrs() ([]string, error)` if the reachable addresses can change after `Listen`
+  (as `transport/lan` does when the machine changes network): the daemon re-reads it on every
+  gossip tick, re-announces discovery and re-gossips presence when the set changes.
 
 **Register it** by adding to the `Transports` slice built in `withNetwork` in
 `internal/cli/daemon.go`:

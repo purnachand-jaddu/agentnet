@@ -40,8 +40,10 @@ var httpClient = &http.Client{
 type Transport struct {
 	bind string
 	port int
+	IPs  func() ([]net.IP, error) // interface addresses advertised for a 0.0.0.0 bind; netaddr.LocalIPv4 if nil
 
 	mu        sync.Mutex
+	bound     int // the listening port; 0 before Listen
 	srv       *http.Server
 	stopPrune chan struct{}
 	closed    chan struct{} // closed by Close, so the ctx-watcher goroutine exits even if ctx never fires
@@ -87,6 +89,7 @@ func (t *Transport) Listen(ctx context.Context, h transport.Handler) ([]string, 
 	}
 
 	t.mu.Lock()
+	t.bound = port
 	t.srv = srv
 	t.stopPrune = stopPrune
 	t.closed = make(chan struct{})
@@ -110,6 +113,17 @@ func (t *Transport) Listen(ctx context.Context, h transport.Handler) ([]string, 
 	return addrs, nil
 }
 
+// Addrs lists this machine's current lan:// addresses for the listening port, re-reading the interfaces; none before Listen.
+func (t *Transport) Addrs() ([]string, error) {
+	t.mu.Lock()
+	port := t.bound
+	t.mu.Unlock()
+	if port == 0 {
+		return nil, nil
+	}
+	return t.addresses(port)
+}
+
 // addresses lists this machine's lan:// addresses for the bound port: loopback if bind is loopback, the bind IP alone if it's a specific non-loopback address, else one per up, non-loopback IPv4 interface address.
 func (t *Transport) addresses(port int) ([]string, error) {
 	if ip := net.ParseIP(t.bind); ip != nil && ip.IsLoopback() {
@@ -118,7 +132,11 @@ func (t *Transport) addresses(port int) ([]string, error) {
 	if ip := net.ParseIP(t.bind); ip != nil && !ip.IsUnspecified() {
 		return []string{fmt.Sprintf("lan://%s:%d", ip.String(), port)}, nil
 	}
-	ips, err := netaddr.LocalIPv4()
+	ipsFn := t.IPs
+	if ipsFn == nil {
+		ipsFn = netaddr.LocalIPv4
+	}
+	ips, err := ipsFn()
 	if err != nil {
 		return nil, err
 	}

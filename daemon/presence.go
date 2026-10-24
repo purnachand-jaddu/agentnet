@@ -36,27 +36,22 @@ type presence struct {
 
 // startNetwork listens on every transport, starts discovery and the gossip loop; each failure is logged, never fatal.
 func (d *Daemon) startNetwork(ctx context.Context) {
-	var addrs []string
 	for _, t := range d.opts.Transports {
 		a, err := t.Listen(ctx, d.handleEnvelope)
 		if err != nil {
 			d.opts.Log("daemon: listen %v: %v; serving locally only", t.Schemes(), err)
 			continue
 		}
-		addrs = append(addrs, a...)
+		if r, ok := t.(interface{ Addrs() ([]string, error) }); ok {
+			d.addrSrc = append(d.addrSrc, r.Addrs)
+		} else {
+			d.addrSrc = append(d.addrSrc, func() ([]string, error) { return a, nil })
+		}
 	}
-	d.mu.Lock()
-	d.myAddrs = addrs
-	d.mu.Unlock()
+	d.refreshAddrs(ctx)
 
 	teamID := identity.TeamID(d.opts.Team.Founder)
-	port := portOf(addrs)
 	for _, disc := range d.opts.Discoverers {
-		if port != 0 {
-			if err := disc.Announce(ctx, d.opts.Keys.Public(), teamID, port); err != nil {
-				d.opts.Log("daemon: discovery announce unavailable: %v", err)
-			}
-		}
 		d.netGo(func() {
 			if err := disc.Browse(ctx, teamID, d.found); err != nil {
 				d.opts.Log("daemon: discovery browse unavailable: %v", err)
@@ -65,6 +60,50 @@ func (d *Daemon) startNetwork(ctx context.Context) {
 	}
 	d.netGo(func() { d.gossip(ctx) })
 	d.netGo(func() { d.outboxLoop(ctx) })
+}
+
+// refreshAddrs re-reads this machine's transport addresses; on a change it stores them, marks presence due and re-announces.
+// ponytail: no debounce beyond the gossip tick; add one if a flapping interface churns mDNS.
+func (d *Daemon) refreshAddrs(ctx context.Context) {
+	var addrs []string
+	for _, src := range d.addrSrc {
+		a, err := src()
+		if err != nil {
+			return // keep advertising the current set until the interfaces can be read again
+		}
+		addrs = append(addrs, a...)
+	}
+	d.mu.Lock()
+	changed := !slices.Equal(addrs, d.myAddrs)
+	if changed {
+		d.myAddrs, d.netDirty = addrs, true
+	}
+	d.mu.Unlock()
+	if !changed {
+		return
+	}
+	d.opts.Log("daemon: advertising %v", addrs)
+	d.announce(ctx, addrs)
+}
+
+// announce replaces the current discovery announcement with one for addrs' port; none when no address has a port.
+func (d *Daemon) announce(ctx context.Context, addrs []string) {
+	if d.stopAnnounce != nil {
+		d.stopAnnounce()
+		d.stopAnnounce = nil
+	}
+	port := portOf(addrs)
+	if port == 0 {
+		return
+	}
+	actx, cancel := context.WithCancel(ctx)
+	d.stopAnnounce = cancel
+	teamID := identity.TeamID(d.opts.Team.Founder)
+	for _, disc := range d.opts.Discoverers {
+		if err := disc.Announce(actx, d.opts.Keys.Public(), teamID, port); err != nil {
+			d.opts.Log("daemon: discovery announce unavailable: %v", err)
+		}
+	}
 }
 
 // stopNetwork closes every transport and waits for the network goroutines; Run's ctx is already done.
@@ -98,13 +137,14 @@ func portOf(addrs []string) int {
 	return 0
 }
 
-// gossip sends presence when local sessions change (checked every Debounce), when netDirty is set, and every PresenceEvery.
+// gossip sends presence when local sessions or addresses change (checked every Debounce), when netDirty is set, and every PresenceEvery.
 func (d *Daemon) gossip(ctx context.Context) {
 	tick := time.NewTicker(d.opts.Debounce)
 	defer tick.Stop()
 	var lastSnap []byte
 	var lastSent time.Time
 	for {
+		d.refreshAddrs(ctx)
 		sessions := d.localWho(WhoArgs{}).Sessions
 		slices.SortFunc(sessions, func(x, y WhoEntry) int { return strings.Compare(x.Address, y.Address) })
 		snap, _ := json.Marshal(sessions) // WhoEntry always marshals

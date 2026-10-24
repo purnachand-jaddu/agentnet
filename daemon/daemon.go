@@ -74,14 +74,16 @@ type Daemon struct {
 	gitMu    sync.Mutex // guards gitCache; never held together with mu
 	gitCache map[string]gitInfo
 
-	verifier envelope.Verifier
-	peers    map[string]*peer     // remote member machines, keyed by peerKey; guarded by mu
-	statics  []string             // keyless discovery hints (static peers); guarded by mu
-	myAddrs  []string             // this machine's transport addresses; guarded by mu
-	netDirty bool                 // something changed that warrants sending presence now; guarded by mu
-	addrSkip map[string]time.Time // endpoints that asked us to wait, until when; guarded by mu
-	unsaved  atomic.Bool          // a merged team change hasn't reached the store yet
-	netWG    sync.WaitGroup       // network goroutines Run waits for
+	verifier     envelope.Verifier
+	peers        map[string]*peer           // remote member machines, keyed by peerKey; guarded by mu
+	statics      []string                   // keyless discovery hints (static peers); guarded by mu
+	myAddrs      []string                   // this machine's transport addresses; guarded by mu
+	addrSrc      []func() ([]string, error) // each listening transport's current addresses; set by startNetwork, then gossip only
+	stopAnnounce context.CancelFunc         // ends the current discovery announcement; startNetwork, then gossip only
+	netDirty     bool                       // something changed that warrants sending presence now; guarded by mu
+	addrSkip     map[string]time.Time       // endpoints that asked us to wait, until when; guarded by mu
+	unsaved      atomic.Bool                // a merged team change hasn't reached the store yet
+	netWG        sync.WaitGroup             // network goroutines Run waits for
 
 	sendMu   map[string]*sync.Mutex // per-peer lock serialising message sends; guarded by mu
 	flushing map[string]bool        // peers with a flusher running; guarded by mu
