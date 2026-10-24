@@ -2,6 +2,7 @@
 package setup
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -103,7 +104,7 @@ func applyHooks(path, exe, agent string) error {
 		hooks = map[string]any{}
 	}
 	for _, event := range hookEventOrder {
-		cmd := fmt.Sprintf("%s hook %s %s", exe, agent, hookKebab[event])
+		cmd := fmt.Sprintf("%s hook %s %s", shellQuoteIfNeeded(exe), agent, hookKebab[event])
 		groups, _ := hooks[event].([]any)
 		hooks[event] = upsertHookGroup(groups, exe, agent, cmd)
 	}
@@ -169,9 +170,11 @@ func groupCommand(group any) string {
 	return cmd
 }
 
-// isOurHook reports whether cmd is one of agentnet's own hook commands for agent.
+// isOurHook reports whether cmd is one of agentnet's own hook commands for agent. It matches
+// both the quoted and unquoted forms of exe, so a hook written before quoting was added (or by
+// an older exe path) is still found on remove.
 func isOurHook(cmd, exe, agent string) bool {
-	if strings.HasPrefix(cmd, exe+" hook ") {
+	if strings.HasPrefix(cmd, shellQuoteIfNeeded(exe)+" hook ") || strings.HasPrefix(cmd, exe+" hook ") {
 		return true
 	}
 	marker := " hook " + agent + " "
@@ -204,6 +207,22 @@ func removeOurGroups(groups []any, exe, agent string) []any {
 	return out
 }
 
+// isUnquotedSafe reports whether r needs no quoting in a shell word or a systemd Exec= token.
+func isUnquotedSafe(r rune) bool {
+	return r == '_' || r == '.' || r == '/' || r == '-' ||
+		(r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+}
+
+// shellQuoteIfNeeded single-quotes s for a POSIX shell if it contains anything outside [A-Za-z0-9_./-].
+func shellQuoteIfNeeded(s string) string {
+	for _, r := range s {
+		if !isUnquotedSafe(r) {
+			return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+		}
+	}
+	return s
+}
+
 // backupOnce copies path to path+".agentnet-bak" the first time it's touched; a no-op once that
 // backup exists, or if path doesn't exist yet.
 func backupOnce(path string) error {
@@ -221,7 +240,8 @@ func backupOnce(path string) error {
 	return os.WriteFile(bak, data, 0o600)
 }
 
-// loadJSON reads path as a JSON object, treating a missing file as {}.
+// loadJSON reads path as a JSON object, treating a missing file as {}. Numbers decode as
+// json.Number so re-encoding doesn't reformat them.
 func loadJSON(path string) (map[string]any, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -230,8 +250,10 @@ func loadJSON(path string) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
 	var doc map[string]any
-	if err := json.Unmarshal(data, &doc); err != nil {
+	if err := dec.Decode(&doc); err != nil {
 		return nil, err
 	}
 	if doc == nil {
@@ -240,14 +262,41 @@ func loadJSON(path string) (map[string]any, error) {
 	return doc, nil
 }
 
-// saveJSON writes doc to path as indented JSON, creating path's directory if needed.
+// saveJSON writes doc to path as indented JSON with HTML-escaping off (so "&&"/">" survive as
+// written), atomically: a temp file in path's directory, renamed over path, keeping path's
+// existing file mode if it had one.
 func saveJSON(path string, doc map[string]any) error {
-	data, err := json.MarshalIndent(doc, "", "  ")
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(doc); err != nil { // Encode appends the trailing newline
+		return err
+	}
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	mode := os.FileMode(0o644)
+	if st, err := os.Stat(path); err == nil {
+		mode = st.Mode()
+	}
+	tmp, err := os.CreateTemp(dir, ".setup-*.tmp")
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // no-op once the rename below succeeds
+	if _, err := tmp.Write(buf.Bytes()); err != nil {
+		tmp.Close()
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpPath, mode); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }

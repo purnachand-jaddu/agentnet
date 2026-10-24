@@ -36,7 +36,9 @@ func cmdSetup(args []string) int {
 
 	approver := newApprover()
 	steps := setup.Plan(home, exe, setup.Exec)
-	steps = append(steps, folderStep(approver))
+	if !*remove {
+		steps = append(steps, folderStep(approver)) // nothing to undo on --remove
+	}
 
 	var detail strings.Builder
 	for _, s := range steps {

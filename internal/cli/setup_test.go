@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/purnachand-jaddu/agentnet/consent"
@@ -63,4 +64,29 @@ func TestSetupNoHumanAbortsWithNoChanges(t *testing.T) {
 		t.Fatal("code = 0, want non-zero on consent denial")
 	}
 	assertHomeUntouched(t, home, before)
+}
+
+// TestSetupRemoveOmitsFolderStep checks --remove's step list never offers to opt the cwd in —
+// there's nothing for --remove to undo there.
+func TestSetupRemoveOmitsFolderStep(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("AGENTNET_HOME", filepath.Join(home, ".agentnet"))
+	t.Setenv("PATH", t.TempDir())
+
+	out, _ := withIO(t)
+	if code := Main([]string{"setup", "--dry-run"}, "v0"); code != 0 {
+		t.Fatalf("code = %d, want 0", code)
+	}
+	if !strings.Contains(out.String(), "Opt this folder in") {
+		t.Fatalf("apply's dry-run should list the folder step: %q", out.String())
+	}
+
+	out, _ = withIO(t)
+	if code := Main([]string{"setup", "--remove", "--dry-run"}, "v0"); code != 0 {
+		t.Fatalf("code = %d, want 0", code)
+	}
+	if strings.Contains(out.String(), "Opt this folder in") {
+		t.Fatalf("--remove should omit the folder step: %q", out.String())
+	}
 }

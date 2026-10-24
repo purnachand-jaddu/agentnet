@@ -1,6 +1,7 @@
 package setup
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,16 +18,14 @@ func codexStep(home, exe string, run Runner) Step {
 	return Step{
 		Name: "Codex: MCP server and hooks (trust new hooks once in /hooks)",
 		Apply: func() error {
-			if err := applyCodexConfig(configPath, exe); err != nil {
-				return err
-			}
-			return applyHooks(hooksPath, exe, codexAgent)
+			errConfig := applyCodexConfig(configPath, exe)
+			errHooks := applyHooks(hooksPath, exe, codexAgent)
+			return errors.Join(errConfig, errHooks)
 		},
 		Remove: func() error {
-			if err := removeCodexConfig(configPath); err != nil {
-				return err
-			}
-			return removeHooks(hooksPath, exe, codexAgent)
+			errConfig := removeCodexConfig(configPath)
+			errHooks := removeHooks(hooksPath, exe, codexAgent)
+			return errors.Join(errConfig, errHooks)
 		},
 		Check: func() (bool, error) {
 			data, err := os.ReadFile(configPath)
@@ -42,9 +41,15 @@ func codexStep(home, exe string, run Runner) Step {
 func codexBlock(exe string) []string {
 	return []string{
 		"[mcp_servers.agentnet]",
-		fmt.Sprintf(`command = "%s"`, exe),
+		fmt.Sprintf(`command = "%s"`, tomlEscape(exe)),
 		`args = ["mcp"]`,
 	}
+}
+
+// tomlEscape escapes \ and " for a TOML basic string.
+func tomlEscape(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	return strings.ReplaceAll(s, `"`, `\"`)
 }
 
 // applyCodexConfig appends, or in place replaces, our [mcp_servers.agentnet] table in path.

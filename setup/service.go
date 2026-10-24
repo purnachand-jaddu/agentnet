@@ -9,12 +9,21 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/purnachand-jaddu/agentnet/internal/paths"
+	"github.com/purnachand-jaddu/agentnet/ipc"
 )
 
 // launchAgentLabel is the launchd job label (and plist basename, minus ".plist").
 const launchAgentLabel = "dev.agentnet.daemon"
+
+// shutdownWait and startWait bound how long the service step waits for the old daemon to let go
+// of the socket, and for the newly (re)started one to pick it back up.
+const (
+	shutdownWait = 3 * time.Second
+	startWait    = 5 * time.Second
+)
 
 // serviceStep installs and starts agentnet's background daemon as the OS's per-user service.
 func serviceStep(home, exe string, run Runner, goos string, binDirs []string) Step {
@@ -22,6 +31,41 @@ func serviceStep(home, exe string, run Runner, goos string, binDirs []string) St
 		return macServiceStep(home, exe, run, binDirs)
 	}
 	return linuxServiceStep(home, exe, run, binDirs)
+}
+
+// takeOverRunningDaemon asks any daemon already answering on paths.Socket() to shut down, and
+// waits for it to let go, so the service we're about to (re)start becomes the one true runner
+// instead of losing the flock to it and sitting in backoff. A no-op if nothing is listening.
+func takeOverRunningDaemon() {
+	c, err := ipc.Dial(paths.Socket())
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownWait)
+	c.Call(ctx, "shutdown", nil, nil) // best effort; the poll below is what actually matters
+	cancel()
+	c.Close()
+	waitForSocket(shutdownWait, false)
+}
+
+// waitForSocket polls paths.Socket() until dialing it succeeds (want=true) or fails (want=false),
+// or timeout elapses; it reports whether that state was reached.
+func waitForSocket(timeout time.Duration, want bool) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		c, err := ipc.Dial(paths.Socket())
+		answers := err == nil
+		if c != nil {
+			c.Close()
+		}
+		if answers == want {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // servicePATH is the PATH the service runs with: binDirs (where claude/codex were found) first,
@@ -93,15 +137,25 @@ func macServiceStep(home, exe string, run Runner, binDirs []string) Step {
 	return Step{
 		Name: "Background service (launchd)",
 		Apply: func() error {
+			if err := paths.Ensure(); err != nil {
+				return err
+			}
+			takeOverRunningDaemon()
+
 			if err := os.MkdirAll(filepath.Dir(plistPath), 0o700); err != nil {
 				return err
 			}
 			if err := os.WriteFile(plistPath, []byte(plistXML(exe, binDirs)), 0o644); err != nil {
 				return err
 			}
+
+			run(context.Background(), "launchctl", "bootout", service) // ignore: fine if it wasn't loaded
 			if _, err := run(context.Background(), "launchctl", "bootstrap", target, plistPath); err != nil {
-				_, err = run(context.Background(), "launchctl", "kickstart", "-k", service)
 				return err
+			}
+
+			if !waitForSocket(startWait, true) {
+				return fmt.Errorf("service did not start; see %s", paths.Log())
 			}
 			return nil
 		},
@@ -119,19 +173,34 @@ func macServiceStep(home, exe string, run Runner, binDirs []string) Step {
 	}
 }
 
+// systemdQuoteIfNeeded double-quotes s for a systemd unit's Exec= syntax if it contains anything
+// outside [A-Za-z0-9_./-].
+func systemdQuoteIfNeeded(s string) string {
+	for _, r := range s {
+		if !isUnquotedSafe(r) {
+			return `"` + tomlEscape(s) + `"` // systemd's "..." escaping matches \ and " doubling
+		}
+	}
+	return s
+}
+
 // systemdUnit renders agentnet's systemd user unit.
 func systemdUnit(exe string, binDirs []string) string {
+	env := "Environment=PATH=" + servicePATH(binDirs)
+	if h := os.Getenv("AGENTNET_HOME"); h != "" {
+		env += "\nEnvironment=AGENTNET_HOME=" + h
+	}
 	return fmt.Sprintf(`[Unit]
 Description=agentnet daemon
 
 [Service]
 ExecStart=%s daemon --service
 Restart=always
-Environment=PATH=%s
+%s
 
 [Install]
 WantedBy=default.target
-`, exe, servicePATH(binDirs))
+`, systemdQuoteIfNeeded(exe), env)
 }
 
 // linuxServiceStep installs agentnet.service as a systemd user unit.
@@ -140,17 +209,32 @@ func linuxServiceStep(home, exe string, run Runner, binDirs []string) Step {
 	return Step{
 		Name: "Background service (systemd)",
 		Apply: func() error {
+			if err := paths.Ensure(); err != nil {
+				return err
+			}
+			takeOverRunningDaemon()
+
 			if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
 				return err
 			}
 			if err := os.WriteFile(unitPath, []byte(systemdUnit(exe, binDirs)), 0o644); err != nil {
 				return err
 			}
+
 			if _, err := run(context.Background(), "systemctl", "--user", "daemon-reload"); err != nil {
 				return err
 			}
-			_, err := run(context.Background(), "systemctl", "--user", "enable", "--now", "agentnet")
-			return err
+			if _, err := run(context.Background(), "systemctl", "--user", "enable", "agentnet"); err != nil {
+				return err
+			}
+			if _, err := run(context.Background(), "systemctl", "--user", "restart", "agentnet"); err != nil {
+				return err
+			}
+
+			if !waitForSocket(startWait, true) {
+				return fmt.Errorf("service did not start; see %s", paths.Log())
+			}
+			return nil
 		},
 		Remove: func() error {
 			run(context.Background(), "systemctl", "--user", "disable", "--now", "agentnet")
