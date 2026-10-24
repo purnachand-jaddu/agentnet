@@ -5,6 +5,8 @@ on:
   pull_request:
 jobs:
   test:
+    env:
+      AGENTNET_SKIP_MDNS: "1"
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
