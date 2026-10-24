@@ -12,14 +12,13 @@ var frameTagRx = regexp.MustCompile(`(?i)<(/?)agentnet-`)
 func Defang(s string) string {
 	var b strings.Builder
 	for _, r := range s {
-		// Skip control chars except tab/newline; skip invisible/bidi chars.
 		if r == '\n' || r == '\t' || (r >= 0x20 && r != 0x7f && !(r >= 0x80 && r < 0xa0) &&
 			!(r >= 0x200b && r <= 0x200f) && !(r >= 0x202a && r <= 0x202e) && !(r >= 0x2066 && r <= 0x2069)) {
 			b.WriteRune(r)
 		}
 	}
-	// Neutralize both <agentnet- and </agentnet- (case-insensitive) by replacing < with ‹.
-	return frameTagRx.ReplaceAllString(b.String(), "‹$1agentnet-")
+	// Replace <agentnet- and </agentnet- (case-insensitive) with ‹${1}agentnet- to break tags.
+	return frameTagRx.ReplaceAllString(b.String(), "‹${1}agentnet-")
 }
 
 func attr(s string) string {
