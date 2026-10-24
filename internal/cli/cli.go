@@ -46,6 +46,8 @@ func Main(args []string, version string) int {
 		return cmdListen(args[1:])
 	case "folder":
 		return cmdFolder(args[1:])
+	case "setup":
+		return cmdSetup(args[1:])
 	default:
 		usage()
 		return 2
@@ -54,5 +56,5 @@ func Main(args []string, version string) int {
 
 // usage prints the command summary to stderr.
 func usage() {
-	fmt.Fprintln(stderr, "usage: agentnet daemon|mcp|hook|send|who|listen|folder|version")
+	fmt.Fprintln(stderr, "usage: agentnet daemon|mcp|hook|send|who|listen|folder|setup|version")
 }
