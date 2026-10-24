@@ -3,7 +3,9 @@ package paths
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -41,5 +43,41 @@ func TestEnsureCreatesPrivateDir(t *testing.T) {
 	st, _ := os.Stat(dir)
 	if st.Mode().Perm() != 0o700 {
 		t.Fatalf("mode = %v", st.Mode().Perm())
+	}
+}
+
+func TestSocketDirPrivate(t *testing.T) {
+	long := filepath.Join(t.TempDir(), strings.Repeat("d", 120))
+	t.Setenv("AGENTNET_HOME", long)
+	if err := SocketDir(); err != nil {
+		t.Fatal(err)
+	}
+	sockDir := filepath.Join(os.TempDir(), "agentnet-"+strconv.Itoa(os.Getuid()))
+	st, err := os.Lstat(sockDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o700 {
+		t.Fatalf("socket dir mode = %v, want 0700", st.Mode().Perm())
+	}
+	stat := st.Sys().(*syscall.Stat_t)
+	if int(stat.Uid) != os.Getuid() {
+		t.Fatalf("socket dir uid = %d, want %d", stat.Uid, os.Getuid())
+	}
+}
+
+func TestSocketDirRejectsWorldWritable(t *testing.T) {
+	long := filepath.Join(t.TempDir(), strings.Repeat("d", 120))
+	t.Setenv("AGENTNET_HOME", long)
+	sockDir := filepath.Join(os.TempDir(), "agentnet-"+strconv.Itoa(os.Getuid()))
+	if err := os.MkdirAll(sockDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := SocketDir(); err != nil {
+		t.Fatalf("SocketDir should fix 0777 but got error: %v", err)
+	}
+	st, _ := os.Stat(sockDir)
+	if st.Mode().Perm() != 0o700 {
+		t.Fatalf("socket dir mode = %v after SocketDir, want 0700", st.Mode().Perm())
 	}
 }
