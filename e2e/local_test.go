@@ -20,34 +20,37 @@ import (
 	"github.com/purnachand-jaddu/agentnet/ipc"
 )
 
-// binPath is the built agentnet binary; buildErr is set if the build failed, so tests skip instead of failing.
+// binPath is the built agentnet binary; buildErr is set if the build itself failed.
 var (
 	binPath  string
 	buildErr error
 )
 
 func TestMain(m *testing.M) {
-	buildErr = buildAgentnet()
-	os.Exit(m.Run())
+	dir, err := os.MkdirTemp("/tmp", "an")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "e2e: mkdtemp:", err)
+		os.Exit(1)
+	}
+	binPath = filepath.Join(dir, "agentnet")
+	buildErr = buildAgentnet(binPath)
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
 }
 
-// buildAgentnet builds ./cmd/agentnet into a temp dir, resolving the module root via `go env GOMOD`.
-func buildAgentnet() error {
+// buildAgentnet builds ./cmd/agentnet to out, resolving the module root via `go env GOMOD`.
+func buildAgentnet(out string) error {
 	modOut, err := exec.Command("go", "env", "GOMOD").Output()
 	if err != nil {
 		return fmt.Errorf("go env GOMOD: %w", err)
 	}
 	modRoot := filepath.Dir(strings.TrimSpace(string(modOut)))
 
-	tmp, err := os.MkdirTemp("/tmp", "an")
-	if err != nil {
-		return err
-	}
-	binPath = filepath.Join(tmp, "agentnet")
-	build := exec.Command("go", "build", "-o", binPath, "./cmd/agentnet")
+	build := exec.Command("go", "build", "-o", out, "./cmd/agentnet")
 	build.Dir = modRoot
-	if out, err := build.CombinedOutput(); err != nil {
-		return fmt.Errorf("go build: %w\n%s", err, out)
+	if cout, err := build.CombinedOutput(); err != nil {
+		return fmt.Errorf("go build: %w\n%s", err, cout)
 	}
 	return nil
 }
@@ -139,6 +142,19 @@ func (f *fakeClaudeSocket) snapshot() []string {
 	return append([]string(nil), f.lines...)
 }
 
+// claudeFrame is the subset of an inbox-socket line this test cares about.
+type claudeFrame struct {
+	Type    string `json:"type"`
+	Message struct {
+		Content string `json:"content"`
+	} `json:"message"`
+}
+
+// parseClaudeFrame decodes line as a claudeFrame; ok is false if it doesn't parse.
+func parseClaudeFrame(line string) (f claudeFrame, ok bool) {
+	return f, json.Unmarshal([]byte(line), &f) == nil
+}
+
 // shutdownDaemon sends the "shutdown" op over sockPath, then waits for cmd to exit, killing it if it doesn't.
 func shutdownDaemon(cmd *exec.Cmd, sockPath string) {
 	if c, err := ipc.Dial(sockPath); err == nil {
@@ -157,7 +173,7 @@ func shutdownDaemon(cmd *exec.Cmd, sockPath string) {
 
 func TestClaudeAndCodexExchangeMessages(t *testing.T) {
 	if buildErr != nil {
-		t.Skipf("agentnet build failed: %v", buildErr)
+		t.Fatalf("agentnet build failed: %v", buildErr)
 	}
 
 	tmp, err := os.MkdirTemp("/tmp", "an")
@@ -188,6 +204,7 @@ func TestClaudeAndCodexExchangeMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// AGENTNET_HOME must stay != $HOME/.agentnet, or autostart would try to kickstart the real launchd service (/bin/launchctl is on PATH).
 	env := []string{
 		"HOME=" + home,
 		"AGENTNET_HOME=" + home,
@@ -210,11 +227,14 @@ func TestClaudeAndCodexExchangeMessages(t *testing.T) {
 		logFile.Close()
 	})
 
+	// Poll the socket directly, not via a CLI command: any command that dials through
+	// autostartDial could itself spawn a second daemon while this one is still starting.
 	waitUntil(t, 10*time.Second, func() (bool, string) {
-		_, errOut, err := runCLI(env, nil, "who")
+		c, err := ipc.Dial(sockPath)
 		if err != nil {
-			return false, fmt.Sprintf("daemon not ready: %v: %s", err, errOut)
+			return false, "daemon socket not ready: " + err.Error()
 		}
+		c.Close()
 		return true, ""
 	})
 
@@ -259,18 +279,36 @@ func TestClaudeAndCodexExchangeMessages(t *testing.T) {
 	}
 	waitUntil(t, 5*time.Second, func() (bool, string) {
 		for _, line := range fakeClaude.snapshot() {
-			var frame struct {
-				Type    string `json:"type"`
-				Message struct {
-					Content string `json:"content"`
-				} `json:"message"`
-			}
-			if json.Unmarshal([]byte(line), &frame) == nil && frame.Type == "user" && strings.Contains(frame.Message.Content, "pong") {
+			if f, ok := parseClaudeFrame(line); ok && f.Type == "user" && strings.Contains(f.Message.Content, "pong") {
 				return true, ""
 			}
 		}
 		return false, fmt.Sprintf("fake Claude socket never got pong; lines=%v", fakeClaude.snapshot())
 	})
+
+	// Give a duplicate or stray push a chance to arrive before asserting there's exactly one.
+	time.Sleep(300 * time.Millisecond)
+	var pongCount int
+	var pongContent string
+	for _, line := range fakeClaude.snapshot() {
+		f, ok := parseClaudeFrame(line)
+		if !ok {
+			continue
+		}
+		if strings.Contains(f.Message.Content, "pong") {
+			pongCount++
+			pongContent = f.Message.Content
+		}
+		if strings.Contains(f.Message.Content, "ping") {
+			t.Errorf("fake Claude socket received a frame containing ping (codex's message leaked): %s", line)
+		}
+	}
+	if pongCount != 1 {
+		t.Fatalf("want exactly one frame containing pong, got %d: %v", pongCount, fakeClaude.snapshot())
+	}
+	if !strings.Contains(pongContent, `<agentnet-message from="alex/`) {
+		t.Errorf("pong frame missing expected framing: %s", pongContent)
+	}
 
 	out, errOut, err := runCLI(env, nil, "who")
 	if err != nil {
