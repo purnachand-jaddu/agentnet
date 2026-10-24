@@ -2,13 +2,20 @@
 package daemon
 
 import (
+	"cmp"
 	"context"
 	"sync"
 	"time"
 
 	"github.com/purnachand-jaddu/agentnet/adapter"
+	"github.com/purnachand-jaddu/agentnet/discovery"
+	"github.com/purnachand-jaddu/agentnet/envelope"
+	"github.com/purnachand-jaddu/agentnet/identity"
 	"github.com/purnachand-jaddu/agentnet/ipc"
+	"github.com/purnachand-jaddu/agentnet/seal"
 	"github.com/purnachand-jaddu/agentnet/store"
+	"github.com/purnachand-jaddu/agentnet/team"
+	"github.com/purnachand-jaddu/agentnet/transport"
 )
 
 // touchEvery and forgetEvery pace the periodic jobs Run drives.
@@ -28,6 +35,16 @@ type Options struct {
 	Now             func() time.Time
 	Log             func(format string, args ...any)
 	Service         bool // true when this process was started as the background service (--service)
+
+	Team          *team.State // nil when not in a network: no networking at all
+	Keys          identity.Keys
+	Transports    []transport.Transport
+	Discoverers   []discovery.Discoverer
+	Sealer        seal.Sealer   // seal.HPKE if nil
+	Window        time.Duration // accepted clock skew on envelopes; 5 min if zero
+	PresenceEvery time.Duration // presence resend interval; 60 s if zero
+	OfflineAfter  time.Duration // a machine silent this long is offline; 3 min if zero
+	Debounce      time.Duration // how often local changes are checked and sent; 2 s if zero
 }
 
 // Daemon is one running agentnet daemon: session registry plus (later tasks) send/deliver and hooks.
@@ -47,10 +64,24 @@ type Daemon struct {
 
 	gitMu    sync.Mutex // guards gitCache; never held together with mu
 	gitCache map[string]gitInfo
+
+	verifier envelope.Verifier
+	peers    map[string]*peer // remote member machines, keyed by peerKey; guarded by mu
+	statics  []string         // keyless discovery hints (static peers); guarded by mu
+	myAddrs  []string         // this machine's transport addresses; guarded by mu
+	netDirty bool             // something changed that warrants sending presence now; guarded by mu
+	netWG    sync.WaitGroup   // network goroutines Run waits for
 }
 
 // New builds a Daemon from o.
 func New(o Options) *Daemon {
+	if o.Sealer == nil {
+		o.Sealer = seal.HPKE{}
+	}
+	o.Window = cmp.Or(o.Window, 5*time.Minute)
+	o.PresenceEvery = cmp.Or(o.PresenceEvery, time.Minute)
+	o.OfflineAfter = cmp.Or(o.OfflineAfter, 3*time.Minute)
+	o.Debounce = cmp.Or(o.Debounce, 2*time.Second)
 	return &Daemon{
 		opts:     o,
 		live:     map[string]*live{},
@@ -63,14 +94,20 @@ func New(o Options) *Daemon {
 		started:  o.Now(),
 		shutdown: make(chan struct{}),
 		gitCache: map[string]gitInfo{},
+		verifier: envelope.Verifier{Team: o.Team, Replay: envelope.NewReplay(2 * o.Window), Now: o.Now, Window: o.Window},
+		peers:    map[string]*peer{},
 	}
 }
 
 // Shutdown is closed once the "shutdown" op is handled.
 func (d *Daemon) Shutdown() <-chan struct{} { return d.shutdown }
 
-// Run drives periodic maintenance (touching live sessions, forgetting old ones) until ctx is done. Tests don't call it.
+// Run drives periodic maintenance and, when in a network, presence gossip until ctx is done.
 func (d *Daemon) Run(ctx context.Context) {
+	if d.opts.Team != nil {
+		d.startNetwork(ctx)
+		defer d.stopNetwork()
+	}
 	touch := time.NewTicker(touchEvery)
 	defer touch.Stop()
 	forget := time.NewTicker(forgetEvery)

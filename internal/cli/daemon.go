@@ -22,9 +22,16 @@ import (
 	"github.com/purnachand-jaddu/agentnet/adapter/generic"
 	"github.com/purnachand-jaddu/agentnet/config"
 	"github.com/purnachand-jaddu/agentnet/daemon"
+	"github.com/purnachand-jaddu/agentnet/discovery"
+	"github.com/purnachand-jaddu/agentnet/discovery/mdns"
+	"github.com/purnachand-jaddu/agentnet/discovery/static"
+	"github.com/purnachand-jaddu/agentnet/identity"
 	"github.com/purnachand-jaddu/agentnet/internal/paths"
 	"github.com/purnachand-jaddu/agentnet/ipc"
 	"github.com/purnachand-jaddu/agentnet/store/sqlite"
+	"github.com/purnachand-jaddu/agentnet/team"
+	"github.com/purnachand-jaddu/agentnet/transport"
+	"github.com/purnachand-jaddu/agentnet/transport/lan"
 )
 
 // adapters is the registry shared by the daemon and the MCP server, so they agree on names.
@@ -179,12 +186,33 @@ func newDaemon(logger *log.Logger, service bool) (*daemon.Daemon, io.Closer, err
 		st.Close()
 		return nil, nil, err
 	}
-	d := daemon.New(daemon.Options{
+	o := daemon.Options{
 		Person: cfg.Person, Machine: cfg.Machine, Store: st, Adapters: adapters(),
 		FolderAllowed: folderAllowed(paths.Config()), Now: time.Now, Service: service,
 		Log: func(format string, args ...any) { logger.Printf(format, args...) },
-	})
-	return d, st, nil
+	}
+	if err := withNetwork(&o, cfg, st, logger); err != nil {
+		st.Close()
+		return nil, nil, err
+	}
+	return daemon.New(o), st, nil
+}
+
+// withNetwork fills o's networking fields when this machine is in a network; without keys it stays local and logs why.
+func withNetwork(o *daemon.Options, cfg config.Config, st *sqlite.Store, logger *log.Logger) error {
+	t, err := team.Load(st)
+	if err != nil || t == nil {
+		return err
+	}
+	keys, err := identity.LoadKeys(paths.MachineKey())
+	if err != nil {
+		logger.Printf("daemon: in a network but machine key unreadable (%v); local only", err)
+		return nil
+	}
+	o.Team, o.Keys = t, keys
+	o.Transports = []transport.Transport{lan.New("", cfg.Port)}
+	o.Discoverers = []discovery.Discoverer{&mdns.Discoverer{Self: keys.Public()}, static.New(cfg.Peers)}
+	return nil
 }
 
 // folderAllowed returns a FolderAllowed func that reloads cfgPath at most once every 2s, so `folder add` takes

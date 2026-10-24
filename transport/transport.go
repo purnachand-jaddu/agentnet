@@ -3,6 +3,8 @@ package transport
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	"github.com/purnachand-jaddu/agentnet/envelope"
 )
@@ -16,4 +18,13 @@ type Transport interface {
 	Listen(ctx context.Context, h Handler) (addrs []string, err error)
 	Send(ctx context.Context, addr string, e envelope.Envelope) (envelope.Ack, error)
 	Close() error
+}
+
+// RetryAfterError means the peer asked the caller to wait After before sending again.
+type RetryAfterError struct {
+	After time.Duration
+}
+
+func (e *RetryAfterError) Error() string {
+	return fmt.Sprintf("rate limited, retry after %s", e.After)
 }

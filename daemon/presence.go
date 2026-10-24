@@ -1,0 +1,257 @@
+package daemon
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/purnachand-jaddu/agentnet/envelope"
+	"github.com/purnachand-jaddu/agentnet/identity"
+	"github.com/purnachand-jaddu/agentnet/message"
+	"github.com/purnachand-jaddu/agentnet/transport"
+)
+
+// sendTimeout bounds one presence send to one member across all its addresses; verified ones get the first half.
+const sendTimeout = 5 * time.Second
+
+// presence is what a machine tells every other member about itself.
+type presence struct {
+	Sessions []WhoEntry       `json:"sessions"` // its local sessions only
+	Addrs    []string         `json:"addrs"`    // its transport addresses
+	Certs    []identity.Cert  `json:"certs"`    // members it knows
+	Blocks   []identity.Block `json:"blocks"`
+	TS       int64            `json:"ts"` // unix ms
+}
+
+// startNetwork listens on every transport, starts discovery and the gossip loop; each failure is logged, never fatal.
+func (d *Daemon) startNetwork(ctx context.Context) {
+	var addrs []string
+	for _, t := range d.opts.Transports {
+		a, err := t.Listen(ctx, d.handleEnvelope)
+		if err != nil {
+			d.opts.Log("daemon: listen %v: %v; serving locally only", t.Schemes(), err)
+			continue
+		}
+		addrs = append(addrs, a...)
+	}
+	d.mu.Lock()
+	d.myAddrs = addrs
+	d.mu.Unlock()
+
+	teamID := identity.TeamID(d.opts.Team.Founder)
+	port := portOf(addrs)
+	for _, disc := range d.opts.Discoverers {
+		if port != 0 {
+			if err := disc.Announce(ctx, d.opts.Keys.Public(), teamID, port); err != nil {
+				d.opts.Log("daemon: discovery announce unavailable: %v", err)
+			}
+		}
+		d.netGo(func() {
+			if err := disc.Browse(ctx, teamID, d.found); err != nil {
+				d.opts.Log("daemon: discovery browse unavailable: %v", err)
+			}
+		})
+	}
+	d.netGo(func() { d.gossip(ctx) })
+}
+
+// stopNetwork closes every transport and waits for the network goroutines; Run's ctx is already done.
+func (d *Daemon) stopNetwork() {
+	for _, t := range d.opts.Transports {
+		if err := t.Close(); err != nil {
+			d.opts.Log("daemon: close transport %v: %v", t.Schemes(), err)
+		}
+	}
+	d.netWG.Wait()
+}
+
+// netGo runs fn via safeGo, tracked so stopNetwork waits for it.
+func (d *Daemon) netGo(fn func()) {
+	d.netWG.Add(1)
+	d.safeGo(func() {
+		defer d.netWG.Done()
+		fn()
+	})
+}
+
+// portOf returns the port of the first address that has one, or 0.
+func portOf(addrs []string) int {
+	for _, a := range addrs {
+		if u, err := url.Parse(a); err == nil {
+			if p, err := strconv.Atoi(u.Port()); err == nil {
+				return p
+			}
+		}
+	}
+	return 0
+}
+
+// gossip sends presence when local sessions change (checked every Debounce), when netDirty is set, and every PresenceEvery.
+func (d *Daemon) gossip(ctx context.Context) {
+	tick := time.NewTicker(d.opts.Debounce)
+	defer tick.Stop()
+	var lastSnap []byte
+	var lastSent time.Time
+	for {
+		sessions := d.localWho(WhoArgs{}).Sessions
+		slices.SortFunc(sessions, func(x, y WhoEntry) int { return strings.Compare(x.Address, y.Address) })
+		snap, _ := json.Marshal(sessions) // WhoEntry always marshals
+		d.mu.Lock()
+		dirty := d.netDirty
+		d.netDirty = false
+		d.mu.Unlock()
+		if now := d.opts.Now(); dirty || !bytes.Equal(snap, lastSnap) || now.Sub(lastSent) >= d.opts.PresenceEvery {
+			lastSnap, lastSent = snap, now
+			d.broadcast(ctx, sessions)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+	}
+}
+
+// broadcast seals sessions, this machine's addresses and its team view to every other member, concurrently.
+func (d *Daemon) broadcast(ctx context.Context, sessions []WhoEntry) {
+	d.mu.Lock()
+	addrs := slices.Clone(d.myAddrs)
+	d.mu.Unlock()
+	members := d.opts.Team.MembersSnapshot()
+	payload, err := json.Marshal(presence{Sessions: sessions, Addrs: addrs, Certs: members,
+		Blocks: d.opts.Team.BlocksSnapshot(), TS: d.opts.Now().UnixMilli()})
+	if err != nil {
+		d.opts.Log("daemon: presence: %v", err)
+		return
+	}
+	var wg sync.WaitGroup
+	for _, c := range members {
+		if bytes.Equal(c.Key, d.opts.Keys.Public()) {
+			continue
+		}
+		wg.Add(1)
+		d.safeGo(func() {
+			defer wg.Done()
+			d.sendPresence(ctx, c, payload)
+		})
+	}
+	wg.Wait()
+}
+
+// sendPresence delivers payload to one member: verified addresses first, then hints and static peers.
+func (d *Daemon) sendPresence(ctx context.Context, to identity.Cert, payload []byte) {
+	key := peerKey(to.Key)
+	now := d.opts.Now()
+	verified, fallback, skip := d.addrsFor(key, now)
+	if skip || len(verified)+len(fallback) == 0 {
+		return
+	}
+	e, err := envelope.Build("presence", message.NewID(), d.opts.Keys, d.opts.Team.Self, to, payload, d.opts.Sealer, now)
+	if err != nil {
+		d.opts.Log("daemon: build presence for %s: %v", to.Machine, err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, sendTimeout)
+	defer cancel()
+	first, cancelFirst := context.WithTimeout(ctx, sendTimeout/2)
+	addr, ok := d.race(first, key, to, e, verified)
+	cancelFirst()
+	if !ok {
+		addr, ok = d.race(ctx, key, to, e, fallback)
+	}
+	if ok {
+		d.markVerified(key, addr)
+	}
+}
+
+// race sends e to every addr at once and returns the first address whose reply is to's signed "delivered" ack.
+func (d *Daemon) race(ctx context.Context, key string, to identity.Cert, e envelope.Envelope, addrs []string) (string, bool) {
+	if len(addrs) == 0 {
+		return "", false
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	won := make(chan string, len(addrs))
+	var wg sync.WaitGroup
+	for _, a := range addrs {
+		wg.Add(1)
+		d.safeGo(func() {
+			defer wg.Done()
+			ack, err := d.sendVia(ctx, a, e)
+			var ra *transport.RetryAfterError
+			switch {
+			case errors.As(err, &ra):
+				d.backoff(key, ra.After)
+			case err != nil:
+			case ack.State == message.StateDelivered && envelope.VerifyAck(ack, to, e.ID) == nil:
+				won <- a
+			}
+		})
+	}
+	d.safeGo(func() {
+		wg.Wait()
+		close(won)
+	})
+	a, ok := <-won
+	return a, ok
+}
+
+// sendVia sends e to addr over the transport that dials addr's scheme.
+func (d *Daemon) sendVia(ctx context.Context, addr string, e envelope.Envelope) (envelope.Ack, error) {
+	u, err := url.Parse(addr)
+	if err != nil {
+		return envelope.Ack{}, err
+	}
+	for _, t := range d.opts.Transports {
+		if slices.Contains(t.Schemes(), u.Scheme) {
+			return t.Send(ctx, addr, e)
+		}
+	}
+	return envelope.Ack{}, fmt.Errorf("daemon: no transport for %q", addr)
+}
+
+// handleEnvelope answers one incoming envelope with a signed ack; only "presence" is handled so far.
+func (d *Daemon) handleEnvelope(_ context.Context, e envelope.Envelope) envelope.Ack {
+	ack := envelope.Ack{ID: e.ID, State: message.StateDelivered, TS: d.opts.Now().UnixMilli()}
+	switch e.Kind {
+	case "presence":
+		if err := d.receivePresence(e); err != nil {
+			ack.State, ack.Note = message.StateRefused, err.Error()
+		}
+	default: // "msg" arrives with verified receive
+		ack.State, ack.Note = message.StateRefused, "not yet supported"
+	}
+	envelope.SignAck(&ack, d.opts.Keys)
+	return ack
+}
+
+// receivePresence verifies and applies one presence: team merge (persisted on change), then the directory.
+func (d *Daemon) receivePresence(e envelope.Envelope) error {
+	plain, err := d.verifier.Open(e, d.opts.Keys, d.opts.Sealer)
+	if err != nil {
+		return err
+	}
+	var p presence
+	if err := json.Unmarshal(plain, &p); err != nil {
+		return fmt.Errorf("presence: %w", err)
+	}
+	now := d.opts.Now()
+	if d.opts.Team.Merge(append(p.Certs, e.Cert), p.Blocks, now) {
+		if err := d.opts.Team.Persist(d.opts.Store); err != nil {
+			d.opts.Log("daemon: persist team: %v", err)
+		}
+	}
+	if err := d.opts.Team.Verify(e.Cert, now); err != nil { // its own presence may carry its block
+		return err
+	}
+	d.applyPresence(e.Cert, p, now)
+	return nil
+}

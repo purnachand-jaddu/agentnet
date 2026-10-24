@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/purnachand-jaddu/agentnet/identity"
@@ -28,8 +29,9 @@ const (
 	nsBlock = "block"
 )
 
-// State is this machine's view of the team.
+// State is this machine's view of the team; its methods are safe for concurrent use, direct map access is not.
 type State struct {
+	mu      sync.RWMutex
 	Founder ed25519.PublicKey
 	Self    identity.Cert
 	Members map[string]identity.Cert  // base64url key -> cert
@@ -248,6 +250,8 @@ func Accept(s store.Store, keys identity.Keys, b identity.Bundle, now time.Time)
 
 // Verify checks c's founder signature and that c's key isn't blocked.
 func (st *State) Verify(c identity.Cert, now time.Time) error {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
 	if err := c.Verify(st.Founder, now); err != nil {
 		return err
 	}
@@ -260,6 +264,8 @@ func (st *State) Verify(c identity.Cert, now time.Time) error {
 // Merge folds certs and blocks into st: only founder-verified entries survive, the later-Issued cert wins
 // per key, and a block removes that key from Members. It reports whether st changed.
 func (st *State) Merge(certs []identity.Cert, blocks []identity.Block, now time.Time) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	changed := false
 	for _, c := range certs {
 		if err := c.Verify(st.Founder, now); err != nil {
@@ -293,11 +299,50 @@ func (st *State) Merge(certs []identity.Cert, blocks []identity.Block, now time.
 
 // ByPerson returns every member cert for person.
 func (st *State) ByPerson(person string) []identity.Cert {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
 	var out []identity.Cert
 	for _, c := range st.Members {
 		if c.Person == person {
 			out = append(out, c)
 		}
+	}
+	return out
+}
+
+// Persist saves st to s, founder last.
+func (st *State) Persist(s store.Store) error {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	return st.save(s)
+}
+
+// CertFor returns the member cert for key, if any.
+func (st *State) CertFor(key []byte) (identity.Cert, bool) {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	c, ok := st.Members[keyB64(key)]
+	return c, ok
+}
+
+// MembersSnapshot returns a copy of every member cert.
+func (st *State) MembersSnapshot() []identity.Cert {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	out := make([]identity.Cert, 0, len(st.Members))
+	for _, c := range st.Members {
+		out = append(out, c)
+	}
+	return out
+}
+
+// BlocksSnapshot returns a copy of every block.
+func (st *State) BlocksSnapshot() []identity.Block {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	out := make([]identity.Block, 0, len(st.Blocks))
+	for _, b := range st.Blocks {
+		out = append(out, b)
 	}
 	return out
 }

@@ -366,3 +366,70 @@ func TestCreatePartialFailureNeverReadsAsATeam(t *testing.T) {
 		t.Fatal("a partially-written Create must not read back as an existing team")
 	}
 }
+
+// Gossip merges while the envelope verifier reads; both must be safe together under -race.
+func TestConcurrentMergeAndVerify(t *testing.T) {
+	fpub, fpriv := genFounder(t)
+	st := &State{Founder: fpub, Members: map[string]identity.Cert{}, Blocks: map[string]identity.Block{}}
+	now := time.Now()
+
+	var certs []identity.Cert
+	for i := 0; i < 50; i++ {
+		k, _ := identity.GenerateKeys()
+		c := identity.Cert{V: 1, Team: identity.TeamID(fpub), Key: k.Public(), Enc: k.EncPublic(), Person: "sam", Machine: "xps", Issued: int64(i + 1)}
+		c.Sign(fpriv)
+		certs = append(certs, c)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for _, c := range certs {
+			st.Merge([]identity.Cert{c}, nil, now)
+			blk := identity.Block{Team: identity.TeamID(fpub), Key: c.Key, Reason: "test", TS: 1}
+			blk.Sign(fpriv)
+			st.Merge(nil, []identity.Block{blk}, now)
+		}
+	}()
+	for _, c := range certs {
+		st.Verify(c, now)
+		st.ByPerson("sam")
+		st.CertFor(c.Key)
+		st.MembersSnapshot()
+		st.BlocksSnapshot()
+	}
+	<-done
+	if len(st.BlocksSnapshot()) != len(certs) || len(st.MembersSnapshot()) != 0 {
+		t.Fatalf("blocks = %d, members = %d; want %d, 0", len(st.BlocksSnapshot()), len(st.MembersSnapshot()), len(certs))
+	}
+}
+
+func TestPersistRoundTrip(t *testing.T) {
+	now := time.Now()
+	fs := storetest.SQLite(t)
+	fpub, fpriv := genFounder(t)
+	fkeys, _ := identity.GenerateKeys()
+	st, err := Create(fs, fkeys, fpriv, "alex", "mbp", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mkeys, _ := identity.GenerateKeys()
+	m := identity.Cert{V: 1, Team: identity.TeamID(fpub), Key: mkeys.Public(), Enc: mkeys.EncPublic(), Person: "sam", Machine: "xps", Issued: now.Unix()}
+	m.Sign(fpriv)
+	st.Merge([]identity.Cert{m}, nil, now)
+	if err := st.Persist(fs); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := Load(fs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c, ok := got.CertFor(mkeys.Public()); !ok || c.Person != "sam" {
+		t.Fatalf("CertFor after Persist+Load = %+v, %v", c, ok)
+	}
+	if _, ok := got.CertFor(fkeys.Public()); !ok {
+		t.Fatal("founder's own cert missing after round trip")
+	}
+}

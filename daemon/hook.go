@@ -168,8 +168,15 @@ type whoSnap struct {
 	st        adapter.State
 }
 
-// who handles the "who" op: live sessions here, with git info, status and tier.
+// who handles the "who" op: live sessions here, then remote ones from presence.
 func (d *Daemon) who(a WhoArgs) WhoResult {
+	res := d.localWho(a)
+	res.Sessions = append(res.Sessions, d.remoteWho(res.Sessions)...)
+	return res
+}
+
+// localWho lists live sessions here, with git info, status and tier.
+func (d *Daemon) localWho(a WhoArgs) WhoResult {
 	d.mu.Lock()
 	snaps := make([]whoSnap, 0, len(d.live))
 	for key, l := range d.live {

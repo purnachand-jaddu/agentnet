@@ -168,14 +168,8 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
-// RetryAfterError is returned by Send when the peer answered 429; After is how long it asked the caller to wait.
-type RetryAfterError struct {
-	After time.Duration
-}
-
-func (e *RetryAfterError) Error() string {
-	return fmt.Sprintf("lan: rate limited, retry after %s", e.After)
-}
+// RetryAfterError is returned by Send when the peer answered 429.
+type RetryAfterError = transport.RetryAfterError
 
 // defaultRetryAfter is used when a 429 response has no Retry-After header, or an unparseable one.
 const defaultRetryAfter = 10 * time.Second
