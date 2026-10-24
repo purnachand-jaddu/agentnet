@@ -109,7 +109,7 @@ func TurnRunning(path string) (running, known bool) {
 // isEventMarker checks if a line is a valid event_msg with a target type, and returns the type name.
 func isEventMarker(line string) string {
 	// Cheap prefilter: skip lines that don't contain the marker strings.
-	if !strings.ContainsAny(line, "task_started\ntask_complete\nturn_aborted") {
+	if !strings.Contains(line, "task_started") && !strings.Contains(line, "task_complete") && !strings.Contains(line, "turn_aborted") {
 		return ""
 	}
 
