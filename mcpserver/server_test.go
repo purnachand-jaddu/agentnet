@@ -463,3 +463,96 @@ func TestDefaultLoggerIsStderr(t *testing.T) {
 		t.Fatal("expected a default logger")
 	}
 }
+
+// TestStaleClaudeSessionNeverReceivesAPushAfterRegistryChange: register c1, switch the
+// registry to c2 while c1's hooks keep it live, then send to c1's own name. Nothing must be
+// posted to the fake inbox socket (which now belongs to c2's conversation), and c1's mail
+// must stay pending rather than being silently lost.
+func TestStaleClaudeSessionNeverReceivesAPushAfterRegistryChange(t *testing.T) {
+	ctx := context.Background()
+	env := startDaemon(t)
+	inboxSock, lines := startFakeInbox(t)
+
+	dir := t.TempDir()
+	writeRegistry := func(sessionID string) {
+		b, _ := json.Marshal(map[string]any{"sessionId": sessionID})
+		if err := os.WriteFile(filepath.Join(dir, "0.json"), b, 0o644); err != nil { // ParentPID left 0 below
+			t.Fatal(err)
+		}
+	}
+	writeRegistry("c1")
+
+	cOpts := Options{
+		Dial:     func() (*ipc.Client, error) { return ipc.Dial(env.sock) },
+		Adapters: adapter.NewRegistry(claude.New()),
+		Getenv: func(k string) string {
+			switch k {
+			case "CLAUDE_CODE_SESSION_ID":
+				return "env-placeholder" // only picks the claude-code adapter; the registry file wins the id
+			case "CLAUDE_CODE_MESSAGING_SOCKET":
+				return inboxSock
+			}
+			return ""
+		},
+		Cwd:       "/src/stale",
+		ClaudeDir: dir,
+	}
+	c := connect(t, ctx, cOpts)
+	if _, err := c.CallTool(ctx, &mcp.CallToolParams{Name: "list_team"}); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := ipc.Dial(env.sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	var who daemon.WhoResult
+	if err := raw.Call(ctx, "who", daemon.WhoArgs{}, &who); err != nil {
+		t.Fatal(err)
+	}
+	var c1Addr string
+	for _, s := range who.Sessions {
+		if s.Agent == "claude-code" {
+			c1Addr = s.Address
+		}
+	}
+	if c1Addr == "" {
+		t.Fatal("c1 never registered")
+	}
+
+	// c1's hooks just ran: it stays live (within hookGrace) even after the registry moves on.
+	if err := raw.Call(ctx, "hook", daemon.HookArgs{Agent: "claude-code", Event: adapter.EventStart, SessionID: "c1", Cwd: "/src/stale"}, &daemon.HookResult{}); err != nil {
+		t.Fatal(err)
+	}
+
+	writeRegistry("c2")
+	if _, err := c.CallTool(ctx, &mcp.CallToolParams{Name: "list_team"}); err != nil {
+		t.Fatal(err)
+	}
+
+	a := connect(t, ctx, env.options("A", "/src/a"))
+	if _, err := a.CallTool(ctx, &mcp.CallToolParams{Name: "list_team"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.CallTool(ctx, &mcp.CallToolParams{Name: "send_message", Arguments: map[string]any{"to": c1Addr, "message": "for c1 only"}})
+	if err != nil || res.IsError {
+		t.Fatalf("send: %v %+v", err, res)
+	}
+
+	select {
+	case line := <-lines:
+		t.Fatalf("the stale session's mail was posted to the (now c2's) inbox socket: %q", line)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	// c1's mail must still be there, unread, waiting for it to be picked up (e.g. by check_inbox).
+	var unread daemon.UnreadResult
+	c1Key := "claude-code:c1"
+	if err := raw.Call(ctx, "unread", daemon.InboxArgs{Key: c1Key}, &unread); err != nil {
+		t.Fatal(err)
+	}
+	if unread.Count == 0 {
+		t.Fatal("c1's mail is gone instead of staying pending")
+	}
+}

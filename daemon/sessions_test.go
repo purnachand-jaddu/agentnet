@@ -299,6 +299,63 @@ func TestNameFreeOnlyExemptsTheFoldedPlaceholder(t *testing.T) {
 	}
 }
 
+// TestUnregisterDetachesCallersConnEvenWhenHookKeepsSessionLive checks that unregister always
+// clears conn/mcpPush/Inbox/InboxToken for the caller's own connection, even when the session's
+// hooks ran recently enough to keep it live: otherwise a stale MCP process would keep being
+// pushed to (directly, or via ChannelCommand's leftover Inbox) for a session it no longer
+// serves (e.g. after /clear moved it to a new session id).
+func TestUnregisterDetachesCallersConnEvenWhenHookKeepsSessionLive(t *testing.T) {
+	d := newTestDaemon(t, claudeFake(adapter.ChannelPull))
+	mcpConn := &fakeConn{id: 1}
+	call[Registered](t, d, mcpConn, "register", RegisterArgs{Session: adapter.Session{Key: "claude-code:old", Agent: "claude-code", ID: "old", Cwd: "/src/c", Inbox: "sock", InboxToken: "tok"}, MCPPush: true})
+
+	// The session's hooks just ran: lastHook is recent, well inside hookGrace.
+	d.mu.Lock()
+	d.live["claude-code:old"].hookSeen = true
+	d.live["claude-code:old"].lastHook = d.opts.Now()
+	d.mu.Unlock()
+
+	call[any](t, d, mcpConn, "unregister", UnregisterArgs{Key: "claude-code:old"})
+
+	d.mu.Lock()
+	l, stillLive := d.live["claude-code:old"]
+	d.mu.Unlock()
+	if !stillLive {
+		t.Fatal("hooks kept it live, but it's gone")
+	}
+	if l.conn != nil || l.mcpPush {
+		t.Fatalf("unregister did not detach the caller's conn: conn=%v mcpPush=%v", l.conn, l.mcpPush)
+	}
+	if l.s.Inbox != "" || l.s.InboxToken != "" {
+		t.Fatalf("unregister left Inbox/InboxToken behind: %+v", l.s)
+	}
+}
+
+// TestUnregisterLeavesAnotherConnAlone checks that unregister only detaches the caller's own
+// conn: a session served by a different connection than the one calling unregister is untouched.
+func TestUnregisterLeavesAnotherConnAlone(t *testing.T) {
+	d := newTestDaemon(t, claudeFake(adapter.ChannelPull))
+	owner := &fakeConn{id: 1}
+	call[Registered](t, d, owner, "register", RegisterArgs{Session: adapter.Session{Key: "claude-code:c1", Agent: "claude-code", ID: "c1", Cwd: "/src/c"}, MCPPush: true})
+
+	// Keep it live across the unregister below, so a wrongly-detached conn wouldn't be masked
+	// by the session simply being removed outright.
+	d.mu.Lock()
+	d.live["claude-code:c1"].hookSeen = true
+	d.live["claude-code:c1"].lastHook = d.opts.Now()
+	d.mu.Unlock()
+
+	other := &fakeConn{id: 2}
+	call[any](t, d, other, "unregister", UnregisterArgs{Key: "claude-code:c1"})
+
+	d.mu.Lock()
+	l, stillLive := d.live["claude-code:c1"]
+	d.mu.Unlock()
+	if !stillLive || l.conn != owner || !l.mcpPush {
+		t.Fatalf("unregister from a different conn touched the session: live=%v, %+v", stillLive, l)
+	}
+}
+
 func TestFromClientExactMatch(t *testing.T) {
 	claude := claudeFake(adapter.ChannelPull)
 	codex := codexFake(adapter.ChannelPull)

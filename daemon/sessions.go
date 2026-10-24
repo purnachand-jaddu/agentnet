@@ -265,13 +265,26 @@ func (d *Daemon) nameFree(key, name, allowKey string) (bool, error) {
 	return rec == nil || rec.Key == key, nil
 }
 
-// unregister drops key from live unless its hooks ran within hookGrace; the remembered record is untouched.
-func (d *Daemon) unregister(key string) {
+// unregister detaches c from key if it's the session's conn (so a stale push target can't keep
+// pushing to it, even if the session's own hooks keep it live), then drops key from live unless
+// its hooks ran within hookGrace; the remembered record is untouched.
+//
+// Detaching clears Inbox/InboxToken too, not just conn/mcpPush: both were supplied by this same
+// connection's own registration, and leaving Inbox set would make Channel fall through to
+// ChannelCommand and push straight to that socket anyway (e.g. Claude's inbox, now serving a
+// different conversation in the same process), defeating the whole point of detaching.
+func (d *Daemon) unregister(c ipc.Conn, key string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	l, ok := d.live[key]
 	if !ok {
 		return
+	}
+	if l.conn == c {
+		l.conn = nil
+		l.mcpPush = false
+		l.s.Inbox = ""
+		l.s.InboxToken = ""
 	}
 	if d.opts.Now().Sub(l.lastHook) >= hookGrace {
 		delete(d.live, key)

@@ -44,7 +44,7 @@ func (d *Daemon) Handle(ctx context.Context, c ipc.Conn, op string, args json.Ra
 		if err := json.Unmarshal(args, &a); err != nil {
 			return nil, err
 		}
-		d.unregister(a.Key)
+		d.unregister(c, a.Key)
 		return nil, nil
 	case "send":
 		var a SendArgs

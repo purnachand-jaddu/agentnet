@@ -42,6 +42,7 @@ type sessionManager struct {
 	cache         map[string]string              // "<adapter>:<id>" (or a bare "proc:<pid>") -> resolved daemon key
 	registrations map[string]daemon.RegisterArgs // same cache key -> args to replay after a reconnect
 	claudeID      string                         // the last Claude session id resolved, re-read every call
+	servedKey     string                         // the key the most recent tool call resolved to; guards which pushes handleEvent will post
 }
 
 func newSessionManager(ctx context.Context, o Options) *sessionManager {
@@ -163,11 +164,24 @@ func (sm *sessionManager) reconnectLoop() {
 }
 
 // handleEvent handles one pushed event, recovering any panic so the loop keeps running.
+// Defence in depth: it only ever posts for the key this process currently serves (the most
+// recent tool call's resolved session). A push for any other key means this process is no
+// longer the right target for it — most likely a stale push that arrived for a session this
+// process has since moved on from (e.g. after /clear) — so it's reported back as failed
+// instead of landing in the wrong conversation's inbox.
 func (sm *sessionManager) handleEvent(c *ipc.Client, ev ipc.Event) {
 	defer func() { recover() }()
 	if ev.Event != "deliver" {
 		return
 	}
+	sm.mu.Lock()
+	served := sm.servedKey
+	sm.mu.Unlock()
+	if served != "" && ev.Key != served {
+		c.Call(context.Background(), "push_failed", daemon.PushFailedArgs{Key: ev.Key, IDs: ev.IDs}, nil)
+		return
+	}
+
 	socket, token := claude.InboxFromEnv(sm.o.Getenv)
 	ctx, cancel := context.WithTimeout(context.Background(), pushPostTimeout)
 	defer cancel()
@@ -179,8 +193,22 @@ func (sm *sessionManager) handleEvent(c *ipc.Client, ev ipc.Event) {
 }
 
 // resolveSession returns the daemon key for this call's session, registering (or attaching)
-// with the daemon as needed, and reusing a cached key where that's safe.
+// with the daemon as needed, and reusing a cached key where that's safe. It records the
+// resolved key as the one this process currently serves, for handleEvent's guard.
 func (sm *sessionManager) resolveSession(ctx context.Context, req *mcp.CallToolRequest) (string, error) {
+	key, err := sm.resolveSessionKey(ctx, req)
+	if err != nil {
+		return "", err
+	}
+	sm.mu.Lock()
+	sm.servedKey = key
+	sm.mu.Unlock()
+	return key, nil
+}
+
+// resolveSessionKey is resolveSession's body, kept separate so resolveSession has one place to
+// record the result as the currently served key.
+func (sm *sessionManager) resolveSessionKey(ctx context.Context, req *mcp.CallToolRequest) (string, error) {
 	adp := sm.resolveAdapter(req)
 
 	if id := adp.MetaSessionID(req.Params.GetMeta()); id != "" {
