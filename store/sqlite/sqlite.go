@@ -4,6 +4,7 @@ package sqlite
 import (
 	"database/sql"
 	"encoding/json"
+	"net/url"
 	"os"
 	"time"
 
@@ -43,12 +44,14 @@ func Open(path string) (*Store, error) {
 		}
 		f.Close()
 	}
-	db, err := sql.Open("sqlite", path)
+	// _pragma values apply per-connection, so pool growth never drops them.
+	dsn := "file:" + url.PathEscape(path) + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`); err != nil {
+	if err := os.Chmod(path, 0o600); err != nil { // tighten a pre-existing looser db
 		db.Close()
 		return nil, err
 	}
@@ -133,9 +136,9 @@ func (s *Store) Has(id string) (bool, error) {
 	return n > 0, err
 }
 
-// Held returns every held message, with its mailbox.
+// Held returns every held message, with its mailbox, oldest first.
 func (s *Store) Held() ([]store.Held, error) {
-	rows, err := s.db.Query(`SELECT msg, mailbox FROM messages WHERE held = 1`)
+	rows, err := s.db.Query(`SELECT msg, mailbox FROM messages WHERE held = 1 ORDER BY seq`)
 	if err != nil {
 		return nil, err
 	}

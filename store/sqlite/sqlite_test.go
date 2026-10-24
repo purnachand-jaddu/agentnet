@@ -23,15 +23,33 @@ func TestContract(t *testing.T) {
 
 func TestSurvivesReopenAndIsPrivate(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "a.db")
-	s, _ := sqlite.Open(p)
-	s.Put("ns", "k", []byte("v"))
-	s.Close()
-	if st, _ := os.Stat(p); st.Mode().Perm() != 0o600 {
+	s, err := sqlite.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put("ns", "k", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o600 {
 		t.Fatalf("db mode %v", st.Mode().Perm())
 	}
-	s, _ = sqlite.Open(p)
+	s, err = sqlite.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer s.Close()
-	if v, _ := s.Get("ns", "k"); string(v) != "v" {
+	v, err := s.Get("ns", "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(v) != "v" {
 		t.Fatal("data lost on reopen")
 	}
 }
