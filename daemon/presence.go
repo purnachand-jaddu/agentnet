@@ -19,8 +19,8 @@ import (
 	"github.com/purnachand-jaddu/agentnet/transport"
 )
 
-// maxTSMismatch is how far a presence payload's TS may differ from its envelope's.
-const maxTSMismatch = 5 * time.Second
+// maxTSMismatchMS is how far a presence payload's TS may differ from its envelope's, in ms.
+const maxTSMismatchMS = 5000
 
 // sendTimeout bounds one presence send to one member across all its addresses; verified ones get the first half.
 const sendTimeout = 5 * time.Second
@@ -248,10 +248,10 @@ func (d *Daemon) receivePresence(e envelope.Envelope) error {
 	if err := json.Unmarshal(plain, &p); err != nil {
 		return fmt.Errorf("presence: %v: %w", err, envelope.ErrMalformed)
 	}
-	if diff := time.Duration(p.TS-e.TS) * time.Millisecond; diff > maxTSMismatch || diff < -maxTSMismatch {
+	now := d.opts.Now()
+	if !tsConsistent(p.TS, e.TS, now) {
 		return fmt.Errorf("presence: payload ts %d vs envelope ts %d: %w", p.TS, e.TS, envelope.ErrMalformed)
 	}
-	now := d.opts.Now()
 	if d.opts.Team.Merge(append(p.Certs, e.Cert), p.Blocks, now) {
 		d.unsaved.Store(true)
 	}
@@ -282,4 +282,14 @@ func publicReason(err error) string {
 		}
 	}
 	return envelope.ErrMalformed.Error()
+}
+
+// tsConsistent reports whether payload and envelope ms timestamps are both in (0, now+1 day] and within maxTSMismatchMS; bounds first, so the subtraction can't overflow.
+func tsConsistent(payTS, envTS int64, now time.Time) bool {
+	limit := now.Add(24 * time.Hour).UnixMilli()
+	if payTS <= 0 || envTS <= 0 || payTS > limit || envTS > limit {
+		return false
+	}
+	diff := payTS - envTS
+	return diff <= maxTSMismatchMS && diff >= -maxTSMismatchMS
 }

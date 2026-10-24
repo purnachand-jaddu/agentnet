@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -436,5 +437,48 @@ func TestRefusalNotesArePublicReasons(t *testing.T) {
 	foreign, _ := envelope.Build("presence", message.NewID(), eKeys, eTeam.Self, f.bTeam.Self, []byte("{}"), seal.HPKE{}, now)
 	if ack := b.handleEnvelope(context.Background(), foreign); ack.Note != "not a member" {
 		t.Fatalf("non-member note = %q", ack.Note)
+	}
+}
+
+func TestExtremePayloadTimestampsRefused(t *testing.T) {
+	f := newTeamFixture(t)
+	b := newNetDaemon(t, "sam", "xps", f.bStore, f.bTeam, f.bKeys, 0)
+	now := time.Now()
+	if ack := b.handleEnvelope(context.Background(), presenceFrom(t, f, now, now, "ok")); ack.State != message.StateDelivered {
+		t.Fatalf("baseline: %+v", ack)
+	}
+	lastTS := func() int64 {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		return b.peers[peerKey(f.aKeys.Public())].lastTS
+	}
+	before := lastTS()
+
+	for _, tc := range []struct {
+		name string
+		ts   int64
+	}{
+		{"max int64", math.MaxInt64},
+		{"min int64", math.MinInt64},
+		{"wraps to zero in ns", now.UnixMilli() + 288230376151711744},
+		{"negative", -1},
+		{"zero", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, _ := json.Marshal(presence{Sessions: []WhoEntry{{Address: "alex/pinned", Status: "idle"}}, TS: tc.ts})
+			env, err := envelope.Build("presence", message.NewID(), f.aKeys, f.aTeam.Self, f.bTeam.Self, payload, seal.HPKE{}, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ack := b.handleEnvelope(context.Background(), env); ack.State != message.StateRefused || ack.Note != "malformed" {
+				t.Fatalf("ack %+v, want refused/malformed", ack)
+			}
+			if got := lastTS(); got != before {
+				t.Fatalf("lastTS = %d, want unchanged %d", got, before)
+			}
+			if statusOf(b, "alex/pinned") != "" || statusOf(b, "alex/ok") != "idle" {
+				t.Fatal("directory changed by a refused presence")
+			}
+		})
 	}
 }
