@@ -189,6 +189,31 @@ func Run(t *testing.T, open func(t *testing.T) store.Store) {
 			t.Fatal("IsHeld of an absent id = true")
 		}
 	})
+	t.Run("release held returns only ids actually transitioned from held", func(t *testing.T) {
+		s := open(t)
+		_, err := s.PutMessage(msg("1", "bob/x"), "x", true)
+		must(t, err)
+		_, err = s.PutMessage(msg("2", "bob/x"), "x", false) // already delivered, not held
+		must(t, err)
+
+		got, err := s.ReleaseHeld([]string{"1", "2", "nope"})
+		must(t, err)
+		if len(got) != 1 || got[0].ID != "1" {
+			t.Fatalf("ReleaseHeld = %+v, want only message 1", got)
+		}
+		held, err := s.IsHeld("1")
+		must(t, err)
+		if held {
+			t.Fatal("IsHeld(1) = true after ReleaseHeld")
+		}
+
+		// a second call on the same id (already released) returns nothing: no redelivery.
+		got, err = s.ReleaseHeld([]string{"1"})
+		must(t, err)
+		if len(got) != 0 {
+			t.Fatalf("second ReleaseHeld(1) = %+v, want none", got)
+		}
+	})
 	t.Run("drop removes a held message from Held and Pending", func(t *testing.T) {
 		s := open(t)
 		_, err := s.PutMessage(msg("1", "bob/x"), "x", true)

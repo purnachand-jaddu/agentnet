@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 )
 
 // Policy says what happens to a person's first message on this machine.
@@ -95,6 +96,29 @@ func (c Config) Save(path string) error {
 		return err
 	}
 	return os.Rename(tmpPath, path)
+}
+
+// Update loads path, applies fn to it and saves the result, holding an exclusive flock on
+// path+".lock" for the whole read-modify-write so concurrent writers never lose each other's change.
+func Update(path string, fn func(*Config) error) error {
+	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+
+	c, err := Load(path)
+	if err != nil {
+		return err
+	}
+	if err := fn(&c); err != nil {
+		return err
+	}
+	return c.Save(path)
 }
 
 // Allowed reports whether dir is inside one of c.Folders, resolving symlinks on both sides.

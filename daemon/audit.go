@@ -18,7 +18,8 @@ type AuditEntry struct {
 	From    string        `json:"from"`
 	To      string        `json:"to"`
 	State   message.State `json:"state"`
-	BodySHA string        `json:"body_sha256"`
+	BodySHA string        `json:"body_sha256,omitempty"` // absent when there's no trustworthy plaintext to hash
+	Reason  string        `json:"reason,omitempty"`      // set for a refusal that never reached a decoded message
 }
 
 // Auditor records one AuditEntry per message decision.
@@ -75,4 +76,10 @@ func bodyHash(body string) string {
 // audit records one message decision; dir is "in" or "out".
 func (d *Daemon) audit(dir, id, from, to string, st message.State, body string) {
 	d.opts.Auditor.Record(AuditEntry{TS: d.opts.Now().UnixMilli(), Dir: dir, ID: id, From: from, To: to, State: st, BodySHA: bodyHash(body)})
+}
+
+// auditRefused records an inbound refusal from before decryption: no decoded message exists yet, so
+// there's no trustworthy body to hash; id is the envelope id and from the claimed sender key.
+func (d *Daemon) auditRefused(envelopeID, fromKey, reason string) {
+	d.opts.Auditor.Record(AuditEntry{TS: d.opts.Now().UnixMilli(), Dir: "in", ID: envelopeID, From: fromKey, State: message.StateRefused, Reason: reason})
 }

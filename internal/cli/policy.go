@@ -131,14 +131,11 @@ func setPaused(paused, needConsent bool) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	cfgPath := paths.Config()
-	cfg, err := config.Load(cfgPath)
+	err := config.Update(paths.Config(), func(cfg *config.Config) error {
+		cfg.Paused = paused
+		return nil
+	})
 	if err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
-	}
-	cfg.Paused = paused
-	if err := cfg.Save(cfgPath); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}

@@ -76,18 +76,15 @@ func folderAddRemove(args []string, add bool) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	cfgPath := paths.Config()
-	cfg, err := config.Load(cfgPath)
+	err = config.Update(paths.Config(), func(cfg *config.Config) error {
+		if add {
+			cfg.Folders = appendUnique(cfg.Folders, abs)
+		} else {
+			cfg.Folders = removeString(cfg.Folders, abs)
+		}
+		return nil
+	})
 	if err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
-	}
-	if add {
-		cfg.Folders = appendUnique(cfg.Folders, abs)
-	} else {
-		cfg.Folders = removeString(cfg.Folders, abs)
-	}
-	if err := cfg.Save(cfgPath); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}

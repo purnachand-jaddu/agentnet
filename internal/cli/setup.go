@@ -119,8 +119,10 @@ func folderStep(approver consent.Approver) setup.Step {
 			if err := paths.Ensure(); err != nil {
 				return err
 			}
-			cfg.Folders = appendUnique(cfg.Folders, cwd)
-			return cfg.Save(cfgPath)
+			return config.Update(cfgPath, func(cfg *config.Config) error {
+				cfg.Folders = appendUnique(cfg.Folders, cwd)
+				return nil
+			})
 		},
 		Remove: func() error { return nil }, // folder opt-in isn't undone by --remove
 		Check: func() (bool, error) {

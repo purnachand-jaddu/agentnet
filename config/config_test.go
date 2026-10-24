@@ -1,8 +1,10 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -107,5 +109,66 @@ func TestPolicyFor(t *testing.T) {
 	}
 	if c.PolicyFor("sam", "alex") != Hold {
 		t.Errorf("other person policy != Hold")
+	}
+}
+
+func TestUpdateAppliesFn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := Update(path, func(c *Config) error {
+		c.Paused = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Paused {
+		t.Fatal("Paused = false, want true")
+	}
+}
+
+func TestUpdatePropagatesFnError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	want := fmt.Errorf("boom")
+	if err := Update(path, func(*Config) error { return want }); err != want {
+		t.Fatalf("err = %v, want %v", err, want)
+	}
+}
+
+// TestUpdateConcurrentWritersBothSurvive proves two concurrent Updates to different fields don't
+// lose each other's change: an unsynchronized load/modify/save would have one overwrite the other.
+func TestUpdateConcurrentWritersBothSurvive(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := (Config{}).Save(path); err != nil {
+		t.Fatal(err)
+	}
+	const n = 20
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := Update(path, func(c *Config) error {
+				if c.People == nil {
+					c.People = map[string]Policy{}
+				}
+				c.People[fmt.Sprintf("p%d", i)] = Accept
+				return nil
+			})
+			if err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.People) != n {
+		t.Fatalf("People has %d entries, want %d: %+v", len(got.People), n, got.People)
 	}
 }

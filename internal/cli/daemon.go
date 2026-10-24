@@ -186,27 +186,43 @@ func newDaemon(logger *log.Logger, service bool) (*daemon.Daemon, io.Closer, err
 		st.Close()
 		return nil, nil, err
 	}
-	current := configReloader(paths.Config(), 2*time.Second)
+	current, invalidate := configReloader(paths.Config(), 2*time.Second)
 	logFn := func(format string, args ...any) { logger.Printf(format, args...) }
 	o := daemon.Options{
 		Person: cfg.Person, Machine: cfg.Machine, Store: st, Adapters: adapters(), Config: cfg,
-		FolderAllowed: func(dir string) bool { return current().Allowed(dir) },
-		Paused:        func() bool { return current().Paused },
-		PolicyFor:     func(person string) config.Policy { return current().PolicyFor(person, cfg.Person) },
-		ConfigPath:    paths.Config(),
-		Now:           time.Now, Service: service,
+		FolderAllowed:    func(dir string) bool { return current().Allowed(dir) },
+		Paused:           func() bool { return current().Paused },
+		PolicyFor:        func(person string) config.Policy { return current().PolicyFor(person, cfg.Person) },
+		InvalidatePolicy: invalidate,
+		ConfigPath:       paths.Config(),
+		Now:              time.Now, Service: service,
 		Log: logFn,
 	}
+	closer := closers{st}
 	if au, err := daemon.NewFileAuditor(paths.Audit(), logFn); err != nil {
 		logger.Printf("daemon: audit log unavailable: %v", err)
 	} else {
 		o.Auditor = au
+		closer = append(closer, au)
 	}
 	if err := withNetwork(&o, cfg, st, logger); err != nil {
-		st.Close()
+		closer.Close()
 		return nil, nil, err
 	}
-	return daemon.New(o), st, nil
+	return daemon.New(o), closer, nil
+}
+
+// closers closes every one of them, continuing past an error and returning the first one.
+type closers []io.Closer
+
+func (cs closers) Close() error {
+	var first error
+	for _, c := range cs {
+		if err := c.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }
 
 // withNetwork fills o's networking fields when this machine is in a network; without keys it stays local and logs why.
@@ -226,13 +242,13 @@ func withNetwork(o *daemon.Options, cfg config.Config, st *sqlite.Store, logger 
 	return nil
 }
 
-// configReloader returns a func giving cfgPath's config, reloaded at most once per every, so `folder add` and pausing
-// take effect without a restart.
-func configReloader(cfgPath string, every time.Duration) func() config.Config {
+// configReloader returns a func giving cfgPath's config, reloaded at most once per every, plus an
+// invalidate func that forces its next call to reload immediately (used after approve/refuse).
+func configReloader(cfgPath string, every time.Duration) (get func() config.Config, invalidate func()) {
 	var mu sync.Mutex
 	var cfg config.Config
 	var loaded time.Time
-	return func() config.Config {
+	get = func() config.Config {
 		mu.Lock()
 		defer mu.Unlock()
 		if time.Since(loaded) > every {
@@ -243,4 +259,10 @@ func configReloader(cfgPath string, every time.Duration) func() config.Config {
 		}
 		return cfg
 	}
+	invalidate = func() {
+		mu.Lock()
+		defer mu.Unlock()
+		loaded = time.Time{}
+	}
+	return get, invalidate
 }

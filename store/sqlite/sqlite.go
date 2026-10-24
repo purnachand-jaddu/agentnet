@@ -247,6 +247,39 @@ func (s *Store) IsHeld(id string) (bool, error) {
 	return held, err
 }
 
+// ReleaseHeld clears the held flag only on ids that are currently held, in one transaction, and
+// returns exactly the messages transitioned — so an id that's absent or already delivered is a no-op.
+func (s *Store) ReleaseHeld(ids []string) ([]message.Message, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var out []message.Message
+	for _, id := range ids {
+		var body []byte
+		err := tx.QueryRow(`SELECT msg FROM messages WHERE id = ? AND held = 1`, id).Scan(&body)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(`UPDATE messages SET held = 0 WHERE id = ?`, id); err != nil {
+			return nil, err
+		}
+		var m message.Message
+		if err := json.Unmarshal(body, &m); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, tx.Commit()
+}
+
 // Release clears the held flag on ids.
 func (s *Store) Release(ids []string) error {
 	stmt, err := s.db.Prepare(`UPDATE messages SET held = 0 WHERE id = ?`)

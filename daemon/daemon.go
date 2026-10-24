@@ -30,18 +30,19 @@ const (
 
 // Options configures a Daemon.
 type Options struct {
-	Person, Machine string
-	Store           store.Store
-	Adapters        *adapter.Registry
-	FolderAllowed   func(dir string) bool
-	Paused          func() bool                       // true refuses every incoming message; nil is never paused
-	PolicyFor       func(person string) config.Policy // inbound policy for person; nil accepts everyone
-	ConfigPath      string                            // config.json, for approve/refuse to edit via config.Save
-	Auditor         Auditor                           // nil defaults to NoAudit
-	Now             func() time.Time
-	Log             func(format string, args ...any)
-	Service         bool // true when this process was started as the background service (--service)
-	Config          config.Config
+	Person, Machine  string
+	Store            store.Store
+	Adapters         *adapter.Registry
+	FolderAllowed    func(dir string) bool
+	Paused           func() bool                       // true refuses every incoming message; nil is never paused
+	PolicyFor        func(person string) config.Policy // inbound policy for person; nil accepts everyone
+	InvalidatePolicy func()                            // forces the next PolicyFor read to reload; nil is a no-op
+	ConfigPath       string                            // config.json, for approve/refuse to edit via config.Update
+	Auditor          Auditor                           // nil defaults to NoAudit
+	Now              func() time.Time
+	Log              func(format string, args ...any)
+	Service          bool // true when this process was started as the background service (--service)
+	Config           config.Config
 
 	Team          *team.State // nil when not in a network: no networking at all
 	Keys          identity.Keys
@@ -88,6 +89,8 @@ type Daemon struct {
 	kick     chan struct{}          // wakes the outbox loop to start flushers for dirty peers
 	rate     map[string][]time.Time // recent incoming message times per sender peerKey; guarded by mu
 	admitMu  [64]sync.Mutex         // admission locks for incoming messages, sharded by id hash; taken before mu, never inside it
+
+	policyMu sync.RWMutex // guards a policy change against admission still mid-flight under the old policy
 }
 
 // New builds a Daemon from o.

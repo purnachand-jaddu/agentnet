@@ -7,21 +7,19 @@ import (
 	"github.com/purnachand-jaddu/agentnet/config"
 	"github.com/purnachand-jaddu/agentnet/identity"
 	"github.com/purnachand-jaddu/agentnet/message"
-	"github.com/purnachand-jaddu/agentnet/store"
 )
 
 // firstLineLen caps the `held` listing's body preview.
 const firstLineLen = 80
 
-// inboundPolicy decides whether m from cert is accepted, held or refused. Own person is always accepted;
-// anyone else's is decided by PolicyFor (nil accepts everyone).
+// inboundPolicy decides whether m from cert is accepted, held or refused (own person always accepted).
 func (d *Daemon) inboundPolicy(cert identity.Cert, m message.Message) (message.State, string) {
 	if cert.Person == d.opts.Person || d.opts.PolicyFor == nil {
 		return message.StateDelivered, ""
 	}
 	switch d.opts.PolicyFor(cert.Person) {
 	case config.Hold:
-		return message.StateHeld, heldNote(cert.Person)
+		return message.StateHeld, heldNote(d.opts.Person)
 	case config.Refuse:
 		return message.StateRefused, refusedNote(d.opts.Person, cert.Person)
 	default: // config.Accept
@@ -29,8 +27,8 @@ func (d *Daemon) inboundPolicy(cert identity.Cert, m message.Message) (message.S
 	}
 }
 
-// heldNote is the receipt note for a message held awaiting approval of its sender's person.
-func heldNote(person string) string { return fmt.Sprintf("held until %s approves it", person) }
+// heldNote is the receipt note for a message held awaiting self's approval.
+func heldNote(self string) string { return fmt.Sprintf("held until %s approves it", self) }
 
 // refusedNote is the receipt note for a message from sender refused by self's policy.
 func refusedNote(self, sender string) string {
@@ -95,57 +93,90 @@ func (d *Daemon) approve(a ApproveArgs) (ApproveResult, error) {
 	return d.approveID(a.ID)
 }
 
-// approveID releases the one held message id, if it's still held, and delivers it.
+// approveID releases the one held message id, if it's still held (a no-op otherwise, e.g. already
+// delivered or absent), and delivers it. ReleaseHeld's own transaction is the only guard needed.
 func (d *Daemon) approveID(id string) (ApproveResult, error) {
-	m, mailbox, err := d.opts.Store.MessageByID(id)
-	if err != nil || m == nil {
-		return ApproveResult{}, err
-	}
-	if err := d.opts.Store.Release([]string{id}); err != nil {
-		return ApproveResult{}, err
-	}
-	d.deliverReleased(mailbox, *m)
-	return ApproveResult{Released: 1}, nil
-}
-
-// approvePerson releases every held message from person and sets its policy to accept.
-func (d *Daemon) approvePerson(person string) (ApproveResult, error) {
-	all, err := d.opts.Store.Held()
+	msgs, err := d.opts.Store.ReleaseHeld([]string{id})
 	if err != nil {
 		return ApproveResult{}, err
 	}
-	var release []store.Held
-	for _, h := range all {
-		if from, err := message.ParseAddress(h.Message.From); err == nil && from.Person == person {
-			release = append(release, h)
-		}
-	}
-	if err := d.setPersonPolicy(person, config.Accept); err != nil {
-		return ApproveResult{}, err
-	}
-	if len(release) == 0 {
-		return ApproveResult{}, nil
-	}
-	ids := make([]string, len(release))
-	for i, h := range release {
-		ids[i] = h.Message.ID
-	}
-	if err := d.opts.Store.Release(ids); err != nil {
-		return ApproveResult{}, err
-	}
-	for _, h := range release {
-		d.deliverReleased(h.Mailbox, h.Message)
-	}
-	return ApproveResult{Released: len(release)}, nil
+	d.deliverReleasedAll(msgs)
+	return ApproveResult{Released: len(msgs)}, nil
 }
 
-// deliverReleased delivers a just-released message to its mailbox session, in the background.
-func (d *Daemon) deliverReleased(mailbox string, m message.Message) {
-	name := m.To
-	if to, err := message.ParseAddress(m.To); err == nil {
-		name = to.Session
+// maxPolicyFlushPasses bounds the straggler-release loop after a policy change: policyMu closes the
+// race for any single admission, but a loop is cheap insurance and stops as soon as a pass finds none.
+const maxPolicyFlushPasses = 5
+
+// approvePerson sets person's policy to accept, then releases and delivers their held mail, looping
+// until none remain so a message admitted while the change was publishing can't end up stranded.
+func (d *Daemon) approvePerson(person string) (ApproveResult, error) {
+	if err := d.publishPolicy(person, config.Accept); err != nil {
+		return ApproveResult{}, err
 	}
-	d.safeGo(func() { d.deliver(mailbox, name, []message.Message{m}, m.Wake) })
+	var released int
+	for range maxPolicyFlushPasses {
+		ids, err := d.heldIDsFrom(person)
+		if err != nil {
+			return ApproveResult{Released: released}, err
+		}
+		if len(ids) == 0 {
+			break
+		}
+		msgs, err := d.opts.Store.ReleaseHeld(ids)
+		if err != nil {
+			return ApproveResult{Released: released}, err
+		}
+		d.deliverReleasedAll(msgs)
+		released += len(msgs)
+	}
+	return ApproveResult{Released: released}, nil
+}
+
+// heldIDsFrom returns the ids of every currently held message from person.
+func (d *Daemon) heldIDsFrom(person string) ([]string, error) {
+	all, err := d.opts.Store.Held()
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, h := range all {
+		if from, err := message.ParseAddress(h.Message.From); err == nil && from.Person == person {
+			ids = append(ids, h.Message.ID)
+		}
+	}
+	return ids, nil
+}
+
+// publishPolicy sets person's policy and invalidates the policy cache under policyMu's write lock, so
+// it can't return until every admission already past the policy read has also finished storing.
+func (d *Daemon) publishPolicy(person string, p config.Policy) error {
+	d.policyMu.Lock()
+	defer d.policyMu.Unlock()
+	if err := d.setPersonPolicy(person, p); err != nil {
+		return err
+	}
+	if d.opts.InvalidatePolicy != nil {
+		d.opts.InvalidatePolicy()
+	}
+	return nil
+}
+
+// deliverReleasedAll delivers each released message to its current local session, in the background;
+// a message whose session isn't resolvable just stays unread and surfaces via Pending once it's back.
+func (d *Daemon) deliverReleasedAll(msgs []message.Message) {
+	for _, m := range msgs {
+		to, err := message.ParseAddress(m.To)
+		if err != nil {
+			continue
+		}
+		tg, err := d.localSession(to)
+		if err != nil || tg == nil {
+			continue
+		}
+		mm := m
+		d.safeGo(func() { d.deliver(tg.key, tg.name, []message.Message{mm}, mm.Wake) })
+	}
 }
 
 // RefusePersonArgs is the "refuse_person" op's arguments.
@@ -158,39 +189,36 @@ type RefusePersonResult struct {
 	Dropped int `json:"dropped"`
 }
 
-// refusePerson handles the "refuse_person" op: sets person's policy to refuse and drops their held mail.
+// refusePerson handles the "refuse_person" op: sets person's policy to refuse, then drops their held
+// mail, repeating until none remain so a message admitted while the change was publishing can't survive.
 func (d *Daemon) refusePerson(a RefusePersonArgs) (RefusePersonResult, error) {
-	all, err := d.opts.Store.Held()
-	if err != nil {
+	if err := d.publishPolicy(a.Person, config.Refuse); err != nil {
 		return RefusePersonResult{}, err
 	}
-	var ids []string
-	for _, h := range all {
-		if from, err := message.ParseAddress(h.Message.From); err == nil && from.Person == a.Person {
-			ids = append(ids, h.Message.ID)
+	var dropped int
+	for range maxPolicyFlushPasses {
+		ids, err := d.heldIDsFrom(a.Person)
+		if err != nil {
+			return RefusePersonResult{Dropped: dropped}, err
 		}
+		if len(ids) == 0 {
+			break
+		}
+		if err := d.opts.Store.Drop(ids); err != nil {
+			return RefusePersonResult{Dropped: dropped}, err
+		}
+		dropped += len(ids)
 	}
-	if err := d.setPersonPolicy(a.Person, config.Refuse); err != nil {
-		return RefusePersonResult{}, err
-	}
-	if len(ids) == 0 {
-		return RefusePersonResult{}, nil
-	}
-	if err := d.opts.Store.Drop(ids); err != nil {
-		return RefusePersonResult{}, err
-	}
-	return RefusePersonResult{Dropped: len(ids)}, nil
+	return RefusePersonResult{Dropped: dropped}, nil
 }
 
-// setPersonPolicy sets person's People override on disk via config.Save.
+// setPersonPolicy sets person's People override on disk, serialized against every other config writer.
 func (d *Daemon) setPersonPolicy(person string, p config.Policy) error {
-	cfg, err := config.Load(d.opts.ConfigPath)
-	if err != nil {
-		return err
-	}
-	if cfg.People == nil {
-		cfg.People = map[string]config.Policy{}
-	}
-	cfg.People[person] = p
-	return cfg.Save(d.opts.ConfigPath)
+	return config.Update(d.opts.ConfigPath, func(cfg *config.Config) error {
+		if cfg.People == nil {
+			cfg.People = map[string]config.Policy{}
+		}
+		cfg.People[person] = p
+		return nil
+	})
 }

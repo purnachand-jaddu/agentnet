@@ -107,7 +107,7 @@ func TestConfigReloaderSeesChangesAfterInterval(t *testing.T) {
 	if err := base.Save(p); err != nil {
 		t.Fatal(err)
 	}
-	current := configReloader(p, 50*time.Millisecond)
+	current, _ := configReloader(p, 50*time.Millisecond)
 	if c := current(); c.Paused || c.Allowed(dir) {
 		t.Fatalf("initial %+v", c)
 	}
@@ -121,5 +121,29 @@ func TestConfigReloaderSeesChangesAfterInterval(t *testing.T) {
 	time.Sleep(60 * time.Millisecond)
 	if c := current(); !c.Paused || !c.Allowed(dir) {
 		t.Fatalf("after the interval %+v, want paused with %s allowed", c, dir)
+	}
+}
+
+func TestConfigReloaderInvalidateForcesImmediateReload(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.json")
+	base := config.Config{Person: "alex", Machine: "mbp"}
+	if err := base.Save(p); err != nil {
+		t.Fatal(err)
+	}
+	current, invalidate := configReloader(p, time.Hour)
+	if c := current(); c.Paused {
+		t.Fatalf("initial %+v", c)
+	}
+	base.Paused = true
+	if err := base.Save(p); err != nil {
+		t.Fatal(err)
+	}
+	if c := current(); c.Paused {
+		t.Fatalf("reloaded before the interval: %+v", c)
+	}
+	invalidate()
+	if c := current(); !c.Paused {
+		t.Fatalf("after invalidate %+v, want paused", c)
 	}
 }

@@ -28,7 +28,9 @@ func (d *Daemon) receiveMsg(e envelope.Envelope) (message.State, string) {
 	m, to, err := d.openMsg(e)
 	if err != nil {
 		d.opts.Log("daemon: refused message from %s: %v", e.Cert.Machine, err)
-		return message.StateRefused, publicReason(err)
+		reason := publicReason(err)
+		d.auditRefused(e.ID, peerKey(e.Cert.Key), reason)
+		return message.StateRefused, reason
 	}
 	st, note := d.admitMsg(e.Cert, m, to)
 	d.audit("in", m.ID, m.From, m.To, st, m.Body)
@@ -99,6 +101,10 @@ func (d *Daemon) admitMsg(cert identity.Cert, m message.Message, to message.Addr
 	if tg == nil {
 		return message.StateRefused, noSessionNote
 	}
+	// RLock spans the policy read through the store write, so a concurrent policy change (Lock)
+	// can't finish while this admission is still mid-flight under the old policy.
+	d.policyMu.RLock()
+	defer d.policyMu.RUnlock()
 	st, note := d.inboundPolicy(cert, m)
 	if st == message.StateRefused {
 		return st, note
@@ -144,7 +150,7 @@ func (d *Daemon) duplicateAck(cert identity.Cert, id string, same bool) (message
 		return message.StateRetry, storeRetry
 	}
 	if held {
-		return message.StateHeld, heldNote(cert.Person)
+		return message.StateHeld, heldNote(d.opts.Person)
 	}
 	return message.StateDelivered, alreadyNote
 }

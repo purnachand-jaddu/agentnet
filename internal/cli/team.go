@@ -52,13 +52,10 @@ func personMachine(person, machine *string) (p, m string, err error) {
 
 // saveConfigPersonMachine updates and saves person/machine to config.json; a var so tests can force a failure.
 var saveConfigPersonMachine = func(person, machine string) error {
-	cfgPath := paths.Config()
-	cfg, err := config.Load(cfgPath)
-	if err != nil {
-		return err
-	}
-	cfg.Person, cfg.Machine = person, machine
-	return cfg.Save(cfgPath)
+	return config.Update(paths.Config(), func(c *config.Config) error {
+		c.Person, c.Machine = person, machine
+		return nil
+	})
 }
 
 // loadOrGenerateMachineKeys loads this machine's keys, generating and saving a fresh pair if none exist yet.

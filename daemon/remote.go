@@ -87,11 +87,13 @@ func (d *Daemon) sendRemote(ctx context.Context, tg target, msg message.Message)
 	defer mu.Unlock()
 	if err := d.opts.Store.OutboxAdd(tg.peer, msg, d.opts.Now()); err != nil {
 		r.State, r.Note = message.StateRefused, fmt.Sprintf("could not store the message: %v", err)
+		d.audit("out", msg.ID, msg.From, msg.To, r.State, msg.Body)
 		return r, false
 	}
 	cert, member := d.memberCert(tg.peer)
 	if !member {
 		r.State, r.Note = message.StateQueued, unreachableNote
+		d.audit("out", msg.ID, msg.From, msg.To, r.State, msg.Body)
 		return r, true
 	}
 	r.State, r.Note, _ = d.attempt(ctx, cert, msg)

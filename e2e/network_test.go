@@ -201,9 +201,7 @@ func TestTwoMachinesExchangeMessages(t *testing.T) {
 	})
 }
 
-// TestHeldMessageApprovedThenDelivered proves the default policy (Inbound: hold) holds a new
-// sender's first message, that `held`/`approve` work over the real socket, and that approving a
-// person both delivers their held mail and lets their next message straight through.
+// TestHeldMessageApprovedThenDelivered proves the default hold policy, held/approve and their delivery, end to end.
 func TestHeldMessageApprovedThenDelivered(t *testing.T) {
 	if buildErr != nil {
 		t.Fatalf("agentnet build failed: %v", buildErr)
@@ -297,16 +295,13 @@ func TestHeldMessageApprovedThenDelivered(t *testing.T) {
 		return false, "codex.log missing the approved message:\n" + s
 	})
 
-	// B's daemon reloads config.json at most once every 2s, so the new accept policy may take a
-	// moment to take effect; retry the second send until it gets through.
-	waitUntil(t, 10*time.Second, func() (bool, string) {
-		out, errOut, err := a.run(nil, "send", "sam/web-codex", "hi again")
-		if err != nil {
-			return false, fmt.Sprintf("second send: %v\n%s", err, errOut)
-		}
-		if strings.Contains(out, "held") || strings.Contains(out, "refused") {
-			return false, "second send receipt says held/refused after approve: " + out
-		}
-		return true, ""
-	})
+	// approve invalidates B's policy cache, so the new accept policy applies immediately, with no
+	// need to wait out the daemon's normal 2s config reload interval.
+	out, errOut, err = a.run(nil, "send", "sam/web-codex", "hi again")
+	if err != nil {
+		t.Fatalf("second send: %v\n%s", err, errOut)
+	}
+	if strings.Contains(out, "held") || strings.Contains(out, "refused") {
+		t.Fatalf("second send receipt says held/refused after approve: %s", out)
+	}
 }

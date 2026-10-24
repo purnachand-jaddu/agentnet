@@ -89,12 +89,16 @@ func (d *Daemon) send(ctx context.Context, a SendArgs) (SendResult, error) {
 			continue
 		}
 		if _, err := d.opts.Store.PutMessage(msg, tg.key, false); err != nil {
-			res.Receipts = append(res.Receipts, message.Receipt{To: to, State: message.StateRefused,
+			st := message.StateRefused
+			res.Receipts = append(res.Receipts, message.Receipt{To: to, State: st,
 				Note: fmt.Sprintf("could not store the message: %v", err)})
+			d.audit("out", msg.ID, msg.From, msg.To, st, msg.Body)
 			continue
 		}
 		res.IDs = append(res.IDs, msg.ID)
-		res.Receipts = append(res.Receipts, d.deliver(tg.key, tg.name, []message.Message{msg}, a.Wake))
+		r := d.deliver(tg.key, tg.name, []message.Message{msg}, a.Wake)
+		res.Receipts = append(res.Receipts, r)
+		d.audit("out", msg.ID, msg.From, msg.To, r.State, msg.Body)
 	}
 	return res, nil
 }
