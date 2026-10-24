@@ -126,8 +126,7 @@ func containsIP(ips []net.IP, ip net.IP) bool {
 }
 
 // Announce starts an mDNS responder advertising key on port for team, shutting down once ctx is done.
-// It advertises this machine's own LAN IPv4 addresses (via IPs, or netaddr.LocalIPv4 if unset) rather
-// than letting hashicorp/mdns resolve os.Hostname() itself, which can land on a loopback /etc/hosts entry.
+// It advertises IPs (netaddr.LocalIPv4 if unset), never os.Hostname's lookup, which can resolve to loopback.
 func (d *Discoverer) Announce(ctx context.Context, key []byte, team string, port int) error {
 	ipsFn := d.IPs
 	if ipsFn == nil {
@@ -211,10 +210,8 @@ func (d *Discoverer) query(ctx context.Context, want string, found func(discover
 	}
 }
 
-// report calls found for e if its t= tag matches want and its k= decodes to a 32-byte key other than Self.
-// Addrs carries every address from the a= TXT field plus e.AddrV4 as a fallback (deduped): hashicorp/mdns
-// v1.0.7's client keeps only the LAST A record it sees, so on a multi-NIC host (Docker, a VPN) AddrV4 alone
-// can be the wrong interface; the a= TXT value is this package's own record of every address it announced on.
+// report calls found for e if its t= tag matches want and its k= is a 32-byte key other than Self, with the
+// a= TXT addresses plus AddrV4 (hashicorp/mdns keeps only the last A record, which can be the wrong NIC).
 func (d *Discoverer) report(e *hmdns.ServiceEntry, want string, found func(discovery.Found)) {
 	k, t, a := parseTXT(e.InfoFields)
 	if t != want {

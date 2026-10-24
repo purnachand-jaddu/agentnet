@@ -47,9 +47,8 @@ func revokeConsentText(certs []identity.Cert) string {
 	return "Revoke " + strings.Join(parts, ", ") + "? They will be cut off from the network."
 }
 
-// reloadRunningDaemon tells a running daemon to reload team state and gossip immediately. A daemon
-// that isn't running is tolerated (err is nil). One that answers but fails to reload is not: err is
-// that failure, and hint is the command to suggest to actually pick the change up.
+// reloadRunningDaemon tells a running daemon to reload team state and gossip now; no daemon is fine (nil).
+// A reload failure returns err plus hint, the command that picks the change up.
 func reloadRunningDaemon() (err error, hint string) {
 	c, dialErr := ipc.Dial(paths.Socket())
 	if dialErr != nil {

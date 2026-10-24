@@ -76,9 +76,8 @@ func loadOrGenerateMachineKeys() (identity.Keys, error) {
 	return keys, nil
 }
 
-// saveFounderKeyOnce writes priv's seed to path, 0600, refusing to overwrite an existing file. O_EXCL makes
-// the create-and-check one atomic step (no link/rename trick needed, so this also works on exFAT/FAT media).
-// A write or sync failure removes the partial file rather than leaving it behind.
+// saveFounderKeyOnce writes priv's seed to path, 0600, via O_EXCL so it never overwrites an existing file;
+// a failed write removes the partial file.
 func saveFounderKeyOnce(path string, priv ed25519.PrivateKey) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
@@ -212,9 +211,7 @@ func cmdInit(args []string) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	// The network now exists in the store: keep the founder key regardless of what happens below.
-	// person/machine already live in the self cert, so a config-save failure here is a warning, not fatal —
-	// stranding a network with no founder key (because cleanup ran after Create had already succeeded) is worse.
+	// The network exists now: keep the founder key whatever happens below (config save only warns).
 	committed = true
 
 	if err := saveConfigPersonMachine(p, m); err != nil {

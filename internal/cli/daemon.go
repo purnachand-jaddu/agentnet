@@ -68,10 +68,8 @@ var (
 	retryMaxDelay     = 30 * time.Second
 )
 
-// runOrRetry calls fn once and returns its error, unless service is true, in which case it retries fn
-// with exponential backoff (doubling from retryInitialDelay up to retryMaxDelay), logging each failure,
-// until fn succeeds. A --service daemon must never give up on a startup error (Apple TN3179: a launchd
-// agent that exits quickly can get its local network access silently denied).
+// runOrRetry calls fn once, or with service set retries it with backoff (retryInitialDelay to retryMaxDelay)
+// until it succeeds: a launchd agent that exits quickly can lose local network access (Apple TN3179).
 func runOrRetry(service bool, logger *log.Logger, label string, fn func() error) error {
 	if !service {
 		return fn()

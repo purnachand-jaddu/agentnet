@@ -36,11 +36,7 @@ type DeliveredArgs struct {
 }
 
 // inbox handles the "inbox" op: long-polls up to wait_secs (capped at maxWaitSecs) for mail at key.
-// It subscribes to arrivals before checking pending(), not after: checking first would leave a
-// window where a message stored (and its broadcast) between the check and the subscribe is missed,
-// and the call would then sleep out the full wait instead of waking at once.
-// wait_secs 0 never subscribes at all: an instant check isn't a waiter, and deliver() must not
-// treat it as one (it would otherwise short-circuit a concurrent send to "delivered").
+// It subscribes before checking pending, so no arrival is missed; wait_secs 0 never subscribes (it isn't a waiter).
 func (d *Daemon) inbox(ctx context.Context, a InboxArgs) (InboxResult, error) {
 	wait := a.WaitSecs
 	if wait > maxWaitSecs {

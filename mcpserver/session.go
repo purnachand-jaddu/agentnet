@@ -26,9 +26,8 @@ const (
 	reconnectMaxBackoff = 10 * time.Second
 )
 
-// placeholderID is the fallback id/key for a session the daemon can't otherwise name: it must
-// be exactly "proc:<pid>" because the daemon recognises a placeholder only by that key prefix
-// (daemon.isPlaceholder, findProcSession), to fold into the hook's own registration later.
+// placeholderID is the fallback key for a session with no id; the daemon recognises placeholders
+// only by this exact "proc:<pid>" form.
 func placeholderID(pid int) string { return fmt.Sprintf("proc:%d", pid) }
 
 // sessionManager owns the one ipc.Client this MCP server process uses, resolving and
@@ -118,9 +117,8 @@ func (sm *sessionManager) replay(c *ipc.Client) {
 	}
 }
 
-// pushLoop forwards the daemon's pushed "deliver" events to this agent's inbox socket. When the
-// connection dies on its own (e.g. a daemon restart), it reconnects proactively rather than
-// waiting for the next tool call to notice.
+// pushLoop forwards the daemon's pushed "deliver" events to this agent's inbox socket, reconnecting
+// as soon as the connection drops.
 func (sm *sessionManager) pushLoop(c *ipc.Client) {
 	for ev := range c.Events() {
 		sm.handleEvent(c, ev)
@@ -135,10 +133,8 @@ func (sm *sessionManager) pushLoop(c *ipc.Client) {
 	}
 }
 
-// reconnectLoop redials with exponential backoff (0.5s doubling to a 10s cap) until conn()
-// succeeds, then replays this process's registrations on the new connection and resumes the
-// push loop. It routes every dial through conn() so it can't race a tool call's own redial
-// into opening two connections at once.
+// reconnectLoop redials through conn() with backoff (0.5s to 10s) until it succeeds, then replays
+// this process's registrations and resumes the push loop.
 func (sm *sessionManager) reconnectLoop() {
 	backoff := reconnectMinBackoff
 	for {
@@ -163,12 +159,8 @@ func (sm *sessionManager) reconnectLoop() {
 	}
 }
 
-// handleEvent handles one pushed event, recovering any panic so the loop keeps running.
-// Defence in depth: it only ever posts for the key this process currently serves (the most
-// recent tool call's resolved session). A push for any other key means this process is no
-// longer the right target for it — most likely a stale push that arrived for a session this
-// process has since moved on from (e.g. after /clear) — so it's reported back as failed
-// instead of landing in the wrong conversation's inbox.
+// handleEvent posts one pushed event to the inbox, recovering any panic; a push for a key this process
+// no longer serves (e.g. after /clear) is reported back as failed, never posted.
 func (sm *sessionManager) handleEvent(c *ipc.Client, ev ipc.Event) {
 	defer func() { recover() }()
 	if ev.Event != "deliver" {
@@ -192,9 +184,8 @@ func (sm *sessionManager) handleEvent(c *ipc.Client, ev ipc.Event) {
 	c.Call(context.Background(), "delivered", daemon.DeliveredArgs{Key: ev.Key, IDs: ev.IDs}, nil)
 }
 
-// resolveSession returns the daemon key for this call's session, registering (or attaching)
-// with the daemon as needed, and reusing a cached key where that's safe. It records the
-// resolved key as the one this process currently serves, for handleEvent's guard.
+// resolveSession returns the daemon key for this call's session, registering or attaching as needed,
+// and records it as the key this process serves.
 func (sm *sessionManager) resolveSession(ctx context.Context, req *mcp.CallToolRequest) (string, error) {
 	key, err := sm.resolveSessionKey(ctx, req)
 	if err != nil {
@@ -231,11 +222,8 @@ func (sm *sessionManager) resolveSessionKey(ctx context.Context, req *mcp.CallTo
 	return sm.registerCached(ctx, adp, placeholderID(sm.o.ParentPID), true)
 }
 
-// resolveClaudeSession re-resolves Claude's session id on every call (registry first, env
-// fallback) instead of caching it for the process lifetime: after /clear, the MCP process's
-// env still names the old conversation while the hook registers the new one under the same
-// PID. When the id has changed since the last call, it drops the stale registration before
-// registering the new one, so the new session can reclaim the old one's name.
+// resolveClaudeSession re-resolves Claude's session id on every call (registry, then env), since /clear
+// changes it under the same PID; on a change it drops the stale registration so the name can be reused.
 func (sm *sessionManager) resolveClaudeSession(ctx context.Context, adp adapter.Adapter) (string, error) {
 	id, ok := claude.SessionFromRegistry(sm.o.ClaudeDir, sm.o.ParentPID)
 	if !ok {
@@ -285,9 +273,8 @@ func (sm *sessionManager) resolveAdapter(req *mcp.CallToolRequest) adapter.Adapt
 	return generic.New()
 }
 
-// registerCached resolves (adp, id) to a daemon key, calling "register" once and caching the
-// result. placeholder keys a transient, unnamed session as exactly id (which must already be
-// "proc:<pid>"); anything else is cached and keyed as "<adapter>:<id>".
+// registerCached resolves (adp, id) to a daemon key, registering once and caching it; the key is id
+// itself for a placeholder ("proc:<pid>"), else "<adapter>:<id>".
 func (sm *sessionManager) registerCached(ctx context.Context, adp adapter.Adapter, id string, placeholder bool) (string, error) {
 	cacheKey, key := adp.Name()+":"+id, adp.Name()+":"+id
 	if placeholder {

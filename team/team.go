@@ -100,9 +100,8 @@ func Load(s store.Store) (*State, error) {
 	return st, nil
 }
 
-// save writes st's self cert, members and blocks to s, dropping any stored cert for a now-blocked key, and
-// writes the founder key LAST: Load treats its presence as "this store belongs to a team", so a save that
-// fails partway through must never leave it set — that would read back as a team with no self cert/members.
+// save writes st's self cert, members and blocks to s, dropping certs of blocked keys, and the founder key
+// last: Load reads its presence as "in a team", so a partial save must not set it.
 func (st *State) save(s store.Store) error {
 	selfB, err := json.Marshal(st.Self)
 	if err != nil {
@@ -177,9 +176,8 @@ func (st *State) bundle(founderPub ed25519.PublicKey, cert identity.Cert) identi
 	return identity.Bundle{V: 1, Founder: founderPub, Cert: cert, Members: members, Blocks: blocks}
 }
 
-// Admit signs a cert for req and returns a bundle with the whole team. Admitting the same request
-// (same key, person and machine) again is idempotent: it hands back the existing cert rather than erroring,
-// so a lost bundle can be re-issued. ErrPersonTaken when another key already holds req.Person and samePerson is false.
+// Admit signs a cert for req and returns a bundle with the whole team; re-admitting the same request re-issues it.
+// ErrPersonTaken when another key already holds req.Person and samePerson is false.
 func Admit(s store.Store, founder ed25519.PrivateKey, req identity.JoinRequest, samePerson bool, now time.Time) (identity.Bundle, error) {
 	founderPub := founder.Public().(ed25519.PublicKey)
 	st, err := Load(s)
@@ -371,9 +369,7 @@ func Revoke(s store.Store, founder ed25519.PrivateKey, st *State, key []byte, re
 	return blk, nil
 }
 
-// Reload re-reads certs and blocks from s and folds them into st via Merge — monotonically, not a
-// wholesale replace — so a long-lived *State (like the daemon's) picks up an out-of-band change
-// without ever losing a block a concurrent Merge already applied after Load(s) took its snapshot.
+// Reload merges certs and blocks from s into st (never replacing, so a concurrently merged block survives);
 // Founder and Self are untouched.
 func (st *State) Reload(s store.Store) error {
 	fresh, err := Load(s)

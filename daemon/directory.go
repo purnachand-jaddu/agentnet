@@ -49,12 +49,8 @@ func (d *Daemon) online(p *peer, now time.Time) bool {
 	return !p.lastSeen.IsZero() && now.Sub(p.lastSeen) < d.opts.OfflineAfter
 }
 
-// dropBlocked removes directory and address state for every machine currently blocked in Team, so a
-// revoke takes it out of who/presence immediately instead of waiting for it to time out as offline.
-// For each key actually removed (a real transition, not one already handled), it also drops that
-// peer's queued outbox mail. A key blocked before it was ever in the directory (no prior traffic)
-// keeps any pre-existing outbox entries until OutboxPrune's normal 7-day expiry — a narrow gap, since
-// resolveRemote already refuses to resolve a blocked member, so nothing is ever sent over it.
+// dropBlocked removes directory state and queued outbox mail for every newly blocked machine in Team.
+// A key blocked before it was ever in the directory keeps its outbox until OutboxPrune; nothing is sent to it.
 func (d *Daemon) dropBlocked() {
 	d.mu.Lock()
 	var newlyDropped []string

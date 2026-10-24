@@ -111,9 +111,8 @@ func (d *Daemon) register(c ipc.Conn, a RegisterArgs) (Registered, error) {
 		}
 	}
 
-	// Reverse join: a hook registration folds in a live MCP-only placeholder for the same process.
-	// Only find it here; the fold itself (freeing its name, moving its mail) waits until the
-	// incoming key is successfully named, so a naming failure doesn't strand the MCP conn or mail.
+	// Reverse join: find a live MCP-only placeholder for the same process; fold it in only once
+	// the incoming key is named, so a naming failure strands neither its conn nor its mail.
 	var proc *live
 	allowKey := "" // the one placeholder key, if any, the incoming session is about to fold and may reuse the name of
 	if a.Hook && a.Session.PID != 0 {
@@ -176,9 +175,7 @@ func (d *Daemon) register(c ipc.Conn, a RegisterArgs) (Registered, error) {
 		l.hookSeen = true
 		l.lastHook = d.opts.Now()
 	}
-	// One inbox socket serves one session at a time: a stale pre-/clear hook must not stay armed
-	// to push into a socket that now belongs to a different conversation.
-	// It self-heals on the live conversation's next hook.
+	// One inbox socket serves one session: disarm any other session (e.g. pre-/clear) still pointing at it.
 	if a.Hook && a.Session.Inbox != "" {
 		for k, other := range d.live {
 			if k != key && other.s.Agent == a.Session.Agent && other.s.Inbox == a.Session.Inbox {
@@ -293,14 +290,8 @@ func (d *Daemon) nameFree(key, name, allowKey string) (bool, error) {
 	return rec == nil || rec.Key == key, nil
 }
 
-// unregister detaches c from key if it's the session's conn (so a stale push target can't keep
-// pushing to it, even if the session's own hooks keep it live), then drops key from live unless
-// its hooks ran within hookGrace; the remembered record is untouched.
-//
-// Detaching clears Inbox/InboxToken too, not just conn/mcpPush: both were supplied by this same
-// connection's own registration, and leaving Inbox set would make Channel fall through to
-// ChannelCommand and push straight to that socket anyway (e.g. Claude's inbox, now serving a
-// different conversation in the same process), defeating the whole point of detaching.
+// unregister detaches c (and the Inbox it supplied) from key's session, then drops key from live unless
+// its hooks ran within hookGrace; a left-over Inbox would keep pushing to that socket, so it goes too.
 func (d *Daemon) unregister(c ipc.Conn, key string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()

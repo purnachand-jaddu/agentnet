@@ -30,9 +30,8 @@ var execCommand = exec.Command
 // runCommand runs an external command for the service-takeover path; a var so tests can fake it.
 var runCommand setup.Runner = setup.Exec
 
-// autostartDial dials the daemon's socket, preferring the installed service over spawning a
-// second daemon; if the service can't start (no GUI/user session, stale exe) it falls back to
-// spawning, so a dead service never leaves agentnet permanently unreachable.
+// autostartDial dials the daemon's socket, starting the installed service if needed and
+// spawning a daemon when the service can't start (no user session, stale exe).
 func autostartDial() (*ipc.Client, error) {
 	if c, err := ipc.Dial(paths.Socket()); err == nil {
 		return c, nil
