@@ -14,6 +14,7 @@ import (
 	"github.com/purnachand-jaddu/agentnet/envelope"
 	"github.com/purnachand-jaddu/agentnet/identity"
 	"github.com/purnachand-jaddu/agentnet/ipc"
+	"github.com/purnachand-jaddu/agentnet/message"
 	"github.com/purnachand-jaddu/agentnet/seal"
 	"github.com/purnachand-jaddu/agentnet/store"
 	"github.com/purnachand-jaddu/agentnet/team"
@@ -48,6 +49,9 @@ type Options struct {
 	PresenceEvery time.Duration // presence resend interval; 60 s if zero
 	OfflineAfter  time.Duration // a machine silent this long is offline; 3 min if zero
 	Debounce      time.Duration // how often local changes are checked and sent; 2 s if zero
+	OutboxEvery   time.Duration // outbox retry interval; 30 s if zero
+
+	testAcceptMsg func(message.Message) message.State // test-only stand-in for verified receive; nil in production
 }
 
 // Daemon is one running agentnet daemon: session registry plus (later tasks) send/deliver and hooks.
@@ -76,6 +80,10 @@ type Daemon struct {
 	addrSkip map[string]time.Time // endpoints that asked us to wait, until when; guarded by mu
 	unsaved  atomic.Bool          // a merged team change hasn't reached the store yet
 	netWG    sync.WaitGroup       // network goroutines Run waits for
+
+	sendMu   map[string]*sync.Mutex // per-peer lock serialising message sends; guarded by mu
+	flushing map[string]bool        // peers with an outbox flush running; guarded by mu
+	flushNow chan string            // peers whose presence just arrived, for the outbox loop
 }
 
 // New builds a Daemon from o.
@@ -87,6 +95,7 @@ func New(o Options) *Daemon {
 	o.PresenceEvery = cmp.Or(o.PresenceEvery, time.Minute)
 	o.OfflineAfter = cmp.Or(o.OfflineAfter, 3*time.Minute)
 	o.Debounce = cmp.Or(o.Debounce, 2*time.Second)
+	o.OutboxEvery = cmp.Or(o.OutboxEvery, 30*time.Second)
 	return &Daemon{
 		opts:     o,
 		live:     map[string]*live{},
@@ -102,6 +111,9 @@ func New(o Options) *Daemon {
 		verifier: envelope.Verifier{Team: o.Team, Replay: envelope.NewReplay(2 * o.Window), Now: o.Now, Window: o.Window},
 		peers:    map[string]*peer{},
 		addrSkip: map[string]time.Time{},
+		sendMu:   map[string]*sync.Mutex{},
+		flushing: map[string]bool{},
+		flushNow: make(chan string, 16),
 	}
 }
 

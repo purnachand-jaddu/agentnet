@@ -64,6 +64,7 @@ func (d *Daemon) startNetwork(ctx context.Context) {
 		})
 	}
 	d.netGo(func() { d.gossip(ctx) })
+	d.netGo(func() { d.outboxLoop(ctx) })
 }
 
 // stopNetwork closes every transport and waits for the network goroutines; Run's ctx is already done.
@@ -150,40 +151,49 @@ func (d *Daemon) broadcast(ctx context.Context, sessions []WhoEntry) {
 	wg.Wait()
 }
 
-// sendPresence delivers payload to one member: verified addresses first, then hints and static peers.
+// sendPresence delivers payload to one member.
 func (d *Daemon) sendPresence(ctx context.Context, to identity.Cert, payload []byte) {
-	key := peerKey(to.Key)
-	now := d.opts.Now()
-	verified, fallback := d.addrsFor(key, now)
-	if len(verified)+len(fallback) == 0 {
-		return
-	}
-	e, err := envelope.Build("presence", message.NewID(), d.opts.Keys, d.opts.Team.Self, to, payload, d.opts.Sealer, now)
+	e, err := envelope.Build("presence", message.NewID(), d.opts.Keys, d.opts.Team.Self, to, payload, d.opts.Sealer, d.opts.Now())
 	if err != nil {
 		d.opts.Log("daemon: build presence for %s: %v", to.Machine, err)
 		return
 	}
+	d.sendEnvelope(ctx, to, e)
+}
+
+// sendEnvelope sends e to member to, verified addresses first, then hints and static peers; it returns to's first valid signed ack.
+func (d *Daemon) sendEnvelope(ctx context.Context, to identity.Cert, e envelope.Envelope) (envelope.Ack, bool) {
+	key := peerKey(to.Key)
+	verified, fallback := d.addrsFor(key, d.opts.Now())
+	if len(verified)+len(fallback) == 0 {
+		return envelope.Ack{}, false
+	}
 	ctx, cancel := context.WithTimeout(ctx, sendTimeout)
 	defer cancel()
 	first, cancelFirst := context.WithTimeout(ctx, sendTimeout/2)
-	addr, ok := d.race(first, to, e, verified)
+	addr, ack, ok := d.race(first, to, e, verified)
 	cancelFirst()
 	if !ok {
-		addr, ok = d.race(ctx, to, e, fallback)
+		addr, ack, ok = d.race(ctx, to, e, fallback)
 	}
 	if ok {
 		d.markVerified(key, addr)
 	}
+	return ack, ok
 }
 
-// race sends e to every addr at once and returns the first address whose reply is to's signed "delivered" ack.
-func (d *Daemon) race(ctx context.Context, to identity.Cert, e envelope.Envelope, addrs []string) (string, bool) {
+// race sends e to every addr at once and returns the first address whose reply is to's validly signed ack, with that ack.
+func (d *Daemon) race(ctx context.Context, to identity.Cert, e envelope.Envelope, addrs []string) (string, envelope.Ack, bool) {
 	if len(addrs) == 0 {
-		return "", false
+		return "", envelope.Ack{}, false
+	}
+	type win struct {
+		addr string
+		ack  envelope.Ack
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	won := make(chan string, len(addrs))
+	won := make(chan win, len(addrs))
 	var wg sync.WaitGroup
 	for _, a := range addrs {
 		wg.Add(1)
@@ -195,8 +205,8 @@ func (d *Daemon) race(ctx context.Context, to identity.Cert, e envelope.Envelope
 			case errors.As(err, &ra):
 				d.backoff(a, ra.After)
 			case err != nil:
-			case ack.State == message.StateDelivered && envelope.VerifyAck(ack, to, e.ID) == nil:
-				won <- a
+			case envelope.VerifyAck(ack, to, e.ID) == nil:
+				won <- win{a, ack}
 			}
 		})
 	}
@@ -204,8 +214,8 @@ func (d *Daemon) race(ctx context.Context, to identity.Cert, e envelope.Envelope
 		wg.Wait()
 		close(won)
 	})
-	a, ok := <-won
-	return a, ok
+	w, ok := <-won
+	return w.addr, w.ack, ok
 }
 
 // sendVia sends e to addr over the transport that dials addr's scheme.
@@ -222,7 +232,7 @@ func (d *Daemon) sendVia(ctx context.Context, addr string, e envelope.Envelope) 
 	return envelope.Ack{}, fmt.Errorf("daemon: no transport for %q", addr)
 }
 
-// handleEnvelope answers one incoming envelope with a signed ack; only "presence" is handled so far.
+// handleEnvelope answers one incoming envelope with a signed ack.
 func (d *Daemon) handleEnvelope(_ context.Context, e envelope.Envelope) envelope.Ack {
 	ack := envelope.Ack{ID: e.ID, State: message.StateDelivered, TS: d.opts.Now().UnixMilli()}
 	switch e.Kind {
@@ -231,7 +241,9 @@ func (d *Daemon) handleEnvelope(_ context.Context, e envelope.Envelope) envelope
 			d.opts.Log("daemon: refused presence from %s: %v", e.Cert.Machine, err)
 			ack.State, ack.Note = message.StateRefused, publicReason(err)
 		}
-	default: // "msg" arrives with verified receive
+	case "msg":
+		ack.State, ack.Note = d.receiveMsg(e)
+	default:
 		ack.State, ack.Note = message.StateRefused, "not yet supported"
 	}
 	envelope.SignAck(&ack, d.opts.Keys)

@@ -66,6 +66,9 @@ func (d *Daemon) send(a SendArgs) (SendResult, error) {
 	var res SendResult
 	for _, tg := range targets {
 		to := d.opts.Person + "/" + tg.name
+		if tg.peer != "" {
+			to = tg.name
+		}
 		if a.From != "cli:terminal" && !d.loopAllowed(a.From, tg.key) {
 			res.Receipts = append(res.Receipts, message.Receipt{To: to, State: message.StateRefused,
 				Note: "too many messages between these two sessions; is this a loop?"})
@@ -74,6 +77,14 @@ func (d *Daemon) send(a SendArgs) (SendResult, error) {
 		msg := message.Message{
 			ID: message.NewID(), From: fromAddr, To: to, FromAgent: fromAgent,
 			ReplyTo: a.ReplyTo, Body: a.Body, Wake: a.Wake, SentAt: d.opts.Now(),
+		}
+		if tg.peer != "" {
+			r, ok := d.sendRemote(tg, msg)
+			if ok {
+				res.IDs = append(res.IDs, msg.ID)
+			}
+			res.Receipts = append(res.Receipts, r)
+			continue
 		}
 		if _, err := d.opts.Store.PutMessage(msg, tg.key, false); err != nil {
 			res.Receipts = append(res.Receipts, message.Receipt{To: to, State: message.StateRefused,

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"cmp"
 	"fmt"
 
 	"github.com/purnachand-jaddu/agentnet/message"
@@ -10,6 +11,7 @@ import (
 type target struct {
 	name string
 	key  string
+	peer string // remote machine's peerKey ("" if local); when set, name is the full address and key is peer/session
 }
 
 // resolveTo parses to and resolves it to the target(s) a send from fromKey should reach.
@@ -18,11 +20,9 @@ func (d *Daemon) resolveTo(fromKey, to string) ([]target, error) {
 	if err != nil {
 		return nil, err
 	}
-	if addr.Machine != "" && addr.Machine != d.opts.Machine {
-		return nil, fmt.Errorf("no such machine here (remote delivery comes later)")
-	}
-	if addr.Person != "" && addr.Person != d.opts.Person {
-		return nil, fmt.Errorf("no such person on this machine (remote delivery comes later)")
+	if (addr.Person != "" && addr.Person != d.opts.Person) || (addr.Machine != "" && addr.Machine != d.opts.Machine) {
+		addr.Person = cmp.Or(addr.Person, d.opts.Person)
+		return d.resolveRemote(fromKey, addr)
 	}
 	if addr.IsGroup() {
 		if fromKey != "cli:terminal" {

@@ -91,6 +91,10 @@ func (d *Daemon) applyPresence(from identity.Cert, p presence, now time.Time) {
 		d.netDirty = true // it just (re)appeared: tell it about us now
 	}
 	pr.cert, pr.lastSeen, pr.skew = from, now, now.Sub(time.UnixMilli(p.TS))
+	select { // it is reachable: have the outbox loop flush its queue
+	case d.flushNow <- peerKey(from.Key):
+	default:
+	}
 	if p.TS <= pr.lastTS {
 		return // an older snapshot (e.g. its clock stepped back) still proves liveness
 	}
