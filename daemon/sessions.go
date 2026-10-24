@@ -114,14 +114,18 @@ func (d *Daemon) register(c ipc.Conn, a RegisterArgs) (Registered, error) {
 	// Only find it here; the fold itself (freeing its name, moving its mail) waits until the
 	// incoming key is successfully named, so a naming failure doesn't strand the MCP conn or mail.
 	var proc *live
+	allowKey := "" // the one placeholder key, if any, the incoming session is about to fold and may reuse the name of
 	if a.Hook && a.Session.PID != 0 {
 		proc = d.findProcSession(a.Session.Agent, a.Session.PID)
+		if proc != nil {
+			allowKey = proc.s.Key
+		}
 	}
 
 	key := a.Session.Key
 	l, exists := d.live[key]
 	if !exists {
-		name, err := d.assignName(key, a.Session.Agent, a.Session.Cwd)
+		name, err := d.assignName(key, a.Session.Agent, a.Session.Cwd, allowKey)
 		if err != nil {
 			return Registered{}, err
 		}
@@ -209,14 +213,15 @@ func (d *Daemon) findProcSession(agent string, pid int) *live {
 	return nil
 }
 
-// assignName picks the name for key: its remembered name if still free, else the first free <base>-<short>[-N]. Caller holds mu.
-func (d *Daemon) assignName(key, agentName, cwd string) (string, error) {
+// assignName picks the name for key: its remembered name if still free, else the first free <base>-<short>[-N].
+// allowKey, if non-empty, is the one placeholder key being folded into key, whose name key may reuse. Caller holds mu.
+func (d *Daemon) assignName(key, agentName, cwd, allowKey string) (string, error) {
 	rec, err := d.opts.Store.SessionByKey(key)
 	if err != nil {
 		return "", err
 	}
 	if rec != nil {
-		free, err := d.nameFree(key, rec.Name)
+		free, err := d.nameFree(key, rec.Name, allowKey)
 		if err != nil {
 			return "", err
 		}
@@ -231,7 +236,7 @@ func (d *Daemon) assignName(key, agentName, cwd string) (string, error) {
 	base, short := slugBase(cwd), a.Short()
 	for n := 1; n <= maxNameAttempts; n++ {
 		name := buildName(base, short, n)
-		free, err := d.nameFree(key, name)
+		free, err := d.nameFree(key, name, allowKey)
 		if err != nil {
 			return "", err
 		}
@@ -242,12 +247,14 @@ func (d *Daemon) assignName(key, agentName, cwd string) (string, error) {
 	return "", fmt.Errorf("daemon: no free name for %s after %d attempts", key, maxNameAttempts)
 }
 
-// nameFree reports whether name is unused by any live session or remembered record of a different key. Caller holds mu.
-// A proc: placeholder's claim on a name never blocks: it's never persisted, and now that the reverse
-// join frees it only after the real session is named, the real session must still be able to reuse it.
-func (d *Daemon) nameFree(key, name string) (bool, error) {
+// nameFree reports whether name is unused by any live session or remembered record of a different key, other than
+// allowKey (the one placeholder being folded into key, whose name key is allowed to take over). Caller holds mu.
+func (d *Daemon) nameFree(key, name, allowKey string) (bool, error) {
 	for k, l := range d.live {
-		if k != key && !isPlaceholder(k) && l.name == name {
+		if k == key || k == allowKey {
+			continue
+		}
+		if l.name == name {
 			return false, nil
 		}
 	}

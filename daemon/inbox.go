@@ -39,6 +39,8 @@ type DeliveredArgs struct {
 // It subscribes to arrivals before checking pending(), not after: checking first would leave a
 // window where a message stored (and its broadcast) between the check and the subscribe is missed,
 // and the call would then sleep out the full wait instead of waking at once.
+// wait_secs 0 never subscribes at all: an instant check isn't a waiter, and deliver() must not
+// treat it as one (it would otherwise short-circuit a concurrent send to "delivered").
 func (d *Daemon) inbox(ctx context.Context, a InboxArgs) (InboxResult, error) {
 	wait := a.WaitSecs
 	if wait > maxWaitSecs {
@@ -50,23 +52,32 @@ func (d *Daemon) inbox(ctx context.Context, a InboxArgs) (InboxResult, error) {
 	deadline := d.opts.Now().Add(time.Duration(wait) * time.Second)
 
 	for {
-		d.mu.Lock()
-		d.waiting[a.Key]++
-		arrived := d.arrived
-		d.mu.Unlock()
+		var arrived chan struct{}
+		if wait > 0 {
+			d.mu.Lock()
+			d.waiting[a.Key]++
+			arrived = d.arrived
+			d.mu.Unlock()
+		}
 
 		msgs, err := d.pending(a.Key)
 		if err != nil {
-			d.stopWaiting(a.Key)
+			if wait > 0 {
+				d.stopWaiting(a.Key)
+			}
 			return InboxResult{}, err
 		}
 		if len(msgs) > 0 {
-			d.stopWaiting(a.Key)
+			if wait > 0 {
+				d.stopWaiting(a.Key)
+			}
 			return d.inboxResult(a, msgs)
 		}
 		remaining := deadline.Sub(d.opts.Now())
 		if remaining <= 0 {
-			d.stopWaiting(a.Key)
+			if wait > 0 {
+				d.stopWaiting(a.Key)
+			}
 			return InboxResult{}, nil
 		}
 

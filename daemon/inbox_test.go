@@ -10,6 +10,8 @@ import (
 
 	"github.com/purnachand-jaddu/agentnet/adapter"
 	"github.com/purnachand-jaddu/agentnet/message"
+	"github.com/purnachand-jaddu/agentnet/store"
+	"github.com/purnachand-jaddu/agentnet/store/storetest"
 )
 
 func TestInboxLongPollWakesOnArrival(t *testing.T) {
@@ -141,4 +143,49 @@ func TestInboxWaitSecsCappedAt600(t *testing.T) {
 	if len(r.IDs) != 1 {
 		t.Fatalf("expected the already-pending message returned at once, got %+v", r)
 	}
+}
+
+// pauseStore blocks Pending() until unblock is closed, giving a test a window to inspect daemon
+// state while an "inbox" call is paused mid-check.
+type pauseStore struct {
+	store.Store
+	unblock chan struct{}
+}
+
+func (s *pauseStore) Pending(mailbox string) ([]message.Message, error) {
+	<-s.unblock
+	return s.Store.Pending(mailbox)
+}
+
+// TestZeroWaitInboxNeverRegistersAsWaiting checks that a zero-wait "inbox" call never subscribes
+// to arrivals (d.waiting stays 0 throughout), so deliver() can't mistake it for a long poll and
+// short-circuit a concurrent send to "delivered" when the session actually has a push channel.
+func TestZeroWaitInboxNeverRegistersAsWaiting(t *testing.T) {
+	unblock := make(chan struct{})
+	st := &pauseStore{Store: storetest.SQLite(t), unblock: unblock}
+	d := New(Options{Person: "alex", Machine: "mbp", Store: st, Adapters: adapter.NewRegistry(claudeFake(adapter.ChannelMCP)),
+		FolderAllowed: func(string) bool { return true }, Now: time.Now, Log: t.Logf})
+	claudeConn := &fakeConn{id: 1}
+	register(t, d, claudeConn, "claude-code", "c1", "/src/api", true)
+
+	done := make(chan InboxResult, 1)
+	go func() {
+		done <- call[InboxResult](t, d, &fakeConn{id: 2}, "inbox", InboxArgs{Key: "claude-code:c1", WaitSecs: 0})
+	}()
+	time.Sleep(50 * time.Millisecond) // let the call reach (and pause inside) pending()
+
+	d.mu.Lock()
+	waiting := d.waiting["claude-code:c1"]
+	d.mu.Unlock()
+	if waiting != 0 {
+		t.Fatalf("a zero-wait inbox call registered as waiting: %d", waiting)
+	}
+
+	res := call[SendResult](t, d, &fakeConn{id: 3}, "send", SendArgs{From: "cli:terminal", To: "alex/api-claude", Body: "hi", Wake: true})
+	if res.Receipts[0].State != message.StatePushed {
+		t.Fatalf("expected the push channel's receipt, not a false 'waiting' short-circuit, got %+v", res.Receipts[0])
+	}
+
+	close(unblock)
+	<-done
 }

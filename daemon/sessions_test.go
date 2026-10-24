@@ -279,6 +279,26 @@ func TestRehomeWakesWaitingInboxOnNewKey(t *testing.T) {
 	}
 }
 
+// TestNameFreeOnlyExemptsTheFoldedPlaceholder checks that the placeholder-name exemption is scoped
+// to the one placeholder a reverse join is actually folding, not every live placeholder: two
+// unrelated id-less MCP registrations must get distinct names, and a keyed session that isn't
+// folding a given placeholder must not take its name.
+func TestNameFreeOnlyExemptsTheFoldedPlaceholder(t *testing.T) {
+	d := newTestDaemon(t, claudeFake(adapter.ChannelPull))
+	a := call[Registered](t, d, &fakeConn{id: 1}, "register", RegisterArgs{Session: adapter.Session{Key: "proc:111", Agent: "claude-code", Cwd: "/src/api"}, MCPPush: true, MCPPID: 1111})
+	b := call[Registered](t, d, &fakeConn{id: 2}, "register", RegisterArgs{Session: adapter.Session{Key: "proc:222", Agent: "claude-code", Cwd: "/src/api"}, MCPPush: true, MCPPID: 2222})
+	if a.Name == b.Name {
+		t.Fatalf("two unrelated id-less MCP registrations got the same name %q", a.Name)
+	}
+
+	// A hook session with a PID that matches neither placeholder doesn't fold either one, so it
+	// must not take proc:111's name.
+	c := call[Registered](t, d, &fakeConn{id: 3}, "register", RegisterArgs{Session: adapter.Session{Key: "claude-code:c1", Agent: "claude-code", ID: "c1", Cwd: "/src/api", PID: 9999}, Hook: true})
+	if c.Name == a.Name {
+		t.Fatalf("a keyed session took a live placeholder's name without folding it: %q", c.Name)
+	}
+}
+
 func TestFromClientExactMatch(t *testing.T) {
 	claude := claudeFake(adapter.ChannelPull)
 	codex := codexFake(adapter.ChannelPull)
