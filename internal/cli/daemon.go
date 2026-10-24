@@ -137,7 +137,7 @@ func cmdDaemon(args []string) int {
 	var d *daemon.Daemon
 	var st io.Closer
 	if err := runOrRetry(*service, logger, "newDaemon", func() error {
-		dd, s, e := newDaemon(logger)
+		dd, s, e := newDaemon(logger, *service)
 		if e == nil {
 			d, st = dd, s
 		}
@@ -169,7 +169,7 @@ func cmdDaemon(args []string) int {
 
 // newDaemon builds the Daemon this process serves, reading its identity and folder opt-in from config.json.
 // It also returns the sqlite store so the caller can close it on shutdown.
-func newDaemon(logger *log.Logger) (*daemon.Daemon, io.Closer, error) {
+func newDaemon(logger *log.Logger, service bool) (*daemon.Daemon, io.Closer, error) {
 	st, err := sqlite.Open(paths.DB())
 	if err != nil {
 		return nil, nil, err
@@ -181,7 +181,7 @@ func newDaemon(logger *log.Logger) (*daemon.Daemon, io.Closer, error) {
 	}
 	d := daemon.New(daemon.Options{
 		Person: cfg.Person, Machine: cfg.Machine, Store: st, Adapters: adapters(),
-		FolderAllowed: folderAllowed(paths.Config()), Now: time.Now,
+		FolderAllowed: folderAllowed(paths.Config()), Now: time.Now, Service: service,
 		Log: func(format string, args ...any) { logger.Printf(format, args...) },
 	})
 	return d, st, nil

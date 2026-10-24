@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/purnachand-jaddu/agentnet/daemon"
 	"github.com/purnachand-jaddu/agentnet/internal/paths"
 	"github.com/purnachand-jaddu/agentnet/ipc"
 )
@@ -25,6 +26,50 @@ const (
 	startWait    = 5 * time.Second
 )
 
+// bootstrapRetries and bootstrapRetryDelay bound retrying `launchctl bootstrap`, which can fail
+// transiently right after bootout; vars so tests can shrink the delay.
+var (
+	bootstrapRetries    = 5
+	bootstrapRetryDelay = 500 * time.Millisecond
+)
+
+// ServicePath is where the per-OS service definition lives: the launchd plist on macOS, the
+// systemd user unit elsewhere.
+func ServicePath(home, goos string) string {
+	if goos == "darwin" {
+		return filepath.Join(home, "Library", "LaunchAgents", launchAgentLabel+".plist")
+	}
+	return filepath.Join(home, ".config", "systemd", "user", "agentnet.service")
+}
+
+// ServiceInstalled reports whether ServicePath(home, goos) exists.
+func ServiceInstalled(home, goos string) (bool, error) {
+	_, err := os.Stat(ServicePath(home, goos))
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+// StartService asks the already-installed service to (re)start, without reinstalling it.
+func StartService(goos string, run Runner) error {
+	if goos == "darwin" {
+		_, err := run(context.Background(), "launchctl", "kickstart", launchdTarget())
+		return err
+	}
+	_, err := run(context.Background(), "systemctl", "--user", "start", "agentnet")
+	return err
+}
+
+// launchdDomain is this user's launchd GUI domain.
+func launchdDomain() string { return "gui/" + strconv.Itoa(os.Getuid()) }
+
+// launchdTarget is this user's launchd service identifier for agentnet's job.
+func launchdTarget() string { return launchdDomain() + "/" + launchAgentLabel }
+
 // serviceStep installs and starts agentnet's background daemon as the OS's per-user service.
 func serviceStep(home, exe string, run Runner, goos string, binDirs []string) Step {
 	if goos == "darwin" {
@@ -33,9 +78,8 @@ func serviceStep(home, exe string, run Runner, goos string, binDirs []string) St
 	return linuxServiceStep(home, exe, run, binDirs)
 }
 
-// takeOverRunningDaemon asks any daemon already answering on paths.Socket() to shut down, and
-// waits for it to let go, so the service we're about to (re)start becomes the one true runner
-// instead of losing the flock to it and sitting in backoff. A no-op if nothing is listening.
+// takeOverRunningDaemon shuts down any daemon already answering on paths.Socket(), so the
+// service doesn't lose the flock to it; a no-op if nothing is listening.
 func takeOverRunningDaemon() {
 	c, err := ipc.Dial(paths.Socket())
 	if err != nil {
@@ -46,6 +90,26 @@ func takeOverRunningDaemon() {
 	cancel()
 	c.Close()
 	waitForSocket(shutdownWait, false)
+}
+
+// verifyServiceAnswering confirms the daemon now on paths.Socket() is the service, not some
+// other daemon (e.g. an autostarted one) that grabbed the socket first.
+func verifyServiceAnswering() error {
+	c, err := ipc.Dial(paths.Socket())
+	if err != nil {
+		return fmt.Errorf("service did not start; see %s", paths.Log())
+	}
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var st daemon.StatusResult
+	if err := c.Call(ctx, "status", nil, &st); err != nil {
+		return fmt.Errorf("service did not start; see %s", paths.Log())
+	}
+	if !st.Service {
+		return fmt.Errorf("the running daemon (pid %d) is not the service; it will be replaced when it exits", st.PID)
+	}
+	return nil
 }
 
 // waitForSocket polls paths.Socket() until dialing it succeeds (want=true) or fails (want=false),
@@ -68,9 +132,7 @@ func waitForSocket(timeout time.Duration, want bool) bool {
 	}
 }
 
-// servicePATH is the PATH the service runs with: binDirs (where claude/codex were found) first,
-// then the usual system bin directories, deduped. The service must be the normal runner, so an
-// autostarted daemon doesn't inherit an agent's sandbox.
+// servicePATH is binDirs (where claude/codex were found) plus the usual system bin dirs, deduped.
 func servicePATH(binDirs []string) string {
 	dirs := append(append([]string{}, binDirs...),
 		"/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin")
@@ -129,11 +191,25 @@ func plistXML(exe string, binDirs []string) string {
 `, launchAgentLabel, escapeXML(exe), logPath, logPath, env)
 }
 
+// bootstrapWithRetry retries `launchctl bootstrap`, which can fail transiently right after bootout.
+func bootstrapWithRetry(run Runner, target, plistPath string) error {
+	var err error
+	for i := 0; i < bootstrapRetries; i++ {
+		if _, err = run(context.Background(), "launchctl", "bootstrap", target, plistPath); err == nil {
+			return nil
+		}
+		if i < bootstrapRetries-1 {
+			time.Sleep(bootstrapRetryDelay)
+		}
+	}
+	return err
+}
+
 // macServiceStep installs dev.agentnet.daemon.plist as a launchd LaunchAgent.
 func macServiceStep(home, exe string, run Runner, binDirs []string) Step {
-	plistPath := filepath.Join(home, "Library", "LaunchAgents", launchAgentLabel+".plist")
-	target := "gui/" + strconv.Itoa(os.Getuid())
-	service := target + "/" + launchAgentLabel
+	plistPath := ServicePath(home, "darwin")
+	target := launchdDomain()
+	service := launchdTarget()
 	return Step{
 		Name: "Background service (launchd)",
 		Apply: func() error {
@@ -150,14 +226,14 @@ func macServiceStep(home, exe string, run Runner, binDirs []string) Step {
 			}
 
 			run(context.Background(), "launchctl", "bootout", service) // ignore: fine if it wasn't loaded
-			if _, err := run(context.Background(), "launchctl", "bootstrap", target, plistPath); err != nil {
+			if err := bootstrapWithRetry(run, target, plistPath); err != nil {
 				return err
 			}
 
 			if !waitForSocket(startWait, true) {
 				return fmt.Errorf("service did not start; see %s", paths.Log())
 			}
-			return nil
+			return verifyServiceAnswering()
 		},
 		Remove: func() error {
 			run(context.Background(), "launchctl", "bootout", service)
@@ -178,17 +254,24 @@ func macServiceStep(home, exe string, run Runner, binDirs []string) Step {
 func systemdQuoteIfNeeded(s string) string {
 	for _, r := range s {
 		if !isUnquotedSafe(r) {
-			return `"` + tomlEscape(s) + `"` // systemd's "..." escaping matches \ and " doubling
+			return `"` + systemdEscapeValue(s) + `"`
 		}
 	}
 	return s
 }
 
+// systemdEscapeValue escapes \ and " and doubles a literal % (systemd's specifier syntax).
+func systemdEscapeValue(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return strings.ReplaceAll(s, "%", "%%")
+}
+
 // systemdUnit renders agentnet's systemd user unit.
 func systemdUnit(exe string, binDirs []string) string {
-	env := "Environment=PATH=" + servicePATH(binDirs)
+	env := `Environment="PATH=` + systemdEscapeValue(servicePATH(binDirs)) + `"`
 	if h := os.Getenv("AGENTNET_HOME"); h != "" {
-		env += "\nEnvironment=AGENTNET_HOME=" + h
+		env += "\n" + `Environment="AGENTNET_HOME=` + systemdEscapeValue(h) + `"`
 	}
 	return fmt.Sprintf(`[Unit]
 Description=agentnet daemon
@@ -205,7 +288,7 @@ WantedBy=default.target
 
 // linuxServiceStep installs agentnet.service as a systemd user unit.
 func linuxServiceStep(home, exe string, run Runner, binDirs []string) Step {
-	unitPath := filepath.Join(home, ".config", "systemd", "user", "agentnet.service")
+	unitPath := ServicePath(home, "linux")
 	return Step{
 		Name: "Background service (systemd)",
 		Apply: func() error {
@@ -234,7 +317,7 @@ func linuxServiceStep(home, exe string, run Runner, binDirs []string) Step {
 			if !waitForSocket(startWait, true) {
 				return fmt.Errorf("service did not start; see %s", paths.Log())
 			}
-			return nil
+			return verifyServiceAnswering()
 		},
 		Remove: func() error {
 			run(context.Background(), "systemctl", "--user", "disable", "--now", "agentnet")

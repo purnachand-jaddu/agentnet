@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,15 +34,16 @@ func claudeStep(home, exe string, run Runner) Step {
 	}
 }
 
-// claudeMCPApply (re-)registers agentnet's MCP server with Claude Code. Claude Code's CLI has no
-// "update" verb, so this removes any existing registration (ignoring "not registered") and adds
-// a fresh one pointed at exe — idempotent, and unlike `claude mcp get`, it never spawns the server.
+// claudeMCPApply (re-)registers agentnet with Claude Code: remove (ignoring "not registered")
+// then add, since there's no "update" verb — idempotent, and never calls `claude mcp get`.
 func claudeMCPApply(exe string, run Runner) error {
 	if err := claudeMCPRemove(run); err != nil {
 		return err
 	}
-	_, err := run(context.Background(), "claude", "mcp", "add", "--scope", "user", "agentnet", "--", exe, "mcp")
-	return err
+	if _, err := run(context.Background(), "claude", "mcp", "add", "--scope", "user", "agentnet", "--", exe, "mcp"); err != nil {
+		return fmt.Errorf("agentnet MCP unregistered; re-run setup: %w", err)
+	}
+	return nil
 }
 
 // claudeNotFound is the substring Claude Code's CLI prints when "agentnet" isn't registered.

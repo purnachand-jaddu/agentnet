@@ -27,6 +27,7 @@ type Options struct {
 	FolderAllowed   func(dir string) bool
 	Now             func() time.Time
 	Log             func(format string, args ...any)
+	Service         bool // true when this process was started as the background service (--service)
 }
 
 // Daemon is one running agentnet daemon: session registry plus (later tasks) send/deliver and hooks.

@@ -12,9 +12,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/purnachand-jaddu/agentnet/daemon"
 	"github.com/purnachand-jaddu/agentnet/internal/paths"
 	"github.com/purnachand-jaddu/agentnet/ipc"
 )
+
+// requireSandboxedAgentnetHome fails t unless AGENTNET_HOME is set and isn't the real ~/.agentnet,
+// so a bug in a service/takeover test can never reach the real daemon's state.
+func requireSandboxedAgentnetHome(t *testing.T) {
+	t.Helper()
+	h := os.Getenv("AGENTNET_HOME")
+	if h == "" {
+		t.Fatal("AGENTNET_HOME must be set for this test")
+	}
+	if real, err := os.UserHomeDir(); err == nil && h == filepath.Join(real, ".agentnet") {
+		t.Fatal("AGENTNET_HOME must not equal the real ~/.agentnet")
+	}
+}
 
 // fakeRunner records every call it receives and never touches a real process.
 func fakeRunner(t *testing.T) (Runner, *[][]string) {
@@ -67,14 +81,15 @@ func findStep(t *testing.T, steps []Step, name string) Step {
 }
 
 // fakeDaemon is a minimal real ipc server at paths.Socket() that answers "shutdown" by stopping
-// itself (closing its listener), and records whether it was ever asked to.
+// itself, answers "status" with the service flag it was started with, and records whether
+// "shutdown" was ever sent.
 type fakeDaemon struct {
 	mu   sync.Mutex
 	got  bool
 	done chan struct{}
 }
 
-func startFakeDaemon(t *testing.T) *fakeDaemon {
+func startFakeDaemon(t *testing.T, service bool) *fakeDaemon {
 	t.Helper()
 	if err := paths.Ensure(); err != nil {
 		t.Fatal(err)
@@ -86,11 +101,14 @@ func startFakeDaemon(t *testing.T) *fakeDaemon {
 	fd := &fakeDaemon{done: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
 	handler := func(_ context.Context, _ ipc.Conn, op string, _ json.RawMessage) (any, error) {
-		if op == "shutdown" {
+		switch op {
+		case "shutdown":
 			fd.mu.Lock()
 			fd.got = true
 			fd.mu.Unlock()
 			cancel()
+		case "status":
+			return daemon.StatusResult{Service: service, PID: os.Getpid()}, nil
 		}
 		return nil, nil
 	}
@@ -467,12 +485,13 @@ func TestPlistRendersServiceAndKeepAliveAndPATH(t *testing.T) {
 
 	home := t.TempDir()
 	t.Setenv("AGENTNET_HOME", filepath.Join(home, "state"))
+	requireSandboxedAgentnetHome(t)
 
 	var calls [][]string
 	run := func(_ context.Context, name string, args ...string) ([]byte, error) {
 		calls = append(calls, append([]string{name}, args...))
 		if name == "launchctl" && len(args) > 0 && args[0] == "bootstrap" {
-			startFakeDaemon(t)
+			startFakeDaemon(t, true)
 		}
 		return nil, nil
 	}
@@ -511,12 +530,13 @@ func TestMacServiceReapplyRunsBootoutThenBootstrap(t *testing.T) {
 
 	home := t.TempDir()
 	t.Setenv("AGENTNET_HOME", filepath.Join(home, "state"))
+	requireSandboxedAgentnetHome(t)
 
 	var calls [][]string
 	run := func(_ context.Context, name string, args ...string) ([]byte, error) {
 		calls = append(calls, append([]string{name}, args...))
 		if name == "launchctl" && len(args) > 0 && args[0] == "bootstrap" {
-			startFakeDaemon(t)
+			startFakeDaemon(t, true)
 		}
 		return nil, nil
 	}
@@ -561,6 +581,7 @@ func TestSystemdUnitRenders(t *testing.T) {
 
 	home := t.TempDir()
 	t.Setenv("AGENTNET_HOME", filepath.Join(home, "state"))
+	requireSandboxedAgentnetHome(t)
 	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -569,7 +590,7 @@ func TestSystemdUnitRenders(t *testing.T) {
 	run := func(_ context.Context, name string, args ...string) ([]byte, error) {
 		calls = append(calls, append([]string{name}, args...))
 		if name == "systemctl" && len(args) > 1 && args[1] == "restart" {
-			startFakeDaemon(t)
+			startFakeDaemon(t, true)
 		}
 		return nil, nil
 	}
@@ -584,7 +605,7 @@ func TestSystemdUnitRenders(t *testing.T) {
 	unit := readFile(t, unitPath)
 	for _, want := range []string{
 		"ExecStart=/usr/local/bin/agentnet daemon --service", "Restart=always", "WantedBy=default.target",
-		bin, "/usr/bin", "Environment=AGENTNET_HOME=",
+		bin, "/usr/bin", `Environment="AGENTNET_HOME=`,
 	} {
 		if !strings.Contains(unit, want) {
 			t.Fatalf("unit missing %q:\n%s", want, unit)
@@ -614,7 +635,8 @@ func TestSystemdUnitRenders(t *testing.T) {
 func TestTakeOverRunningDaemonSendsShutdown(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("AGENTNET_HOME", home)
-	fd := startFakeDaemon(t)
+	requireSandboxedAgentnetHome(t)
+	fd := startFakeDaemon(t, true)
 
 	takeOverRunningDaemon()
 
@@ -630,5 +652,108 @@ func TestTakeOverRunningDaemonSendsShutdown(t *testing.T) {
 func TestPlanPicksServiceForRuntimeGOOS(t *testing.T) {
 	if goos != runtime.GOOS {
 		t.Fatalf("goos = %q, want %q", goos, runtime.GOOS)
+	}
+}
+
+// TestMacServiceApplyFailsWhenAnsweringDaemonIsNotTheService checks Apply reports ✗ when
+// something answers the socket but its "status" says it isn't the service.
+func TestMacServiceApplyFailsWhenAnsweringDaemonIsNotTheService(t *testing.T) {
+	oldGOOS := goos
+	goos = "darwin"
+	t.Cleanup(func() { goos = oldGOOS })
+
+	home := t.TempDir()
+	t.Setenv("AGENTNET_HOME", filepath.Join(home, "state"))
+	requireSandboxedAgentnetHome(t)
+
+	run := func(_ context.Context, name string, args ...string) ([]byte, error) {
+		if name == "launchctl" && len(args) > 0 && args[0] == "bootstrap" {
+			startFakeDaemon(t, false) // answers, but isn't the service
+		}
+		return nil, nil
+	}
+	steps := Plan(home, "/usr/local/bin/agentnet", run)
+	svc := findStep(t, steps, "Background service (launchd)")
+
+	err := svc.Apply()
+	if err == nil || !strings.Contains(err.Error(), "is not the service") {
+		t.Fatalf("apply err = %v, want it to mention \"is not the service\"", err)
+	}
+}
+
+// TestMacServiceRetriesBootstrapAfterTransientFailure checks bootstrap is retried (not treated
+// as fatal on its first failure right after bootout).
+func TestMacServiceRetriesBootstrapAfterTransientFailure(t *testing.T) {
+	oldGOOS := goos
+	goos = "darwin"
+	t.Cleanup(func() { goos = oldGOOS })
+	oldDelay := bootstrapRetryDelay
+	bootstrapRetryDelay = time.Millisecond
+	t.Cleanup(func() { bootstrapRetryDelay = oldDelay })
+
+	home := t.TempDir()
+	t.Setenv("AGENTNET_HOME", filepath.Join(home, "state"))
+	requireSandboxedAgentnetHome(t)
+
+	var bootstrapAttempts int
+	run := func(_ context.Context, name string, args ...string) ([]byte, error) {
+		if name == "launchctl" && len(args) > 0 && args[0] == "bootstrap" {
+			bootstrapAttempts++
+			if bootstrapAttempts < 3 {
+				return nil, errors.New("Service already loaded")
+			}
+			startFakeDaemon(t, true)
+		}
+		return nil, nil
+	}
+	steps := Plan(home, "/usr/local/bin/agentnet", run)
+	svc := findStep(t, steps, "Background service (launchd)")
+
+	if err := svc.Apply(); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if bootstrapAttempts != 3 {
+		t.Fatalf("bootstrap attempts = %d, want 3", bootstrapAttempts)
+	}
+}
+
+// TestSystemdPercentIsDoubled checks a literal % in exe survives as %% (systemd's specifier escape).
+func TestSystemdPercentIsDoubled(t *testing.T) {
+	exe := "/opt/100%-sure/agentnet"
+	unit := systemdUnit(exe, nil)
+	if !strings.Contains(unit, `ExecStart="/opt/100%%-sure/agentnet" daemon --service`) {
+		t.Fatalf("%% not doubled in ExecStart:\n%s", unit)
+	}
+}
+
+// TestSaveJSONPreservesSymlink checks a settings.json that's a symlink (e.g. into a dotfiles
+// repo) stays a symlink after Apply, with the content landing at its real target.
+func TestSaveJSONPreservesSymlink(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real.json")
+	if err := os.WriteFile(real, []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "settings.json")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := applyHooks(link, "/usr/local/bin/agentnet", claudeAgent); err != nil {
+		t.Fatal(err)
+	}
+
+	fi, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("settings.json is no longer a symlink")
+	}
+	if got, err := os.Readlink(link); err != nil || got != real {
+		t.Fatalf("symlink now points to %q, %v, want %q", got, err, real)
+	}
+	if !strings.Contains(readFile(t, real), "hook") {
+		t.Fatalf("hooks weren't written to the real target:\n%s", readFile(t, real))
 	}
 }

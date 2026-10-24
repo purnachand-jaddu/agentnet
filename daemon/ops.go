@@ -4,10 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 
 	"github.com/purnachand-jaddu/agentnet/adapter"
 	"github.com/purnachand-jaddu/agentnet/ipc"
 )
+
+// StatusResult answers a "status" op.
+type StatusResult struct {
+	Service bool `json:"service"`
+	PID     int  `json:"pid"`
+}
 
 // RegisterArgs is the "register" op's arguments.
 type RegisterArgs struct {
@@ -98,9 +105,16 @@ func (d *Daemon) Handle(ctx context.Context, c ipc.Conn, op string, args json.Ra
 	case "shutdown":
 		d.doShutdown()
 		return nil, nil
+	case "status":
+		return d.status(), nil
 	default:
 		return nil, fmt.Errorf("unknown op %q", op)
 	}
+}
+
+// status reports whether this process is the installed background service, and its PID.
+func (d *Daemon) status() StatusResult {
+	return StatusResult{Service: d.opts.Service, PID: os.Getpid()}
 }
 
 // doShutdown closes Shutdown() the first time it's called; later calls are harmless.

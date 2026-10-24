@@ -170,9 +170,8 @@ func groupCommand(group any) string {
 	return cmd
 }
 
-// isOurHook reports whether cmd is one of agentnet's own hook commands for agent. It matches
-// both the quoted and unquoted forms of exe, so a hook written before quoting was added (or by
-// an older exe path) is still found on remove.
+// isOurHook reports whether cmd is one of agentnet's own hook commands for agent, matching both
+// the quoted and unquoted forms of exe (so an older, pre-quoting hook is still found on remove).
 func isOurHook(cmd, exe, agent string) bool {
 	if strings.HasPrefix(cmd, shellQuoteIfNeeded(exe)+" hook ") || strings.HasPrefix(cmd, exe+" hook ") {
 		return true
@@ -262,9 +261,8 @@ func loadJSON(path string) (map[string]any, error) {
 	return doc, nil
 }
 
-// saveJSON writes doc to path as indented JSON with HTML-escaping off (so "&&"/">" survive as
-// written), atomically: a temp file in path's directory, renamed over path, keeping path's
-// existing file mode if it had one.
+// saveJSON writes doc to path as indented JSON with HTML-escaping off, atomically (temp file +
+// rename, keeping path's mode), resolving path's own symlink first so a dotfiles link survives.
 func saveJSON(path string, doc map[string]any) error {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
@@ -274,12 +272,16 @@ func saveJSON(path string, doc map[string]any) error {
 		return err
 	}
 
-	dir := filepath.Dir(path)
+	target := path
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		target = real
+	}
+	dir := filepath.Dir(target)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	mode := os.FileMode(0o644)
-	if st, err := os.Stat(path); err == nil {
+	if st, err := os.Stat(target); err == nil {
 		mode = st.Mode()
 	}
 	tmp, err := os.CreateTemp(dir, ".setup-*.tmp")
@@ -298,5 +300,5 @@ func saveJSON(path string, doc map[string]any) error {
 	if err := os.Chmod(tmpPath, mode); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, path)
+	return os.Rename(tmpPath, target)
 }
