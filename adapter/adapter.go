@@ -4,7 +4,6 @@ package adapter
 import (
 	"context"
 	"errors"
-	"strings"
 )
 
 // Tier ranks how reachable a session is.
@@ -74,6 +73,11 @@ type TurnWatcher interface {
 	TurnRunning(s Session) (running, known bool)
 }
 
+// ClientNamer is implemented by adapters whose MCP client reports a name other than Name() (e.g. "codex-mcp-client").
+type ClientNamer interface {
+	ClientNames() []string
+}
+
 // ErrCannotPush is returned by Push when the adapter has no way to push to the session.
 var ErrCannotPush = errors.New("this session can't be pushed to")
 
@@ -93,10 +97,19 @@ func (r *Registry) Get(name string) (Adapter, bool) {
 	return nil, false
 }
 
-// FromClient matches an MCP client name against each adapter's Short() as a prefix, e.g. "codex-mcp-client" -> codex.
+// FromClient matches an MCP client name exactly: first against any adapter's ClientNames, then against Name().
 func (r *Registry) FromClient(clientName string) (Adapter, bool) {
 	for _, a := range r.list {
-		if strings.HasPrefix(clientName, a.Short()) {
+		if cn, ok := a.(ClientNamer); ok {
+			for _, n := range cn.ClientNames() {
+				if n == clientName {
+					return a, true
+				}
+			}
+		}
+	}
+	for _, a := range r.list {
+		if a.Name() == clientName {
 			return a, true
 		}
 	}

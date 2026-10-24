@@ -15,10 +15,13 @@ import (
 type fakeAdapter struct {
 	name, short string
 	channel     adapter.Channel
+	clientNames []string
 	mu          sync.Mutex
 	pushed      []string
 	running     bool
 }
+
+func (f *fakeAdapter) ClientNames() []string { return f.clientNames }
 
 func (f *fakeAdapter) Name() string                                           { return f.name }
 func (f *fakeAdapter) Short() string                                          { return f.short }

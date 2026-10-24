@@ -19,8 +19,16 @@ func TestRegistryGet(t *testing.T) {
 	}
 }
 
+// withClientNames wraps a generic adapter to also implement adapter.ClientNamer.
+type withClientNames struct {
+	*generic.Adapter
+	clients []string
+}
+
+func (w *withClientNames) ClientNames() []string { return w.clients }
+
 func TestFromClient(t *testing.T) {
-	codex := generic.WithEnv("codex", "CODEX_SESSION_ID")
+	codex := &withClientNames{Adapter: generic.WithEnv("codex", "CODEX_SESSION_ID"), clients: []string{"codex-mcp-client"}}
 	claude := generic.WithEnv("claude-code", "CLAUDE_SESSION_ID")
 	r := adapter.NewRegistry(codex, claude)
 
@@ -31,6 +39,9 @@ func TestFromClient(t *testing.T) {
 	got, ok = r.FromClient("claude-code")
 	if !ok || got.Name() != "claude-code" {
 		t.Fatalf("FromClient(claude-code) = %v, %v", got, ok)
+	}
+	if _, ok := r.FromClient("claude-ai"); ok {
+		t.Fatal("claude-ai matched the claude-code adapter")
 	}
 }
 
