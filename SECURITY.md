@@ -27,9 +27,16 @@ on the same machine can't reach it. Any process running *as you*, agent or not, 
 - Call the `approve` and `refuse_person` IPC operations directly, with no consent check — the CLI
   (`agentnet approve`/`agentnet refuse`) asks for consent before calling them, but the daemon
   itself does not gate the operations. Consent for holds is enforced CLI-side only.
+- Edit `~/.agentnet/config.json` directly (`folders`, `inbound`, `people`, `paused`), which
+  bypasses every CLI consent prompt, including `folder add` and `resume`.
 
-Both are consequences of same-machine, same-user trust: if a process can run as you, it can drive
-agentnet as you.
+The network side of the first point: a receiving machine trusts the sending machine's claim that
+a message came from `person/terminal`. So a terminal send, including an `agentnet send` that a
+prompt-injected agent runs, skips the receiver's loop guard and may address a group there too.
+Only the receiver's limit of 60 messages a minute per sending machine still applies.
+
+All of these are consequences of same-machine, same-user trust: if a process can run as you, it
+can drive agentnet as you.
 
 ## What the daemon keeps, and for how long
 
