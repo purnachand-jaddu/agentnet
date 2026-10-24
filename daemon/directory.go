@@ -21,13 +21,14 @@ const (
 
 // peer is one remote member machine as this daemon knows it.
 type peer struct {
-	cert     identity.Cert // from its latest presence
-	sessions []WhoEntry    // its local sessions; Address is the bare session name
-	verified []string      // from its own signed presence, or an address that produced its signed ack
-	hints    []string      // unverified, from discovery
-	lastSeen time.Time     // when its latest presence arrived
-	lastTS   int64         // its latest presence timestamp (unix ms); older ones are ignored
-	skew     time.Duration // now minus its presence timestamp, for doctor
+	cert         identity.Cert // from its latest presence
+	sessions     []WhoEntry    // its local sessions; Address is the bare session name
+	verified     []string      // from its own signed presence, or an address that produced its signed ack
+	hints        []string      // unverified, from discovery
+	lastSeen     time.Time     // when its latest presence arrived
+	lastTS       int64         // its latest presence timestamp (unix ms); older ones are ignored
+	skew         time.Duration // now minus its presence timestamp, for doctor
+	timeRefusals int           // presence refused as stale/replayed for time reasons, for doctor
 }
 
 // peerKey is a machine key as the peers map key.
@@ -46,6 +47,66 @@ func (d *Daemon) peerFor(key string) *peer {
 // online reports whether p's latest presence is recent enough.
 func (d *Daemon) online(p *peer, now time.Time) bool {
 	return !p.lastSeen.IsZero() && now.Sub(p.lastSeen) < d.opts.OfflineAfter
+}
+
+// dropBlocked removes directory and address state for every machine currently blocked in Team, so a
+// revoke takes it out of who/presence immediately instead of waiting for it to time out as offline.
+func (d *Daemon) dropBlocked() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, b := range d.opts.Team.BlocksSnapshot() {
+		delete(d.peers, peerKey(b.Key))
+	}
+}
+
+// recordTimeRefusal counts one presence refused as stale/replayed for time reasons from key, so doctor
+// can show a clock skew bad enough that envelopes are refused outright (and so never show up as presence).
+func (d *Daemon) recordTimeRefusal(key string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.peerFor(key).timeRefusals++
+}
+
+// PeerInfo is one other team member as the "peers" op reports it, for doctor.
+type PeerInfo struct {
+	Person       string        `json:"person"`
+	Machine      string        `json:"machine"`
+	Key          string        `json:"key"`
+	Online       bool          `json:"online"`
+	LastSeen     time.Time     `json:"last_seen"`
+	ClockDiff    time.Duration `json:"clock_diff"`
+	TimeRefusals int           `json:"time_refusals"`
+}
+
+// PeersResult answers a "peers" op.
+type PeersResult struct {
+	Peers []PeerInfo `json:"peers"`
+}
+
+// peersOp handles the "peers" op: every other team member, online/offline, with clock skew and
+// presence time-refusal counts.
+func (d *Daemon) peersOp() PeersResult {
+	if d.opts.Team == nil {
+		return PeersResult{}
+	}
+	now := d.opts.Now()
+	var res PeersResult
+	for _, c := range d.opts.Team.MembersSnapshot() {
+		if bytes.Equal(c.Key, d.opts.Keys.Public()) {
+			continue
+		}
+		info := PeerInfo{Person: c.Person, Machine: c.Machine, Key: peerKey(c.Key)}
+		d.mu.Lock()
+		if p, ok := d.peers[peerKey(c.Key)]; ok {
+			info.Online, info.LastSeen, info.ClockDiff, info.TimeRefusals = d.online(p, now), p.lastSeen, p.skew, p.timeRefusals
+		}
+		d.mu.Unlock()
+		res.Peers = append(res.Peers, info)
+	}
+	slices.SortFunc(res.Peers, func(a, b PeerInfo) int {
+		return strings.Compare(a.Person+a.Machine, b.Person+b.Machine)
+	})
+	return res
 }
 
 // found records a discovery hint: keyless ones as static peers, keyed ones only for known members.

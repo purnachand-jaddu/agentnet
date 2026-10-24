@@ -254,6 +254,9 @@ func (d *Daemon) handleEnvelope(_ context.Context, e envelope.Envelope) envelope
 func (d *Daemon) receivePresence(e envelope.Envelope) error {
 	plain, err := d.verifier.Open(e, d.opts.Keys, d.opts.Sealer)
 	if err != nil {
+		if errors.Is(err, envelope.ErrStale) {
+			d.recordTimeRefusal(peerKey(e.Cert.Key))
+		}
 		return err
 	}
 	var p presence
@@ -268,10 +271,25 @@ func (d *Daemon) receivePresence(e envelope.Envelope) error {
 		d.unsaved.Store(true)
 	}
 	d.persistTeam()
+	d.dropBlocked()                                         // a block just merged from gossip drops that machine here too, not just where it originated
 	if err := d.opts.Team.Verify(e.Cert, now); err != nil { // its own presence may carry its block
 		return fmt.Errorf("presence: %w: %w", envelope.ErrNotMember, err)
 	}
 	d.applyPresence(e.Cert, p, now)
+	return nil
+}
+
+// teamChanged handles the "team_changed" op: reload Team from the store (e.g. after an out-of-band
+// `agentnet revoke`) and gossip it immediately rather than waiting for the next presence tick.
+func (d *Daemon) teamChanged(ctx context.Context) error {
+	if d.opts.Team == nil {
+		return errors.New("daemon: not in a network")
+	}
+	if err := d.opts.Team.Reload(d.opts.Store); err != nil {
+		return err
+	}
+	d.dropBlocked()
+	d.broadcast(ctx, d.localWho(WhoArgs{}).Sessions)
 	return nil
 }
 

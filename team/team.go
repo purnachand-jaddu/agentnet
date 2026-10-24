@@ -346,3 +346,36 @@ func (st *State) BlocksSnapshot() []identity.Block {
 	}
 	return out
 }
+
+// Revoke signs a founder Block for key and merges+persists it into st: Verify rejects that key from
+// here on, and the persisted block spreads to other members via presence gossip.
+func Revoke(s store.Store, founder ed25519.PrivateKey, st *State, key []byte, reason string, now time.Time) (identity.Block, error) {
+	founderPub := founder.Public().(ed25519.PublicKey)
+	if !st.Founder.Equal(founderPub) {
+		return identity.Block{}, errors.New("team: that founder key does not match this network")
+	}
+	blk := identity.Block{Team: identity.TeamID(founderPub), Key: key, Reason: reason, TS: now.Unix()}
+	blk.Sign(founder)
+	st.Merge(nil, []identity.Block{blk}, now)
+	if err := st.Persist(s); err != nil {
+		return identity.Block{}, err
+	}
+	return blk, nil
+}
+
+// Reload re-reads certs and blocks from s into st in place, under its lock, so a long-lived *State
+// (like the daemon's) picks up an out-of-band change without restarting. Founder and Self are untouched.
+func (st *State) Reload(s store.Store) error {
+	fresh, err := Load(s)
+	if err != nil {
+		return err
+	}
+	if fresh == nil {
+		return errors.New("team: no network on this machine")
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.Members = fresh.Members
+	st.Blocks = fresh.Blocks
+	return nil
+}

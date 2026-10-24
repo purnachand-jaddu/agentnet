@@ -305,3 +305,97 @@ func TestHeldMessageApprovedThenDelivered(t *testing.T) {
 		t.Fatalf("second send receipt says held/refused after approve: %s", out)
 	}
 }
+
+// TestRevokedPeerCanNoLongerDeliver proves `agentnet revoke` ends a relationship end to end: once A
+// revokes B, A can no longer resolve or send to B.
+func TestRevokedPeerCanNoLongerDeliver(t *testing.T) {
+	if buildErr != nil {
+		t.Fatalf("agentnet build failed: %v", buildErr)
+	}
+
+	ports := freePorts(t, 2)
+	portA, portB := ports[0], ports[1]
+	a := newMachine(t, portA, portB, nil)
+	b := newMachine(t, portB, portA, map[string]config.Policy{"alex": config.Accept})
+
+	if _, errOut, err := a.run(nil, "init", "--person", "alex", "--machine", "mbp"); err != nil {
+		t.Fatalf("init: %v\n%s", err, errOut)
+	}
+	joinOut, errOut, err := b.run(nil, "join", "--person", "sam", "--machine", "xps")
+	if err != nil {
+		t.Fatalf("join: %v\n%s", err, errOut)
+	}
+	request := strings.SplitN(joinOut, "\n", 2)[0]
+	admitOut, errOut, err := a.run(nil, "admit", request)
+	if err != nil {
+		t.Fatalf("admit: %v\n%s", err, errOut)
+	}
+	bundle := strings.SplitN(admitOut, "\n", 2)[0]
+	if _, errOut, err := b.run(nil, "accept", bundle); err != nil {
+		t.Fatalf("accept: %v\n%s", err, errOut)
+	}
+
+	startDaemon(t, "A", a)
+	startDaemon(t, "B", b)
+
+	codexLog := filepath.Join(b.tmp, "codex.log")
+	codexScript := fmt.Sprintf("#!/bin/sh\necho \"$@\" >> %s\n", codexLog)
+	if err := os.WriteFile(filepath.Join(b.bin, "codex"), []byte(codexScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	srcWeb := filepath.Join(b.src, "web")
+	if err := os.MkdirAll(srcWeb, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	codexStdin, _ := json.Marshal(struct {
+		SessionID string `json:"session_id"`
+		Cwd       string `json:"cwd"`
+	}{"x1", srcWeb})
+	if _, errOut, err := b.run(codexStdin, "hook", "codex", "session-start"); err != nil {
+		t.Fatalf("codex hook: %v\n%s", err, errOut)
+	}
+
+	waitUntil(t, 15*time.Second, func() (bool, string) {
+		out, _, err := a.run(nil, "who")
+		if err != nil {
+			return false, "who: " + err.Error()
+		}
+		if strings.Contains(out, "sam/web-codex") {
+			return true, ""
+		}
+		return false, "who missing sam/web-codex:\n" + out
+	})
+
+	out, errOut, err := a.run(nil, "send", "sam/web-codex", "hi")
+	if err != nil {
+		t.Fatalf("send: %v\n%s", err, errOut)
+	}
+	if strings.Contains(out, "refused") {
+		t.Fatalf("send receipt says refused before revoke: %s", out)
+	}
+
+	revokeOut, errOut, err := a.run(nil, "revoke", "sam")
+	if err != nil {
+		t.Fatalf("revoke: %v\n%s", err, errOut)
+	}
+	if !strings.Contains(revokeOut, "revoked sam@xps") {
+		t.Fatalf("revoke output = %q", revokeOut)
+	}
+
+	waitUntil(t, 10*time.Second, func() (bool, string) {
+		out, _, err := a.run(nil, "who")
+		if err != nil {
+			return false, "who: " + err.Error()
+		}
+		if !strings.Contains(out, "sam/web-codex") {
+			return true, ""
+		}
+		return false, "B still in A's directory after revoke:\n" + out
+	})
+
+	if _, errOut, err := a.run(nil, "send", "sam/web-codex", "should not arrive"); err == nil {
+		t.Fatal("send to a revoked peer should fail")
+	} else if !strings.Contains(errOut, "no such session") {
+		t.Fatalf("send error = %v, stderr = %q, want \"no such session\"", err, errOut)
+	}
+}

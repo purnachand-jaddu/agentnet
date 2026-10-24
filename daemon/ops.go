@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 
 	"github.com/purnachand-jaddu/agentnet/adapter"
 	"github.com/purnachand-jaddu/agentnet/ipc"
@@ -12,8 +13,9 @@ import (
 
 // StatusResult answers a "status" op.
 type StatusResult struct {
-	Service bool `json:"service"`
-	PID     int  `json:"pid"`
+	Service bool     `json:"service"`
+	PID     int      `json:"pid"`
+	Addrs   []string `json:"addrs,omitempty"` // this machine's listener addresses
 }
 
 // RegisterArgs is the "register" op's arguments.
@@ -121,14 +123,21 @@ func (d *Daemon) Handle(ctx context.Context, c ipc.Conn, op string, args json.Ra
 		return nil, nil
 	case "status":
 		return d.status(), nil
+	case "team_changed":
+		return nil, d.teamChanged(ctx)
+	case "peers":
+		return d.peersOp(), nil
 	default:
 		return nil, fmt.Errorf("unknown op %q", op)
 	}
 }
 
-// status reports whether this process is the installed background service, and its PID.
+// status reports whether this process is the installed background service, its PID, and its listener addresses.
 func (d *Daemon) status() StatusResult {
-	return StatusResult{Service: d.opts.Service, PID: os.Getpid()}
+	d.mu.Lock()
+	addrs := slices.Clone(d.myAddrs)
+	d.mu.Unlock()
+	return StatusResult{Service: d.opts.Service, PID: os.Getpid(), Addrs: addrs}
 }
 
 // doShutdown closes Shutdown() the first time it's called; later calls are harmless.
