@@ -17,15 +17,24 @@ import (
 	"github.com/purnachand-jaddu/agentnet/ipc"
 )
 
-// freePort returns a free TCP port on 127.0.0.1 by listening and immediately closing.
-func freePort(t *testing.T) int {
+// freePorts returns n distinct free TCP ports on 127.0.0.1, holding every listener open until all
+// n are chosen so the OS can't hand two of them the same port.
+func freePorts(t *testing.T, n int) []int {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	lns := make([]net.Listener, n)
+	ports := make([]int, n)
+	for i := range lns {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		lns[i] = ln
+		ports[i] = ln.Addr().(*net.TCPAddr).Port
 	}
-	defer ln.Close()
-	return ln.Addr().(*net.TCPAddr).Port
+	for _, ln := range lns {
+		ln.Close()
+	}
+	return ports
 }
 
 // machine is one simulated computer: its own HOME/AGENTNET_HOME, bin dir and LAN port.
@@ -36,7 +45,8 @@ type machine struct {
 
 // newMachine sets up a short-path temp root with its own home, bin and src dirs, and an env where
 // every consent prompt auto-approves (that only works because the test binary is built -tags e2e).
-func newMachine(t *testing.T, port int, peerPort int) *machine {
+// people sets this machine's per-sender inbound policy overrides (config.go's People map); nil for none.
+func newMachine(t *testing.T, port int, peerPort int, people map[string]config.Policy) *machine {
 	t.Helper()
 	tmp, err := os.MkdirTemp("/tmp", "an")
 	if err != nil {
@@ -55,7 +65,9 @@ func newMachine(t *testing.T, port int, peerPort int) *machine {
 		"PATH=" + m.bin + ":/usr/bin:/bin",
 		"AGENTNET_TEST_APPROVE=yes",
 	}
-	cfg := config.Config{Port: port, Peers: []string{fmt.Sprintf("lan://127.0.0.1:%d", peerPort)}, Folders: []string{m.src}}
+	cfg := config.Config{
+		Port: port, Peers: []string{fmt.Sprintf("lan://127.0.0.1:%d", peerPort)}, Folders: []string{m.src}, People: people,
+	}
 	if err := cfg.Save(filepath.Join(m.home, "config.json")); err != nil {
 		t.Fatal(err)
 	}
@@ -68,12 +80,14 @@ func (m *machine) run(stdin []byte, args ...string) (stdout, stderr string, err 
 
 func (m *machine) sock() string { return filepath.Join(m.home, "agentnet.sock") }
 
-// startDaemon starts `agentnet daemon` on m, waits for its socket, and registers cleanup to shut it down.
-func startDaemon(t *testing.T, m *machine) {
+// startDaemon starts `agentnet daemon` on m, waits for its socket, and registers cleanup to shut it
+// down; on a failed test, its log is printed before the cleanup that removes m's temp dir runs.
+func startDaemon(t *testing.T, label string, m *machine) {
 	t.Helper()
 	cmd := exec.Command(binPath, "daemon")
 	cmd.Env = m.env
-	logFile, err := os.Create(filepath.Join(m.tmp, "daemon.log"))
+	logPath := filepath.Join(m.tmp, "daemon.log")
+	logFile, err := os.Create(logPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,6 +98,11 @@ func startDaemon(t *testing.T, m *machine) {
 	t.Cleanup(func() {
 		shutdownDaemon(cmd, m.sock())
 		logFile.Close()
+		if t.Failed() {
+			if b, err := os.ReadFile(logPath); err == nil {
+				t.Logf("%s daemon.log:\n%s", label, b)
+			}
+		}
 	})
 	waitUntil(t, 10*time.Second, func() (bool, string) {
 		c, err := ipc.Dial(m.sock())
@@ -95,17 +114,19 @@ func startDaemon(t *testing.T, m *machine) {
 	})
 }
 
-// TestTwoMachinesExchangeMessages proves the whole chain: real init/join/admit/accept between two
-// machines, two daemons talking over the LAN transport, presence, and a remote send delivered into
-// a fake Codex on the receiving machine.
+// TestTwoMachinesExchangeMessages proves the whole chain: real init/join/admit/accept, two daemons
+// over the LAN transport, presence, and a remote send delivered into a fake Codex on the receiver.
 func TestTwoMachinesExchangeMessages(t *testing.T) {
 	if buildErr != nil {
 		t.Fatalf("agentnet build failed: %v", buildErr)
 	}
 
-	portA, portB := freePort(t), freePort(t)
-	a := newMachine(t, portA, portB)
-	b := newMachine(t, portB, portA)
+	ports := freePorts(t, 2)
+	portA, portB := ports[0], ports[1]
+	a := newMachine(t, portA, portB, nil)
+	// B must explicitly accept alex, independent of today's permissive default inbound policy,
+	// so this scenario still holds once policy enforcement (Task 24) is wired in.
+	b := newMachine(t, portB, portA, map[string]config.Policy{"alex": config.Accept})
 
 	if _, errOut, err := a.run(nil, "init", "--person", "alex", "--machine", "mbp"); err != nil {
 		t.Fatalf("init: %v\n%s", err, errOut)
@@ -127,8 +148,8 @@ func TestTwoMachinesExchangeMessages(t *testing.T) {
 		t.Fatalf("accept: %v\n%s", err, errOut)
 	}
 
-	startDaemon(t, a)
-	startDaemon(t, b)
+	startDaemon(t, "A", a)
+	startDaemon(t, "B", b)
 
 	// Fake Codex on B: a script that logs its argv, plus the session-start hook codex's own hook would send.
 	codexLog := filepath.Join(b.tmp, "codex.log")

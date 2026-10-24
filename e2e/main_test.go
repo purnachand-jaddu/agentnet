@@ -29,9 +29,8 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// buildAgentnet builds ./cmd/agentnet to out with the e2e tag, resolving the module root via `go env GOMOD`.
-// The tag only adds a dead-code approver seam (internal/cli/testapprove_e2e.go) unless
-// AGENTNET_TEST_APPROVE=yes is set, so it's safe to build this way even for the untagged local_test.go.
+// buildAgentnet builds ./cmd/agentnet to out with the e2e tag; the tag is dead code unless
+// AGENTNET_TEST_APPROVE=yes is set, so it's safe for the untagged local_test.go too.
 func buildAgentnet(out string) error {
 	modOut, err := exec.Command("go", "env", "GOMOD").Output()
 	if err != nil {
