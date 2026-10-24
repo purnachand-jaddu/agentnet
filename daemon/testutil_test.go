@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -19,19 +20,30 @@ type fakeAdapter struct {
 	mu          sync.Mutex
 	pushed      []string
 	running     bool
+	failPush    bool // Push returns an error instead of recording text
 }
 
 func (f *fakeAdapter) ClientNames() []string { return f.clientNames }
 
-func (f *fakeAdapter) Name() string                                           { return f.name }
-func (f *fakeAdapter) Short() string                                          { return f.short }
-func (f *fakeAdapter) EnvSessionID(func(string) string) string                { return "" }
-func (f *fakeAdapter) MetaSessionID(map[string]any) string                    { return "" }
-func (f *fakeAdapter) Multiplexed() bool                                      { return false }
-func (f *fakeAdapter) Channel(adapter.Session, adapter.State) adapter.Channel { return f.channel }
+func (f *fakeAdapter) Name() string                            { return f.name }
+func (f *fakeAdapter) Short() string                           { return f.short }
+func (f *fakeAdapter) EnvSessionID(func(string) string) string { return "" }
+func (f *fakeAdapter) MetaSessionID(map[string]any) string     { return "" }
+func (f *fakeAdapter) Multiplexed() bool                       { return false }
+
+// Channel returns ChannelHook once st.PushFailed is set, so tests can observe the daemon feeding it back in.
+func (f *fakeAdapter) Channel(_ adapter.Session, st adapter.State) adapter.Channel {
+	if st.PushFailed {
+		return adapter.ChannelHook
+	}
+	return f.channel
+}
 func (f *fakeAdapter) Push(_ context.Context, _ adapter.Session, text string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failPush {
+		return errors.New("push failed")
+	}
 	f.pushed = append(f.pushed, text)
 	return nil
 }

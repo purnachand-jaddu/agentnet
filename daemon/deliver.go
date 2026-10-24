@@ -1,0 +1,250 @@
+package daemon
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/purnachand-jaddu/agentnet/adapter"
+	"github.com/purnachand-jaddu/agentnet/ipc"
+	"github.com/purnachand-jaddu/agentnet/message"
+)
+
+// pushTimeout bounds a daemon-side Adapter.Push call.
+const pushTimeout = 30 * time.Second
+
+// inFlightWindow is how long a pushed id stays hidden from Pending before it's assumed stuck.
+const inFlightWindow = 90 * time.Second
+
+// loopWindow and loopMax bound how many messages one session can send another before the loop guard refuses more.
+const (
+	loopWindow = 10 * time.Minute
+	loopMax    = 12
+)
+
+// SendArgs is the "send" op's arguments.
+type SendArgs struct {
+	From    string `json:"from"` // session key, or "cli:terminal"
+	To      string `json:"to"`
+	Body    string `json:"body"`
+	ReplyTo string `json:"reply_to,omitempty"`
+	Wake    bool   `json:"wake"`
+}
+
+// SendResult answers a "send" op: one id and receipt per recipient.
+type SendResult struct {
+	IDs      []string          `json:"ids"`
+	Receipts []message.Receipt `json:"receipts"`
+}
+
+// PushFailedArgs is the "push_failed" op's arguments: an MCP process reporting it couldn't deliver ids.
+type PushFailedArgs struct {
+	Key string   `json:"key"`
+	IDs []string `json:"ids"`
+}
+
+// send handles the "send" op: validates, resolves recipients, stores one message per recipient and delivers it.
+func (d *Daemon) send(a SendArgs) (SendResult, error) {
+	if a.Body == "" {
+		return SendResult{}, fmt.Errorf("empty message body")
+	}
+	if len(a.Body) > message.MaxBody {
+		return SendResult{}, fmt.Errorf("message body too long (max %d bytes)", message.MaxBody)
+	}
+	fromAddr, fromAgent, err := d.senderAddress(a.From)
+	if err != nil {
+		return SendResult{}, err
+	}
+	targets, err := d.resolveTo(a.From, a.To)
+	if err != nil {
+		return SendResult{}, err
+	}
+
+	var res SendResult
+	for _, tg := range targets {
+		to := d.opts.Person + "/" + tg.name
+		if a.From != "cli:terminal" && !d.loopAllowed(a.From, tg.name) {
+			res.Receipts = append(res.Receipts, message.Receipt{To: to, State: message.StateRefused,
+				Note: "too many messages between these two sessions; is this a loop?"})
+			continue
+		}
+		msg := message.Message{
+			ID: message.NewID(), From: fromAddr, To: to, FromAgent: fromAgent,
+			ReplyTo: a.ReplyTo, Body: a.Body, Wake: a.Wake, SentAt: d.opts.Now(),
+		}
+		if _, err := d.opts.Store.PutMessage(msg, tg.name, false); err != nil {
+			return SendResult{}, err
+		}
+		res.IDs = append(res.IDs, msg.ID)
+		res.Receipts = append(res.Receipts, d.deliver(tg.name, []message.Message{msg}, a.Wake))
+	}
+	return res, nil
+}
+
+// senderAddress resolves fromKey to the address and adapter name to stamp on an outgoing message.
+func (d *Daemon) senderAddress(fromKey string) (addr, agentName string, err error) {
+	if fromKey == "cli:terminal" {
+		return d.opts.Person + "/terminal", "", nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	l, ok := d.live[fromKey]
+	if !ok {
+		return "", "", fmt.Errorf("unknown sender %q", fromKey)
+	}
+	return d.opts.Person + "/" + l.name, l.s.Agent, nil
+}
+
+// loopAllowed reports whether another message from "from" to "to" is allowed within loopWindow, recording this attempt if so.
+func (d *Daemon) loopAllowed(from, to string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	key := [2]string{from, to}
+	now := d.opts.Now()
+	cutoff := now.Add(-loopWindow)
+	kept := d.pairs[key][:0]
+	for _, t := range d.pairs[key] {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) >= loopMax {
+		d.pairs[key] = kept
+		return false
+	}
+	d.pairs[key] = append(kept, now)
+	return true
+}
+
+// pending returns mailbox's unread messages, hiding ids pushed within inFlightWindow.
+func (d *Daemon) pending(mailbox string) ([]message.Message, error) {
+	msgs, err := d.opts.Store.Pending(mailbox)
+	if err != nil {
+		return nil, err
+	}
+	now := d.opts.Now()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var out []message.Message
+	for _, m := range msgs {
+		if t, ok := d.inFlight[m.ID]; ok {
+			if now.Sub(t) < inFlightWindow {
+				continue
+			}
+			delete(d.inFlight, m.ID)
+		}
+		out = append(out, m)
+	}
+	return out, nil
+}
+
+// deliver gets msgs (all addressed to the session named name) to it now, returning a receipt for the recipient.
+func (d *Daemon) deliver(name string, msgs []message.Message, wake bool) message.Receipt {
+	to := d.opts.Person + "/" + name
+	d.mu.Lock()
+	l := d.liveByName(name)
+	if l == nil {
+		d.mu.Unlock()
+		return message.Receipt{To: to, State: message.StateQueued, Note: "it reaches that session when it's back"}
+	}
+	if !wake {
+		d.mu.Unlock()
+		return message.Receipt{To: to, State: message.StateQueued, Note: "FYI: read at its next pause"}
+	}
+	a, ok := d.opts.Adapters.Get(l.s.Agent)
+	if !ok {
+		d.mu.Unlock()
+		return message.Receipt{To: to, State: message.StateQueued, Note: "it sees it when it checks its inbox"}
+	}
+	st := adapter.State{MCPPush: l.mcpPush, HookSeen: l.hookSeen, PushFailed: l.pushFailed}
+	sess, conn := l.s, l.conn
+	ch := a.Channel(sess, st)
+	ids := idsOf(msgs)
+	if ch == adapter.ChannelMCP || ch == adapter.ChannelCommand {
+		now := d.opts.Now()
+		for _, id := range ids {
+			d.inFlight[id] = now
+		}
+	}
+	d.mu.Unlock()
+
+	switch ch {
+	case adapter.ChannelMCP:
+		if conn != nil {
+			if err := conn.Push(ipc.Event{Event: "deliver", Key: sess.Key, IDs: ids, Text: message.ForAgent(msgs)}); err != nil {
+				d.opts.Log("daemon: push event to %s: %v", sess.Key, err)
+			}
+		}
+		return message.Receipt{To: to, State: message.StatePushed}
+	case adapter.ChannelCommand:
+		d.pushInBackground(a, sess, message.ForAgent(msgs), ids)
+		return message.Receipt{To: to, State: message.StatePushed}
+	case adapter.ChannelHook:
+		// Task 6 starts a TurnWatcher poll here when the adapter reports a running turn.
+		return message.Receipt{To: to, State: message.StateQueued, Note: "it sees it at its next tool call or when its turn ends"}
+	default: // ChannelPull
+		return message.Receipt{To: to, State: message.StateQueued, Note: "it sees it when it checks its inbox"}
+	}
+}
+
+// idsOf returns the ids of msgs.
+func idsOf(msgs []message.Message) []string {
+	ids := make([]string, len(msgs))
+	for i, m := range msgs {
+		ids[i] = m.ID
+	}
+	return ids
+}
+
+// pushInBackground runs a.Push for sess in a goroutine, recording the outcome on its live session and marking ids read on success.
+func (d *Daemon) pushInBackground(a adapter.Adapter, sess adapter.Session, text string, ids []string) {
+	d.safeGo(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), pushTimeout)
+		defer cancel()
+		err := a.Push(ctx, sess, text)
+
+		d.mu.Lock()
+		if l, ok := d.live[sess.Key]; ok {
+			l.pushFailed = err != nil
+		}
+		d.mu.Unlock()
+
+		if err != nil {
+			d.opts.Log("daemon: push to %s failed: %v", sess.Key, err)
+			return
+		}
+		if err := d.opts.Store.MarkRead(ids, d.opts.Now()); err != nil {
+			d.opts.Log("daemon: mark read %v: %v", ids, err)
+			return
+		}
+		d.mu.Lock()
+		for _, id := range ids {
+			delete(d.inFlight, id)
+		}
+		d.mu.Unlock()
+	})
+}
+
+// safeGo runs fn in its own goroutine, recovering and logging any panic instead of crashing the daemon.
+func (d *Daemon) safeGo(fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				d.opts.Log("daemon: panic in background push: %v", r)
+			}
+		}()
+		fn()
+	}()
+}
+
+// pushFailed handles the "push_failed" op: an MCP process reporting it has no inbox for ids, so they stay unread.
+func (d *Daemon) pushFailed(a PushFailedArgs) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if l, ok := d.live[a.Key]; ok {
+		l.mcpPush = false
+	}
+	for _, id := range a.IDs {
+		delete(d.inFlight, id)
+	}
+}

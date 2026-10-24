@@ -46,6 +46,19 @@ func (d *Daemon) Handle(ctx context.Context, c ipc.Conn, op string, args json.Ra
 		}
 		d.unregister(a.Key)
 		return nil, nil
+	case "send":
+		var a SendArgs
+		if err := json.Unmarshal(args, &a); err != nil {
+			return nil, err
+		}
+		return d.send(a)
+	case "push_failed":
+		var a PushFailedArgs
+		if err := json.Unmarshal(args, &a); err != nil {
+			return nil, err
+		}
+		d.pushFailed(a)
+		return nil, nil
 	case "shutdown":
 		d.doShutdown()
 		return nil, nil
