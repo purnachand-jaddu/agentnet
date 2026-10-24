@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -14,6 +16,7 @@ import (
 	"github.com/purnachand-jaddu/agentnet/internal/paths"
 	"github.com/purnachand-jaddu/agentnet/ipc"
 	"github.com/purnachand-jaddu/agentnet/setup"
+	"github.com/purnachand-jaddu/agentnet/store/sqlite"
 	"github.com/purnachand-jaddu/agentnet/team"
 )
 
@@ -31,10 +34,11 @@ type doctorTeamInfo struct {
 	HasFounderKey  bool
 }
 
-// doctorAgents is whether Claude Code and Codex are installed, and whether setup's Check passes for each.
+// doctorAgents is whether Claude Code and Codex are installed, and whether their MCP registration
+// and lifecycle hooks are each wired, from setup's own read-only checks.
 type doctorAgents struct {
-	ClaudeFound, ClaudeOK bool
-	CodexFound, CodexOK   bool
+	ClaudeFound, ClaudeMCP, ClaudeHooks bool
+	CodexFound, CodexConfig, CodexHooks bool
 }
 
 // doctorChecks is every call doctor makes to the outside world, as funcs, so tests can fake all of
@@ -82,12 +86,12 @@ func doctorServiceInstalled() (bool, error) {
 }
 
 func doctorTeamFromStore() (doctorTeamInfo, error) {
-	st, err := openStoreIfExists()
+	if _, err := os.Stat(paths.DB()); err != nil {
+		return doctorTeamInfo{}, nil // no db yet: not in a network, and never create one by looking
+	}
+	st, err := sqlite.OpenReadOnly(paths.DB())
 	if err != nil {
 		return doctorTeamInfo{}, err
-	}
-	if st == nil {
-		return doctorTeamInfo{}, nil
 	}
 	defer st.Close()
 	tm, err := team.Load(st)
@@ -128,15 +132,15 @@ func doctorAgentsFromSetup() doctorAgents {
 		return doctorAgents{}
 	}
 	var a doctorAgents
-	for _, s := range setup.Plan(home, exe, setup.Exec) {
-		switch {
-		case strings.HasPrefix(s.Name, "Claude Code"):
-			a.ClaudeFound = true
-			a.ClaudeOK, _ = s.Check()
-		case strings.HasPrefix(s.Name, "Codex"):
-			a.CodexFound = true
-			a.CodexOK, _ = s.Check()
-		}
+	if _, err := exec.LookPath("claude"); err == nil {
+		a.ClaudeFound = true
+		a.ClaudeMCP, a.ClaudeHooks, _ = setup.ClaudeWired(home, exe)
+	}
+	_, codexBinErr := exec.LookPath("codex")
+	_, codexDirErr := os.Stat(filepath.Join(home, ".codex"))
+	if codexBinErr == nil || codexDirErr == nil {
+		a.CodexFound = true
+		a.CodexConfig, a.CodexHooks, _ = setup.CodexWired(home, exe)
 	}
 	return a
 }
@@ -155,9 +159,10 @@ type line struct {
 	text string
 }
 
-func okLine(text string) line  { return line{"✓", text} }
-func badLine(text string) line { return line{"✗", text} }
-func naLine(text string) line  { return line{"–", text} }
+func okLine(text string) line   { return line{"✓", text} }
+func badLine(text string) line  { return line{"✗", text} }
+func naLine(text string) line   { return line{"–", text} }
+func warnLine(text string) line { return line{"⚠", text} } // flagged, but never fails the exit code
 
 // cmdDoctor runs `agentnet doctor`: a read-only health report, no consent needed.
 func cmdDoctor(args []string) int {
@@ -253,20 +258,34 @@ func peerLines(c doctorChecks, t doctorTeamInfo) []line {
 	return out
 }
 
+// timeRefusalSuffix is the diagnostic appended whenever a peer has any authenticated time-window
+// refusal: it already verified signature, so this is suspected real clock skew, not a replay.
+func timeRefusalSuffix(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf(", clock skew suspected (%d refusal%s)", n, pluralS(n))
+}
+
+func pluralS(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
 func peerLine(p daemon.PeerInfo, now time.Time) line {
 	who := fmt.Sprintf("%s@%s", p.Person, p.Machine)
 	if p.LastSeen.IsZero() {
-		return badLine(fmt.Sprintf("peer %s: never seen; check that machine's network or daemon", who))
+		return badLine(fmt.Sprintf("peer %s: never seen; check that machine's network or daemon%s", who, timeRefusalSuffix(p.TimeRefusals)))
 	}
 	age := now.Sub(p.LastSeen).Round(time.Second)
 	status := "offline"
 	if p.Online {
 		status = "online"
 	}
-	text := fmt.Sprintf("peer %s: %s, last seen %s ago, clock diff %s", who, status, age, p.ClockDiff.Round(time.Second))
-	if p.TimeRefusals > 0 {
-		text += fmt.Sprintf(", %d presence refused for clock skew", p.TimeRefusals)
-	}
+	text := fmt.Sprintf("peer %s: %s, last seen %s ago, clock diff %s%s",
+		who, status, age, p.ClockDiff.Round(time.Second), timeRefusalSuffix(p.TimeRefusals))
 	skew := p.ClockDiff
 	if skew < 0 {
 		skew = -skew
@@ -275,7 +294,7 @@ func peerLine(p daemon.PeerInfo, now time.Time) line {
 	case !p.Online:
 		return badLine(text + " — check network/daemon on that machine")
 	case skew > clockSkewWarn:
-		return badLine(text + " — clock skew exceeds 2m; check this machine's clock")
+		return warnLine(text + " — clock skew exceeds 2m; check this machine's clock")
 	default:
 		return okLine(text)
 	}
@@ -295,17 +314,27 @@ func listenerLine(st daemon.StatusResult, daemonErr error, t doctorTeamInfo) lin
 }
 
 func agentLines(a doctorAgents) []line {
-	return []line{agentLine("Claude Code", a.ClaudeFound, a.ClaudeOK), agentLine("Codex", a.CodexFound, a.CodexOK)}
+	return []line{
+		agentLine("Claude Code", a.ClaudeFound, a.ClaudeMCP, a.ClaudeHooks),
+		agentLine("Codex", a.CodexFound, a.CodexConfig, a.CodexHooks),
+	}
 }
 
-func agentLine(name string, found, wired bool) line {
+// agentLine reports which part of the wiring (MCP registration, hooks, or both) is missing.
+func agentLine(name string, found, configOK, hooksOK bool) line {
 	if !found {
 		return naLine(name + ": not installed")
 	}
-	if !wired {
-		return badLine(name + ": installed but not wired; re-run `agentnet setup`")
+	switch {
+	case configOK && hooksOK:
+		return okLine(name + ": wired")
+	case !configOK && !hooksOK:
+		return badLine(name + ": installed but not wired (MCP and hooks both missing); re-run `agentnet setup`")
+	case !configOK:
+		return badLine(name + ": installed but MCP not registered; re-run `agentnet setup`")
+	default:
+		return badLine(name + ": installed but hooks missing; re-run `agentnet setup`")
 	}
-	return okLine(name + ": wired")
 }
 
 func folderLines(c doctorChecks) []line {

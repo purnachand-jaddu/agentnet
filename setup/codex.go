@@ -28,13 +28,26 @@ func codexStep(home, exe string, run Runner) Step {
 			return errors.Join(errConfig, errHooks)
 		},
 		Check: func() (bool, error) {
-			data, err := os.ReadFile(configPath)
-			if err != nil {
-				return false, nil
-			}
-			return strings.Contains(string(data), "[mcp_servers.agentnet]") && strings.Contains(string(data), exe), nil
+			return codexConfigApplied(configPath, exe), nil
 		},
 	}
+}
+
+// codexConfigApplied reports whether config.toml's [mcp_servers.agentnet] table names exe, read-only.
+func codexConfigApplied(configPath, exe string) bool {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(data), "[mcp_servers.agentnet]") && strings.Contains(string(data), exe)
+}
+
+// CodexWired reports whether Codex's MCP table and all five lifecycle hooks are wired for exe,
+// read-only (never invokes the codex binary).
+func CodexWired(home, exe string) (config, hooks bool, err error) {
+	config = codexConfigApplied(filepath.Join(home, ".codex", "config.toml"), exe)
+	hooks, err = hooksWired(filepath.Join(home, ".codex", "hooks.json"), exe, codexAgent)
+	return config, hooks, err
 }
 
 // codexBlock is the exact lines setup owns inside config.toml.

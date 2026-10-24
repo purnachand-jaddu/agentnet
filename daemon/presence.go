@@ -254,7 +254,7 @@ func (d *Daemon) handleEnvelope(_ context.Context, e envelope.Envelope) envelope
 func (d *Daemon) receivePresence(e envelope.Envelope) error {
 	plain, err := d.verifier.Open(e, d.opts.Keys, d.opts.Sealer)
 	if err != nil {
-		if errors.Is(err, envelope.ErrStale) {
+		if errors.Is(err, envelope.ErrClockSkew) { // signature already verified; a real time-window miss, not a replay
 			d.recordTimeRefusal(peerKey(e.Cert.Key))
 		}
 		return err
@@ -275,9 +275,14 @@ func (d *Daemon) receivePresence(e envelope.Envelope) error {
 	if err := d.opts.Team.Verify(e.Cert, now); err != nil { // its own presence may carry its block
 		return fmt.Errorf("presence: %w: %w", envelope.ErrNotMember, err)
 	}
+	afterPresenceVerified() // test-only hook: lets a test pause here to interleave a concurrent revoke
 	d.applyPresence(e.Cert, p, now)
 	return nil
 }
+
+// afterPresenceVerified runs synchronously right after a presence's sender cert passes Verify but
+// before its directory entries are applied; a no-op in production, overridable by tests.
+var afterPresenceVerified = func() {}
 
 // teamChanged handles the "team_changed" op: reload Team from the store (e.g. after an out-of-band
 // `agentnet revoke`) and gossip it immediately rather than waiting for the next presence tick.

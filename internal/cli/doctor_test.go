@@ -2,11 +2,13 @@ package cli
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/purnachand-jaddu/agentnet/daemon"
+	"github.com/purnachand-jaddu/agentnet/internal/paths"
 )
 
 // withDoctorChecks injects c into newDoctorChecks for the duration of t, restoring the original after.
@@ -32,7 +34,7 @@ func healthyChecks() doctorChecks {
 			return []daemon.PeerInfo{{Person: "sam", Machine: "xps", Online: true, LastSeen: time.Now().Add(-5 * time.Second), ClockDiff: time.Second}}, nil
 		},
 		Agents: func() doctorAgents {
-			return doctorAgents{ClaudeFound: true, ClaudeOK: true, CodexFound: true, CodexOK: true}
+			return doctorAgents{ClaudeFound: true, ClaudeMCP: true, ClaudeHooks: true, CodexFound: true, CodexConfig: true, CodexHooks: true}
 		},
 		Folders: func() ([]string, error) { return []string{"/home/alex/src"}, nil },
 		GOOS:    "linux",
@@ -101,19 +103,20 @@ func TestDoctorNotInTeamShowsNotApplicable(t *testing.T) {
 	_ = code
 }
 
-// TestDoctorClockSkewWarning covers the explicit decision: warn when |clock diff| > 2 minutes.
+// TestDoctorClockSkewWarning covers the explicit decision: a warning when |clock diff| > 2 minutes,
+// shown as ⚠ and never failing the exit code by itself.
 func TestDoctorClockSkewWarning(t *testing.T) {
 	c := healthyChecks()
 	c.Peers = func() ([]daemon.PeerInfo, error) {
 		return []daemon.PeerInfo{{Person: "sam", Machine: "xps", Online: true, LastSeen: time.Now(), ClockDiff: 5 * time.Minute}}, nil
 	}
 	lines, code := runDoctor(c)
-	if code != 1 {
-		t.Fatalf("code = %d, want 1", code)
+	if code != 0 {
+		t.Fatalf("code = %d, want 0 (a clock-skew warning alone must not fail doctor)\n%s", code, render(lines))
 	}
 	out := render(lines)
-	if !strings.Contains(out, "clock skew exceeds 2m") {
-		t.Fatalf("output missing clock skew warning:\n%s", out)
+	if !strings.Contains(out, "⚠ peer sam@xps") || !strings.Contains(out, "clock skew exceeds 2m") {
+		t.Fatalf("output missing clock skew warning line:\n%s", out)
 	}
 }
 
@@ -128,6 +131,23 @@ func TestDoctorOfflinePeer(t *testing.T) {
 	}
 	if !strings.Contains(render(lines), "\u2717 peer sam@xps: offline") {
 		t.Fatalf("output:\n%s", render(lines))
+	}
+}
+
+// TestDoctorNeverSeenPeerStillShowsTimeRefusals proves the counter doesn't disappear precisely when
+// it matters most: a peer whose clock skew is bad enough that it has never once been accepted.
+func TestDoctorNeverSeenPeerStillShowsTimeRefusals(t *testing.T) {
+	c := healthyChecks()
+	c.Peers = func() ([]daemon.PeerInfo, error) {
+		return []daemon.PeerInfo{{Person: "sam", Machine: "xps", Online: false, TimeRefusals: 3}}, nil // zero LastSeen
+	}
+	lines, code := runDoctor(c)
+	if code != 1 {
+		t.Fatalf("code = %d, want 1", code)
+	}
+	out := render(lines)
+	if !strings.Contains(out, "peer sam@xps: never seen") || !strings.Contains(out, "clock skew suspected (3 refusals)") {
+		t.Fatalf("output missing never-seen clock-skew diagnostic:\n%s", out)
 	}
 }
 
@@ -174,13 +194,33 @@ func TestDoctorNoFoldersIsAFailure(t *testing.T) {
 
 func TestDoctorAgentNotInstalledIsNotApplicable(t *testing.T) {
 	c := healthyChecks()
-	c.Agents = func() doctorAgents { return doctorAgents{CodexFound: true, CodexOK: true} } // claude not found
+	c.Agents = func() doctorAgents { return doctorAgents{CodexFound: true, CodexConfig: true, CodexHooks: true} } // claude not found
 	lines, code := runDoctor(c)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0 (not-installed is n/a, not a failure)\n%s", code, render(lines))
 	}
 	if !strings.Contains(render(lines), "\u2013 Claude Code: not installed") {
 		t.Fatalf("output:\n%s", render(lines))
+	}
+}
+
+// TestDoctorAgentPartiallyWiredReportsWhichPart proves a half-wired agent (MCP but no hooks, or vice
+// versa) fails and names exactly what's missing, not a generic "not wired".
+func TestDoctorAgentPartiallyWiredReportsWhichPart(t *testing.T) {
+	c := healthyChecks()
+	c.Agents = func() doctorAgents {
+		return doctorAgents{ClaudeFound: true, ClaudeMCP: true, ClaudeHooks: false, CodexFound: true, CodexConfig: false, CodexHooks: true}
+	}
+	lines, code := runDoctor(c)
+	if code != 1 {
+		t.Fatalf("code = %d, want 1", code)
+	}
+	out := render(lines)
+	if !strings.Contains(out, "Claude Code: installed but hooks missing") {
+		t.Fatalf("output missing Claude hooks-missing line:\n%s", out)
+	}
+	if !strings.Contains(out, "Codex: installed but MCP not registered") {
+		t.Fatalf("output missing Codex MCP-missing line:\n%s", out)
 	}
 }
 
@@ -194,5 +234,52 @@ func TestCmdDoctorPrintsAndReturnsCode(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "daemon: running") {
 		t.Fatalf("stdout = %q", out.String())
+	}
+}
+
+// TestDoctorDoesNotModifyDatabase runs doctor's REAL (uninjected) Team check against a real store
+// and proves the database file's mode, mtime and size are unchanged: doctor never writes to it.
+func TestDoctorDoesNotModifyDatabase(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AGENTNET_HOME", home)
+	withApprover(t, fakeApprover{})
+	withIO(t)
+	if code := Main([]string{"init", "--person", "alex", "--machine", "mbp"}, "v0"); code != 0 {
+		t.Fatal("init failed")
+	}
+
+	dbPath := paths.DB()
+	before, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	withIO(t) // exit code doesn't matter here: no daemon is running, so some lines are ✗ regardless
+	Main([]string{"doctor"}, "v0")
+
+	after, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Mode() != after.Mode() {
+		t.Fatalf("mode changed: %v -> %v", before.Mode(), after.Mode())
+	}
+	if !before.ModTime().Equal(after.ModTime()) {
+		t.Fatalf("mtime changed: %v -> %v", before.ModTime(), after.ModTime())
+	}
+	if before.Size() != after.Size() {
+		t.Fatalf("size changed: %d -> %d", before.Size(), after.Size())
+	}
+}
+
+// TestDoctorMissingDatabaseIsNotInANetwork proves a never-created db reads as "not in a network",
+// not an error, and doctor still never creates the file.
+func TestDoctorMissingDatabaseIsNotInANetwork(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AGENTNET_HOME", home)
+	withIO(t)
+	Main([]string{"doctor"}, "v0")
+	if _, err := os.Stat(paths.DB()); !os.IsNotExist(err) {
+		t.Fatalf("doctor should never create the db; stat err = %v", err)
 	}
 }

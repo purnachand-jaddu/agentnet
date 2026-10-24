@@ -51,11 +51,41 @@ func (d *Daemon) online(p *peer, now time.Time) bool {
 
 // dropBlocked removes directory and address state for every machine currently blocked in Team, so a
 // revoke takes it out of who/presence immediately instead of waiting for it to time out as offline.
+// For each key actually removed (a real transition, not one already handled), it also drops that
+// peer's queued outbox mail. A key blocked before it was ever in the directory (no prior traffic)
+// keeps any pre-existing outbox entries until OutboxPrune's normal 7-day expiry — a narrow gap, since
+// resolveRemote already refuses to resolve a blocked member, so nothing is ever sent over it.
 func (d *Daemon) dropBlocked() {
 	d.mu.Lock()
-	defer d.mu.Unlock()
+	var newlyDropped []string
 	for _, b := range d.opts.Team.BlocksSnapshot() {
-		delete(d.peers, peerKey(b.Key))
+		k := peerKey(b.Key)
+		if _, ok := d.peers[k]; ok {
+			delete(d.peers, k)
+			newlyDropped = append(newlyDropped, k)
+		}
+	}
+	d.mu.Unlock()
+	for _, k := range newlyDropped {
+		d.dropOutbox(k)
+	}
+}
+
+// dropOutbox removes every queued outbound message for peerKey and audits each as refused with
+// reason "revoked", so a blocked machine's mail doesn't sit queued until OutboxPrune's 7-day expiry.
+func (d *Daemon) dropOutbox(peerKey string) {
+	msgs, err := d.opts.Store.OutboxFor(peerKey, d.opts.Now())
+	if err != nil {
+		d.opts.Log("daemon: list outbox for revoked peer: %v", err)
+		return
+	}
+	for _, m := range msgs {
+		if err := d.opts.Store.OutboxDone(m.ID); err != nil {
+			d.opts.Log("daemon: drop outbox entry %s: %v", m.ID, err)
+			continue
+		}
+		d.opts.Auditor.Record(AuditEntry{TS: d.opts.Now().UnixMilli(), Dir: "out", ID: m.ID, From: m.From, To: m.To,
+			State: message.StateRefused, BodySHA: bodyHash(m.Body), Reason: "revoked"})
 	}
 }
 
@@ -147,6 +177,9 @@ func (d *Daemon) found(f discovery.Found) {
 func (d *Daemon) applyPresence(from identity.Cert, p presence, now time.Time) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if _, member := d.opts.Team.CertFor(from.Key); !member {
+		return // revoked between the caller's Verify and this lock: never resurrect it in the directory
+	}
 	pr := d.peerFor(peerKey(from.Key))
 	if !d.online(pr, now) {
 		d.netDirty = true // it just (re)appeared: tell it about us now

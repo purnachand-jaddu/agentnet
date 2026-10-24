@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"sync"
@@ -28,6 +29,9 @@ func (d *Daemon) receiveMsg(e envelope.Envelope) (message.State, string) {
 	m, to, err := d.openMsg(e)
 	if err != nil {
 		d.opts.Log("daemon: refused message from %s: %v", e.Cert.Machine, err)
+		if errors.Is(err, envelope.ErrClockSkew) { // signature already verified; a real time-window miss
+			d.recordTimeRefusal(peerKey(e.Cert.Key))
+		}
 		reason := publicReason(err)
 		d.auditRefused(e.ID, peerKey(e.Cert.Key), reason)
 		return message.StateRefused, reason

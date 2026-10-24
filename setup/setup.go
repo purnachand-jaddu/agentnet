@@ -112,6 +112,30 @@ func applyHooks(path, exe, agent string) error {
 	return saveJSON(path, doc)
 }
 
+// hooksWired reports whether every one of our five lifecycle hooks is present in path's "hooks"
+// object for agent's commands built from exe, read-only (a missing file is simply not wired).
+func hooksWired(path, exe, agent string) (bool, error) {
+	doc, err := loadJSON(path)
+	if err != nil {
+		return false, err
+	}
+	hooks, _ := doc["hooks"].(map[string]any)
+	for _, event := range hookEventOrder {
+		groups, _ := hooks[event].([]any)
+		found := false
+		for _, g := range groups {
+			if groupIsOurs(g, exe, agent) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // removeHooks deletes only our hook entries from path's "hooks" object, dropping empty arrays and objects.
 func removeHooks(path, exe, agent string) error {
 	if err := backupOnce(path); err != nil {

@@ -28,6 +28,10 @@ var (
 	ErrMalformed    = errors.New("malformed")
 )
 
+// ErrClockSkew wraps into ErrStale (so the public reason is unchanged) but, unlike a replay, marks
+// specifically a time-window failure on an already-signature-verified envelope: real clock skew.
+var ErrClockSkew = errors.New("outside the time window")
+
 // Envelope is a signed, HPKE-sealed message between two machines.
 type Envelope struct {
 	V      int           `json:"v"`
@@ -136,7 +140,7 @@ func (v Verifier) Open(e Envelope, self identity.Keys, s seal.Sealer) ([]byte, e
 	}
 	now := v.Now()
 	if d := now.Sub(time.UnixMilli(e.TS)); d > v.Window || d < -v.Window {
-		return nil, fmt.Errorf("envelope: too old or from the future; check clocks: %w", ErrStale)
+		return nil, fmt.Errorf("envelope: too old or from the future; check clocks: %w: %w", ErrClockSkew, ErrStale)
 	}
 	if !message.ValidID(e.ID) {
 		return nil, fmt.Errorf("envelope: bad id %q: %w", e.ID, ErrMalformed)

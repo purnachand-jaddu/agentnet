@@ -29,7 +29,9 @@ func TestTeamChangedReloadsAndGossips(t *testing.T) {
 		t.Fatal("A should already know about B")
 	}
 
-	// Admit a third member C, and give A a fallback address to reach it (as discovery would).
+	// Admit a third member C with no static peers of its own (so its fallback pool stays empty),
+	// then give it a keyed hint for A specifically: that hint lands in A's own per-peer slot, never
+	// in a shared pool C might also try for B (whose cert the admit bundle hands it, but no address).
 	now := time.Now()
 	cKeys, _ := identity.GenerateKeys()
 	cBundle, err := team.Admit(f.aStore, f.fpriv, team.NewRequest(cKeys, "pat", "tp"), false, now)
@@ -43,16 +45,7 @@ func TestTeamChangedReloadsAndGossips(t *testing.T) {
 	}
 	c := newNetDaemon(t, "pat", "tp", cStore, cTeam, cKeys, freePort(t))
 	runDaemon(t, c)
-	// C's own static discoverer (configured with no peers) never announces anything, so give A a
-	// fallback hint to reach it, as mDNS discovery would once C's listener is actually up. B may log
-	// a harmless "not for this machine" refusal too: A's fallback pool isn't keyed per-peer, so the
-	// same race() send can also reach B's address while resolving where to reach C.
-	var cAddrs []string
-	waitUntil(t, 3*time.Second, "C is listening", func() bool {
-		cAddrs = c.status().Addrs
-		return len(cAddrs) > 0
-	})
-	a.found(discovery.Found{Addrs: cAddrs})
+	c.found(discovery.Found{Key: f.aKeys.Public(), Addrs: a.status().Addrs})
 
 	// Revoke B out of band, as a separate `agentnet revoke` process would: its own *team.State loaded
 	// from the same store A's daemon already has open.
@@ -80,7 +73,7 @@ func TestTeamChangedReloadsAndGossips(t *testing.T) {
 		t.Fatal("team_changed should have dropped B from A's directory")
 	}
 
-	waitUntil(t, 5*time.Second, "C learns of B's block via the immediate gossip round", func() bool {
+	waitUntil(t, 5*time.Second, "C learns of B's block via gossip", func() bool {
 		return cTeam.Verify(f.bTeam.Self, time.Now()) != nil
 	})
 }
@@ -156,5 +149,123 @@ func TestTimeSkewIncrementsCounterAndPeersOpReportsIt(t *testing.T) {
 	}
 	if found.Online {
 		t.Fatal("A should not be online: its only presence was refused")
+	}
+}
+
+// TestApplyPresenceNeverResurrectsARevokedPeer deterministically interleaves a presence that already
+// passed Verify with a concurrent revoke+dropBlocked, via the afterPresenceVerified test hook: the
+// paused handler must not recreate the peer once it resumes.
+func TestApplyPresenceNeverResurrectsARevokedPeer(t *testing.T) {
+	f := newTeamFixture(t)
+	b := newNetDaemon(t, "sam", "xps", f.bStore, f.bTeam, f.bKeys, 0)
+	now := time.Now()
+	ak := peerKey(f.aKeys.Public())
+
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	old := afterPresenceVerified
+	afterPresenceVerified = func() {
+		close(reached)
+		<-release
+	}
+	t.Cleanup(func() { afterPresenceVerified = old })
+
+	env := presenceFrom(t, f, now, now, "hello")
+	done := make(chan envelope.Ack, 1)
+	go func() { done <- b.handleEnvelope(context.Background(), env) }()
+	<-reached // the handler passed Verify and is paused just before applyPresence
+
+	// While paused, A gets revoked and dropped — exactly as a concurrent presence or team_changed would.
+	blk := identity.Block{Team: identity.TeamID(f.bTeam.Founder), Key: f.aKeys.Public(), Reason: "x", TS: now.Unix()}
+	blk.Sign(f.fpriv)
+	f.bTeam.Merge(nil, []identity.Block{blk}, now)
+	b.dropBlocked()
+
+	close(release)
+	<-done // let the paused handler finish
+
+	b.mu.Lock()
+	_, present := b.peers[ak]
+	b.mu.Unlock()
+	if present {
+		t.Fatal("applyPresence resurrected a peer revoked while the handler was paused")
+	}
+}
+
+// TestDropBlockedRemovesOutboxAndAuditsRevoked proves dropBlocked also clears a revoked peer's queued
+// outbound mail, auditing each as refused with reason "revoked".
+func TestDropBlockedRemovesOutboxAndAuditsRevoked(t *testing.T) {
+	f := newTeamFixture(t)
+	au, auPath := newAuditor(t)
+	b := newNetDaemon(t, "sam", "xps", f.bStore, f.bTeam, f.bKeys, 0)
+	b.opts.Auditor = au
+	now := time.Now()
+	ak := peerKey(f.aKeys.Public())
+
+	msg := message.Message{ID: message.NewID(), From: "sam/term", To: "alex/term", Body: "hi", SentAt: now}
+	if err := f.bStore.OutboxAdd(ak, msg, now); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed B's directory with A so dropBlocked treats it as a real transition.
+	if ack := b.handleEnvelope(context.Background(), presenceFrom(t, f, now, now, "hello")); ack.State != message.StateDelivered {
+		t.Fatalf("seed presence: %+v", ack)
+	}
+
+	blk := identity.Block{Team: identity.TeamID(f.bTeam.Founder), Key: f.aKeys.Public(), Reason: "x", TS: now.Unix()}
+	blk.Sign(f.fpriv)
+	f.bTeam.Merge(nil, []identity.Block{blk}, now)
+	b.dropBlocked()
+
+	left, err := f.bStore.OutboxFor(ak, now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 0 {
+		t.Fatalf("outbox for revoked peer should be empty, got %d entries", len(left))
+	}
+
+	var found bool
+	for _, e := range readAudit(t, auPath) {
+		if e.ID == msg.ID && e.State == message.StateRefused && e.Reason == "revoked" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("audit log missing a \"revoked\" refusal for the dropped outbox entry")
+	}
+}
+
+// TestMsgTimeSkewAlsoIncrementsCounter proves a "msg" envelope refused for a real time-window miss
+// (never a replay: openMsg disables the in-memory replay check) is counted too, not just presence.
+func TestMsgTimeSkewAlsoIncrementsCounter(t *testing.T) {
+	f := newTeamFixture(t)
+	b := newB(t, f, 0)
+
+	m := newMsg("alex/term", "sam/term")
+	payload, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().Add(-10 * time.Minute)
+	env, err := envelope.Build("msg", m.ID, f.aKeys, f.aTeam.Self, f.bTeam.Self, payload, seal.HPKE{}, stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack := b.d.handleEnvelope(context.Background(), env)
+	if ack.State != message.StateRefused || ack.Note != "stale or replayed" {
+		t.Fatalf("ack %+v, want refused/\"stale or replayed\"", ack)
+	}
+
+	ak := peerKey(f.aKeys.Public())
+	res := b.d.peersOp()
+	var found *PeerInfo
+	for i := range res.Peers {
+		if res.Peers[i].Key == ak {
+			found = &res.Peers[i]
+		}
+	}
+	if found == nil || found.TimeRefusals != 1 {
+		t.Fatalf("peer A TimeRefusals = %+v, want 1", found)
 	}
 }

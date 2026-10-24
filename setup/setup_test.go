@@ -755,3 +755,54 @@ func TestSaveJSONPreservesSymlink(t *testing.T) {
 		t.Fatalf("hooks weren't written to the real target:\n%s", readFile(t, real))
 	}
 }
+
+// TestClaudeWiredRequiresMCPAndHooks proves ClaudeWired checks the MCP entry and all five hooks
+// independently, and never invokes the claude binary.
+func TestClaudeWiredRequiresMCPAndHooks(t *testing.T) {
+	home := t.TempDir()
+	exe := "/usr/local/bin/agentnet"
+
+	if mcp, hooks, err := ClaudeWired(home, exe); err != nil || mcp || hooks {
+		t.Fatalf("nothing applied yet: mcp=%v hooks=%v err=%v, want false,false,nil", mcp, hooks, err)
+	}
+
+	if err := applyHooks(filepath.Join(home, ".claude", "settings.json"), exe, claudeAgent); err != nil {
+		t.Fatal(err)
+	}
+	if mcp, hooks, err := ClaudeWired(home, exe); err != nil || mcp || !hooks {
+		t.Fatalf("hooks only: mcp=%v hooks=%v err=%v, want false,true,nil", mcp, hooks, err)
+	}
+
+	// As if the real `claude` CLI had registered the MCP server into .claude.json.
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"),
+		[]byte(`{"mcpServers":{"agentnet":{"command":"`+exe+`"}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if mcp, hooks, err := ClaudeWired(home, exe); err != nil || !mcp || !hooks {
+		t.Fatalf("both: mcp=%v hooks=%v err=%v, want true,true,nil", mcp, hooks, err)
+	}
+}
+
+// TestCodexWiredRequiresConfigAndHooks mirrors the Claude Code test for Codex's config.toml and hooks.json.
+func TestCodexWiredRequiresConfigAndHooks(t *testing.T) {
+	home := t.TempDir()
+	exe := "/usr/local/bin/agentnet"
+
+	if config, hooks, err := CodexWired(home, exe); err != nil || config || hooks {
+		t.Fatalf("nothing applied yet: config=%v hooks=%v err=%v, want false,false,nil", config, hooks, err)
+	}
+
+	if err := applyCodexConfig(filepath.Join(home, ".codex", "config.toml"), exe); err != nil {
+		t.Fatal(err)
+	}
+	if config, hooks, err := CodexWired(home, exe); err != nil || !config || hooks {
+		t.Fatalf("config only: config=%v hooks=%v err=%v, want true,false,nil", config, hooks, err)
+	}
+
+	if err := applyHooks(filepath.Join(home, ".codex", "hooks.json"), exe, codexAgent); err != nil {
+		t.Fatal(err)
+	}
+	if config, hooks, err := CodexWired(home, exe); err != nil || !config || !hooks {
+		t.Fatalf("both: config=%v hooks=%v err=%v, want true,true,nil", config, hooks, err)
+	}
+}

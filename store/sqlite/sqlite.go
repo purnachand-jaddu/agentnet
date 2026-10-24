@@ -34,6 +34,22 @@ type Store struct {
 	db *sql.DB
 }
 
+// OpenReadOnly opens the SQLite store at path strictly read-only, for a tool (doctor) that must
+// never touch the file: no creation, no chmod, no WAL/journal change, no schema exec.
+func OpenReadOnly(path string) (*Store, error) {
+	dsn := "file:" + url.PathEscape(path) + "?mode=ro&_pragma=busy_timeout(5000)&_pragma=query_only(1)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	if err := db.Ping(); err != nil { // sql.Open is lazy; force the real (read-only) connection now
+		db.Close()
+		return nil, err
+	}
+	return &Store{db: db}, nil
+}
+
 // Open opens (creating if needed) the SQLite store at path, with mode 0600.
 func Open(path string) (*Store, error) {
 	if _, err := os.Stat(path); err != nil {

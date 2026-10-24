@@ -58,6 +58,17 @@ func claudeMCPRemove(run Runner) error {
 	return nil
 }
 
+// ClaudeWired reports whether Claude Code's MCP entry and all five lifecycle hooks are wired for
+// exe, read-only (never invokes the claude binary).
+func ClaudeWired(home, exe string) (mcp, hooks bool, err error) {
+	mcp, err = claudeMCPApplied(home, exe)
+	if err != nil {
+		return false, false, err
+	}
+	hooks, err = hooksWired(filepath.Join(home, ".claude", "settings.json"), exe, claudeAgent)
+	return mcp, hooks, err
+}
+
 // claudeMCPApplied reads <home>/.claude.json directly: never invokes the claude binary, since
 // `claude mcp get` actually spawns the configured server as a health check.
 func claudeMCPApplied(home, exe string) (bool, error) {

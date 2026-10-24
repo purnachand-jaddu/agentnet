@@ -62,22 +62,8 @@ func Load(s store.Store) (*State, error) {
 		}
 	}
 
-	certs, err := s.List(nsCert)
-	if err != nil {
-		return nil, err
-	}
-	now := time.Now()
-	for k, b := range certs {
-		var c identity.Cert
-		if err := json.Unmarshal(b, &c); err != nil {
-			continue // drop an unreadable stored cert
-		}
-		if err := c.Verify(founder, now); err != nil {
-			continue // drop a cert that no longer verifies against the founder
-		}
-		st.Members[k] = c
-	}
-
+	// Blocks load first: a stale cert row for an already-blocked key (e.g. written by another
+	// process after the CLI's own delete) must never resurface in Members below.
 	blocks, err := s.List(nsBlock)
 	if err != nil {
 		return nil, err
@@ -91,6 +77,25 @@ func Load(s store.Store) (*State, error) {
 			continue
 		}
 		st.Blocks[k] = blk
+	}
+
+	certs, err := s.List(nsCert)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	for k, b := range certs {
+		if _, blocked := st.Blocks[k]; blocked {
+			continue // a stale cert row for a blocked key must never resurrect it
+		}
+		var c identity.Cert
+		if err := json.Unmarshal(b, &c); err != nil {
+			continue // drop an unreadable stored cert
+		}
+		if err := c.Verify(founder, now); err != nil {
+			continue // drop a cert that no longer verifies against the founder
+		}
+		st.Members[k] = c
 	}
 	return st, nil
 }
@@ -107,6 +112,9 @@ func (st *State) save(s store.Store) error {
 		return err
 	}
 	for k, c := range st.Members {
+		if _, blocked := st.Blocks[k]; blocked {
+			continue // never write a live cert for a key this same state already blocks
+		}
 		b, err := json.Marshal(c)
 		if err != nil {
 			return err
@@ -363,8 +371,10 @@ func Revoke(s store.Store, founder ed25519.PrivateKey, st *State, key []byte, re
 	return blk, nil
 }
 
-// Reload re-reads certs and blocks from s into st in place, under its lock, so a long-lived *State
-// (like the daemon's) picks up an out-of-band change without restarting. Founder and Self are untouched.
+// Reload re-reads certs and blocks from s and folds them into st via Merge — monotonically, not a
+// wholesale replace — so a long-lived *State (like the daemon's) picks up an out-of-band change
+// without ever losing a block a concurrent Merge already applied after Load(s) took its snapshot.
+// Founder and Self are untouched.
 func (st *State) Reload(s store.Store) error {
 	fresh, err := Load(s)
 	if err != nil {
@@ -373,9 +383,14 @@ func (st *State) Reload(s store.Store) error {
 	if fresh == nil {
 		return errors.New("team: no network on this machine")
 	}
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.Members = fresh.Members
-	st.Blocks = fresh.Blocks
+	certs := make([]identity.Cert, 0, len(fresh.Members))
+	for _, c := range fresh.Members {
+		certs = append(certs, c)
+	}
+	blocks := make([]identity.Block, 0, len(fresh.Blocks))
+	for _, b := range fresh.Blocks {
+		blocks = append(blocks, b)
+	}
+	st.Merge(certs, blocks, time.Now())
 	return nil
 }

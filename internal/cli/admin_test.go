@@ -1,16 +1,38 @@
 package cli
 
 import (
+	"context"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/purnachand-jaddu/agentnet/consent"
+	"github.com/purnachand-jaddu/agentnet/daemon"
 	"github.com/purnachand-jaddu/agentnet/internal/paths"
+	"github.com/purnachand-jaddu/agentnet/ipc"
 	"github.com/purnachand-jaddu/agentnet/store/sqlite"
 	"github.com/purnachand-jaddu/agentnet/team"
 )
+
+// startFakeDaemon serves h on paths.Socket() until t ends, so a CLI test can exercise the
+// daemon-is-running path without a real daemon.Daemon.
+func startFakeDaemon(t *testing.T, h ipc.Handler) {
+	t.Helper()
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	l, err := ipc.Listen(paths.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- ipc.Serve(ctx, l, h, nil) }()
+	t.Cleanup(func() { cancel(); <-done })
+}
 
 // loadTeam opens the store at the current AGENTNET_HOME and loads its team state.
 func loadTeam(t *testing.T) *team.State {
@@ -136,5 +158,78 @@ func TestRevokeByKeyExactMatch(t *testing.T) {
 	after := loadTeam(t)
 	if err := after.Verify(member, time.Now()); err == nil {
 		t.Fatal("member should be blocked after revoke by key")
+	}
+}
+
+// TestRevokeToleratesDaemonNotRunning proves a missing daemon is not a reload failure: revoke still
+// succeeds, since no running daemon means no stale state to leave behind.
+func TestRevokeToleratesDaemonNotRunning(t *testing.T) {
+	_, _, _, _ = bundleAndCodes(t)
+	out, errOut := withIO(t)
+	if code := Main([]string{"revoke", "sam"}, "v0"); code != 0 {
+		t.Fatalf("code = %d, want 0; stdout %q, stderr %q", code, out.String(), errOut.String())
+	}
+	if !strings.Contains(out.String(), "revoked sam@xps") {
+		t.Fatalf("stdout = %q", out.String())
+	}
+}
+
+// TestRevokeReportsDaemonReloadFailure proves a running daemon that fails "team_changed" is reported
+// distinctly from success: the revocation is still saved locally, but the CLI exits 1 and says so.
+func TestRevokeReportsDaemonReloadFailure(t *testing.T) {
+	_, _, _, _ = bundleAndCodes(t)
+
+	startFakeDaemon(t, func(ctx context.Context, c ipc.Conn, op string, args json.RawMessage) (any, error) {
+		switch op {
+		case "status":
+			return daemon.StatusResult{PID: 123, Service: false}, nil
+		case "team_changed":
+			return nil, errors.New("boom")
+		default:
+			return nil, errors.New("unexpected op " + op)
+		}
+	})
+
+	tm := loadTeam(t)
+	member := tm.ByPerson("sam")[0]
+
+	_, errOut := withIO(t)
+	if code := Main([]string{"revoke", "sam"}, "v0"); code != 1 {
+		t.Fatalf("code = %d, want 1; stderr %q", code, errOut.String())
+	}
+	want := "revocation saved, but the running daemon didn't reload: boom; restart it with `agentnet daemon`"
+	if !strings.Contains(errOut.String(), want) {
+		t.Fatalf("stderr = %q, want to contain %q", errOut.String(), want)
+	}
+
+	// The local revoke itself must still have taken effect, even though live activation failed.
+	after := loadTeam(t)
+	if err := after.Verify(member, time.Now()); err == nil {
+		t.Fatal("the block should still be persisted locally despite the daemon's reload failure")
+	}
+}
+
+// TestRevokeReportsServiceReloadFailure checks the hint names `agentnet setup` when the answering
+// daemon is the installed service, not a bare one.
+func TestRevokeReportsServiceReloadFailure(t *testing.T) {
+	_, _, _, _ = bundleAndCodes(t)
+
+	startFakeDaemon(t, func(ctx context.Context, c ipc.Conn, op string, args json.RawMessage) (any, error) {
+		switch op {
+		case "status":
+			return daemon.StatusResult{PID: 123, Service: true}, nil
+		case "team_changed":
+			return nil, errors.New("boom")
+		default:
+			return nil, errors.New("unexpected op " + op)
+		}
+	})
+
+	_, errOut := withIO(t)
+	if code := Main([]string{"revoke", "sam"}, "v0"); code != 1 {
+		t.Fatalf("code = %d, want 1; stderr %q", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "restart it with `agentnet setup`") {
+		t.Fatalf("stderr = %q, want the service restart hint", errOut.String())
 	}
 }

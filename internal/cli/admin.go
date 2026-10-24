@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/purnachand-jaddu/agentnet/daemon"
 	"github.com/purnachand-jaddu/agentnet/identity"
 	"github.com/purnachand-jaddu/agentnet/internal/paths"
 	"github.com/purnachand-jaddu/agentnet/ipc"
@@ -46,15 +47,24 @@ func revokeConsentText(certs []identity.Cert) string {
 	return "Revoke " + strings.Join(parts, ", ") + "? They will be cut off from the network."
 }
 
-// notifyDaemonTeamChanged tells a running daemon to reload team state and gossip immediately; a daemon
-// that isn't running is not an error (it will pick up the change from disk next time it starts).
-func notifyDaemonTeamChanged() {
-	c, err := ipc.Dial(paths.Socket())
-	if err != nil {
-		return
+// reloadRunningDaemon tells a running daemon to reload team state and gossip immediately. A daemon
+// that isn't running is tolerated (err is nil). One that answers but fails to reload is not: err is
+// that failure, and hint is the command to suggest to actually pick the change up.
+func reloadRunningDaemon() (err error, hint string) {
+	c, dialErr := ipc.Dial(paths.Socket())
+	if dialErr != nil {
+		return nil, ""
 	}
 	defer c.Close()
-	_ = c.Call(context.Background(), "team_changed", nil, nil)
+	if callErr := c.Call(context.Background(), "team_changed", nil, nil); callErr != nil {
+		hint = "agentnet daemon"
+		var st daemon.StatusResult
+		if c.Call(context.Background(), "status", nil, &st) == nil && st.Service {
+			hint = "agentnet setup" // the service hands itself over cleanly via setup, not a raw restart
+		}
+		return callErr, hint
+	}
+	return nil, ""
 }
 
 // cmdRevoke runs `agentnet revoke <person|key> [--founder-key path]`, founder only, with consent.
@@ -128,7 +138,10 @@ func cmdRevoke(args []string) int {
 		}
 	}
 
-	notifyDaemonTeamChanged()
+	if err, hint := reloadRunningDaemon(); err != nil {
+		fmt.Fprintf(stderr, "revocation saved, but the running daemon didn't reload: %v; restart it with `%s`\n", err, hint)
+		return 1
+	}
 
 	for _, c := range certs {
 		fmt.Fprintf(stdout, "revoked %s@%s\n", c.Person, c.Machine)
