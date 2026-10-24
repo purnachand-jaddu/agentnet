@@ -101,11 +101,7 @@ func (d *Daemon) register(c ipc.Conn, a RegisterArgs) (Registered, error) {
 
 	// Forward join: an MCP connection attaches to the live hook-registered session of the same agent+PID.
 	if a.MCPPID != 0 {
-		l, err := d.findHookSession(a.Session.Agent, a.MCPPID)
-		if err != nil {
-			return Registered{}, err
-		}
-		if l != nil {
+		if l := d.findHookSession(a.Session.Agent, a.MCPPID); l != nil {
 			l.conn = c
 			if a.MCPPush {
 				l.mcpPush = true
@@ -114,11 +110,11 @@ func (d *Daemon) register(c ipc.Conn, a RegisterArgs) (Registered, error) {
 		}
 	}
 
-	// Reverse join: a hook-style registration folds in a live MCP-only placeholder for the same process,
+	// Reverse join: a hook registration folds in a live MCP-only placeholder for the same process,
 	// freeing its name before the incoming key is named.
 	var joinedConn ipc.Conn
 	var joinedMCPPush bool
-	if a.MCPPID == 0 && a.Session.PID != 0 {
+	if a.Hook && a.Session.PID != 0 {
 		if proc := d.findProcSession(a.Session.Agent, a.Session.PID); proc != nil {
 			joinedConn, joinedMCPPush = proc.conn, proc.mcpPush
 			delete(d.live, proc.s.Key)
@@ -134,9 +130,9 @@ func (d *Daemon) register(c ipc.Conn, a RegisterArgs) (Registered, error) {
 		}
 		l = &live{s: a.Session, name: name}
 		d.live[key] = l
-		// An MCP-only placeholder (no hook has joined it yet) isn't remembered: it's transient, and
-		// persisting its name would block a later hook-registered session from claiming it.
-		if a.MCPPID == 0 {
+		// A proc: placeholder (no hook has joined it yet) isn't remembered: it's transient, and
+		// persisting its name would block the real session from claiming it later.
+		if !isPlaceholder(key) {
 			rec := store.SessionRecord{Name: name, Key: key, Agent: a.Session.Agent, Cwd: a.Session.Cwd, LastSeen: d.opts.Now()}
 			if err := d.opts.Store.UpsertSession(rec); err != nil {
 				delete(d.live, key)
@@ -159,15 +155,19 @@ func (d *Daemon) register(c ipc.Conn, a RegisterArgs) (Registered, error) {
 	if joinedMCPPush {
 		l.mcpPush = true
 	}
-	if a.MCPPID == 0 {
+	if a.Hook {
 		l.hookSeen = true
 		l.lastHook = d.opts.Now()
 	}
 	return Registered{Key: key, Address: d.opts.Person + "/" + l.name, Name: l.name}, nil
 }
 
-// findHookSession returns the hook-registered live session for agent+pid, preferring the most recently active one; an error on a tie. Caller holds mu.
-func (d *Daemon) findHookSession(agent string, pid int) (*live, error) {
+// isPlaceholder reports whether key names a transient MCP-only entry that hasn't joined a hook session yet.
+func isPlaceholder(key string) bool { return strings.HasPrefix(key, "proc:") }
+
+// findHookSession returns the hook-registered live session for agent+pid, preferring the most recently active one;
+// nil on an exact tie (logged), so the caller falls back to registering the MCP under its own key. Caller holds mu.
+func (d *Daemon) findHookSession(agent string, pid int) *live {
 	var best *live
 	tie := false
 	for _, l := range d.live {
@@ -182,15 +182,16 @@ func (d *Daemon) findHookSession(agent string, pid int) (*live, error) {
 		}
 	}
 	if tie {
-		return nil, fmt.Errorf("daemon: ambiguous hook session for %s pid %d", agent, pid)
+		d.opts.Log("daemon: ambiguous hook session for %s pid %d; registering MCP under its own key", agent, pid)
+		return nil
 	}
-	return best, nil
+	return best
 }
 
 // findProcSession returns the live MCP-only placeholder registered for agent+pid, if any. Caller holds mu.
 func (d *Daemon) findProcSession(agent string, pid int) *live {
 	for _, l := range d.live {
-		if l.mcpPID == pid && l.s.Agent == agent && strings.HasPrefix(l.s.Key, "proc:") {
+		if l.mcpPID == pid && l.s.Agent == agent && isPlaceholder(l.s.Key) {
 			return l
 		}
 	}

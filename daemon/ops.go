@@ -12,6 +12,7 @@ import (
 // RegisterArgs is the "register" op's arguments.
 type RegisterArgs struct {
 	Session adapter.Session `json:"session"`
+	Hook    bool            `json:"hook,omitempty"` // this call came from the agent's own hook, not its MCP process
 	MCPPush bool            `json:"mcp_push"`
 	Name    string          `json:"name,omitempty"`
 	MCPPID  int             `json:"mcp_pid,omitempty"` // the MCP process's parent (the agent)

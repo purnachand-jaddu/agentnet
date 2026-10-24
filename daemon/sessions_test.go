@@ -36,7 +36,7 @@ func TestReturningSessionGetsItsNameBack(t *testing.T) {
 
 func TestMCPAttachesToHookSessionByPID(t *testing.T) {
 	d := newTestDaemon(t, claudeFake(adapter.ChannelPull))
-	call[Registered](t, d, &fakeConn{id: 1}, "register", RegisterArgs{Session: adapter.Session{Key: "claude-code:c1", Agent: "claude-code", ID: "c1", Cwd: "/src/api", PID: 4242}})
+	call[Registered](t, d, &fakeConn{id: 1}, "register", RegisterArgs{Session: adapter.Session{Key: "claude-code:c1", Agent: "claude-code", ID: "c1", Cwd: "/src/api", PID: 4242}, Hook: true})
 	r := call[Registered](t, d, &fakeConn{id: 2}, "register", RegisterArgs{Session: adapter.Session{Key: "proc:999", Agent: "claude-code", Cwd: "/src/api"}, MCPPush: true, MCPPID: 4242})
 	if r.Key != "claude-code:c1" || r.Name != "api-claude" {
 		t.Fatalf("MCP made a second session: %+v", r)
@@ -81,14 +81,78 @@ func TestRegisterPropagatesStoreError(t *testing.T) {
 	}
 }
 
+// steppingClock returns a Now func that advances by one second on every call, for deterministic lastHook ordering in tests.
+func steppingClock() func() time.Time {
+	now := time.Unix(1700000000, 0)
+	return func() time.Time {
+		now = now.Add(time.Second)
+		return now
+	}
+}
+
 func TestMCPAttachPicksMostRecentHookSession(t *testing.T) {
-	d := newTestDaemon(t, claudeFake(adapter.ChannelPull))
-	call[Registered](t, d, &fakeConn{id: 1}, "register", RegisterArgs{Session: adapter.Session{Key: "claude-code:c1", Agent: "claude-code", ID: "c1", Cwd: "/src/api", PID: 4242}})
-	call[Registered](t, d, &fakeConn{id: 2}, "register", RegisterArgs{Session: adapter.Session{Key: "claude-code:c2", Agent: "claude-code", ID: "c2", Cwd: "/src/api", PID: 4242}})
+	d := New(Options{Person: "alex", Machine: "mbp", Store: storetest.SQLite(t), Adapters: adapter.NewRegistry(claudeFake(adapter.ChannelPull)),
+		FolderAllowed: func(string) bool { return true }, Now: steppingClock(), Log: t.Logf})
+	call[Registered](t, d, &fakeConn{id: 1}, "register", RegisterArgs{Session: adapter.Session{Key: "claude-code:c1", Agent: "claude-code", ID: "c1", Cwd: "/src/api", PID: 4242}, Hook: true})
+	call[Registered](t, d, &fakeConn{id: 2}, "register", RegisterArgs{Session: adapter.Session{Key: "claude-code:c2", Agent: "claude-code", ID: "c2", Cwd: "/src/api", PID: 4242}, Hook: true})
 
 	r := call[Registered](t, d, &fakeConn{id: 3}, "register", RegisterArgs{Session: adapter.Session{Key: "proc:999", Agent: "claude-code", Cwd: "/src/api"}, MCPPush: true, MCPPID: 4242})
 	if r.Key != "claude-code:c2" {
 		t.Fatalf("MCP attached to %q, want the more recently hook-registered claude-code:c2", r.Key)
+	}
+}
+
+func TestMCPFallsBackOnAmbiguousHookTie(t *testing.T) {
+	fixed := func() time.Time { return time.Unix(1700000000, 0) } // every call gets the same timestamp: a guaranteed tie
+	d := New(Options{Person: "alex", Machine: "mbp", Store: storetest.SQLite(t), Adapters: adapter.NewRegistry(claudeFake(adapter.ChannelPull)),
+		FolderAllowed: func(string) bool { return true }, Now: fixed, Log: t.Logf})
+	call[Registered](t, d, &fakeConn{id: 1}, "register", RegisterArgs{Session: adapter.Session{Key: "claude-code:c1", Agent: "claude-code", ID: "c1", Cwd: "/src/api", PID: 4242}, Hook: true})
+	call[Registered](t, d, &fakeConn{id: 2}, "register", RegisterArgs{Session: adapter.Session{Key: "claude-code:c2", Agent: "claude-code", ID: "c2", Cwd: "/src/api", PID: 4242}, Hook: true})
+
+	r := call[Registered](t, d, &fakeConn{id: 3}, "register", RegisterArgs{Session: adapter.Session{Key: "proc:999", Agent: "claude-code", Cwd: "/src/api"}, MCPPush: true, MCPPID: 4242})
+	if r.Key != "proc:999" {
+		t.Fatalf("expected the MCP to register under its own key on an ambiguous tie, got %q", r.Key)
+	}
+}
+
+func TestMCPRegistrationUnderOwnKeyIsRemembered(t *testing.T) {
+	d := newTestDaemon(t, claudeFake(adapter.ChannelPull))
+	call[Registered](t, d, &fakeConn{id: 1}, "register", RegisterArgs{Session: adapter.Session{Key: "claude-code:c1", Agent: "claude-code", Cwd: "/src/api"}, MCPPush: true, MCPPID: 4242})
+
+	rec, err := d.opts.Store.SessionByKey("claude-code:c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec == nil {
+		t.Fatal("claude-code:c1 was not remembered; its name could be taken by another session after a restart")
+	}
+}
+
+func TestMCPPlaceholderIsNotRemembered(t *testing.T) {
+	d := newTestDaemon(t, claudeFake(adapter.ChannelPull))
+	call[Registered](t, d, &fakeConn{id: 1}, "register", RegisterArgs{Session: adapter.Session{Key: "proc:999", Agent: "claude-code", Cwd: "/src/api"}, MCPPush: true, MCPPID: 4242})
+
+	rec, err := d.opts.Store.SessionByKey("proc:999")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec != nil {
+		t.Fatal("proc:999 placeholder was remembered")
+	}
+}
+
+func TestPlainRegisterIsNotHookSeen(t *testing.T) {
+	d := newTestDaemon(t, codexFake(adapter.ChannelPull))
+	c := &fakeConn{id: 1}
+	r := register(t, d, c, "codex", "1", "/src/api", false) // no Hook, no MCPPID
+
+	d.ConnClosed(c)
+
+	d.mu.Lock()
+	_, stillLive := d.live[r.Key]
+	d.mu.Unlock()
+	if stillLive {
+		t.Fatal("a plain (non-hook) register survived ConnClosed; it should have no hook evidence")
 	}
 }
 
@@ -108,7 +172,7 @@ func TestRegisterMergeKeepsExistingFields(t *testing.T) {
 func TestReverseJoinMCPThenHook(t *testing.T) {
 	d := newTestDaemon(t, claudeFake(adapter.ChannelPull))
 	call[Registered](t, d, &fakeConn{id: 1}, "register", RegisterArgs{Session: adapter.Session{Key: "proc:999", Agent: "claude-code", Cwd: "/src/api"}, MCPPush: true, MCPPID: 4242})
-	r := call[Registered](t, d, &fakeConn{id: 2}, "register", RegisterArgs{Session: adapter.Session{Key: "claude-code:c1", Agent: "claude-code", ID: "c1", Cwd: "/src/api", PID: 4242}})
+	r := call[Registered](t, d, &fakeConn{id: 2}, "register", RegisterArgs{Session: adapter.Session{Key: "claude-code:c1", Agent: "claude-code", ID: "c1", Cwd: "/src/api", PID: 4242}, Hook: true})
 
 	if r.Key != "claude-code:c1" {
 		t.Fatalf("got key %q, want claude-code:c1", r.Key)
