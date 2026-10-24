@@ -10,6 +10,11 @@ import (
 	"github.com/purnachand-jaddu/agentnet/daemon"
 )
 
+// init stubs agentPID for the whole test binary: tests exercise Run's own logic, not ps(1).
+func init() {
+	agentPID = func(start int) int { return start }
+}
+
 func TestPrintsMailThenConfirms(t *testing.T) {
 	var ops []string
 	var gotArgs daemon.HookArgs
@@ -36,6 +41,30 @@ func TestBrokenDaemonNeverBreaksTheAgent(t *testing.T) {
 	call := func(context.Context, string, any, any) error { return errors.New("down") }
 	if err := Run(context.Background(), "codex", "stop", strings.NewReader(`{"session_id":"s1"}`), &out, call, func(string) string { return "" }); err != nil || out.Len() != 0 {
 		t.Fatalf("err %v out %q", err, out.String())
+	}
+}
+
+// errWriter always fails, simulating the agent having closed the hook's stdout.
+type errWriter struct{}
+
+func (errWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
+
+// TestWriteErrorSkipsDelivered checks that a failed print never confirms mail as delivered: the
+// agent never saw it, so marking it read would lose it.
+func TestWriteErrorSkipsDelivered(t *testing.T) {
+	var ops []string
+	call := func(_ context.Context, op string, args, result any) error {
+		ops = append(ops, op)
+		if op == "hook" {
+			*(result.(*daemon.HookResult)) = daemon.HookResult{Out: "X", Key: "codex:s1", IDs: []string{"m1"}}
+		}
+		return nil
+	}
+	if err := Run(context.Background(), "codex", "stop", strings.NewReader(`{"session_id":"s1"}`), errWriter{}, call, func(string) string { return "" }); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(ops, ",") != "hook" {
+		t.Fatalf("expected no delivered call after a write error, got ops %v", ops)
 	}
 }
 

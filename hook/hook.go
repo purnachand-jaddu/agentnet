@@ -11,7 +11,11 @@ import (
 
 	"github.com/purnachand-jaddu/agentnet/adapter"
 	"github.com/purnachand-jaddu/agentnet/daemon"
+	"github.com/purnachand-jaddu/agentnet/internal/proc"
 )
+
+// agentPID finds the agent's real pid past any shell that execs the hook; tests stub it to stay hermetic.
+var agentPID = func(start int) int { return proc.AgentPID(start, proc.PS) }
 
 // eventByName maps a hook system's event name to the adapter.HookEvent the daemon expects.
 var eventByName = map[string]adapter.HookEvent{
@@ -60,7 +64,7 @@ func Run(ctx context.Context, agent, event string, stdin io.Reader, stdout io.Wr
 	}
 
 	var in stdinJSON
-	json.Unmarshal(bytes.TrimPrefix(readStdin(stdin, 3*time.Second), bom), &in)
+	json.Unmarshal(bytes.TrimPrefix(readStdin(stdin, 3*time.Second), bom), &in) // best effort
 
 	sessionID := in.SessionID
 	if sessionID == "" {
@@ -82,7 +86,7 @@ func Run(ctx context.Context, agent, event string, stdin io.Reader, stdout io.Wr
 	}
 
 	args := daemon.HookArgs{
-		Agent: agent, Event: ev, SessionID: sessionID, Cwd: cwd, PID: os.Getppid(), Transcript: in.TranscriptPath,
+		Agent: agent, Event: ev, SessionID: sessionID, Cwd: cwd, PID: agentPID(os.Getppid()), Transcript: in.TranscriptPath,
 	}
 	if agent == "claude-code" {
 		args.Inbox = getenv("CLAUDE_CODE_MESSAGING_SOCKET")
@@ -94,7 +98,9 @@ func Run(ctx context.Context, agent, event string, stdin io.Reader, stdout io.Wr
 		return nil
 	}
 	if res.Out != "" {
-		io.WriteString(stdout, res.Out+"\n")
+		if _, err := io.WriteString(stdout, res.Out+"\n"); err != nil {
+			return nil // couldn't show the mail, so don't confirm it as delivered
+		}
 	}
 	if len(res.IDs) > 0 {
 		call(ctx, "delivered", daemon.DeliveredArgs{Key: res.Key, IDs: res.IDs}, nil)
