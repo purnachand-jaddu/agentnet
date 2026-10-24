@@ -1,0 +1,26 @@
+name: ci
+on:
+  push:
+    branches: [main, "build/**"]
+  pull_request:
+jobs:
+  test:
+    env:
+      AGENTNET_SKIP_MDNS: "1"
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: go test -race -tags e2e ./e2e/
+      - if: matrix.os == 'ubuntu-latest'
+        run: shellcheck install.sh install_test.sh
+      - if: matrix.os == 'ubuntu-latest'
+        run: sh install_test.sh
