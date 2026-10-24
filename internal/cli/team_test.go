@@ -116,6 +116,99 @@ func TestAcceptDenialLeavesNoTeam(t *testing.T) {
 	}
 }
 
+// init must never replace an existing network, even if the founder key was moved offline after init.
+func TestInitRefusesWhenAlreadyInNetwork(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AGENTNET_HOME", home)
+	withApprover(t, fakeApprover{})
+	withIO(t)
+	if code := Main([]string{"init", "--person", "alex", "--machine", "mbp"}, "v0"); code != 0 {
+		t.Fatal("first init failed")
+	}
+
+	out, errOut := withIO(t)
+	if code := Main([]string{"init", "--person", "alex", "--machine", "other"}, "v0"); code == 0 {
+		t.Fatalf("second init should fail, stdout %q", out.String())
+	}
+	if !strings.Contains(errOut.String(), "already in network") {
+		t.Fatalf("stderr = %q, want \"already in network\"", errOut.String())
+	}
+}
+
+// A failure after the founder key is written (here: machine.key is a directory, so generating the machine
+// key fails) must not leave the founder key behind, or a rerun would wrongly refuse with "already exists".
+func TestInitRemovesFounderKeyOnLaterFailure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AGENTNET_HOME", home)
+	withApprover(t, fakeApprover{})
+	withIO(t)
+
+	if err := os.MkdirAll(filepath.Join(home, "machine.key"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := Main([]string{"init", "--person", "alex", "--machine", "mbp"}, "v0"); code == 0 {
+		t.Fatal("init should have failed")
+	}
+	if _, err := os.Stat(filepath.Join(home, "founder.key")); !os.IsNotExist(err) {
+		t.Fatalf("founder.key should have been removed after the failure, stat err = %v", err)
+	}
+}
+
+func TestInitRejectsBadPersonOrMachine(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AGENTNET_HOME", home)
+	withApprover(t, fakeApprover{})
+	_, errOut := withIO(t)
+
+	if code := Main([]string{"init", "--person", "Alex", "--machine", "mbp"}, "v0"); code == 0 {
+		t.Fatal("init with a bad person name should fail")
+	}
+	if !strings.Contains(errOut.String(), "lowercase") {
+		t.Fatalf("stderr = %q", errOut.String())
+	}
+	if _, err := os.Stat(filepath.Join(home, "founder.key")); !os.IsNotExist(err) {
+		t.Fatal("founder.key should not have been written")
+	}
+}
+
+func TestJoinRejectsBadPersonOrMachine(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AGENTNET_HOME", home)
+	withApprover(t, fakeApprover{})
+	_, errOut := withIO(t)
+
+	if code := Main([]string{"join", "--person", "sam", "--machine", "my mac"}, "v0"); code == 0 {
+		t.Fatal("join with a bad machine name should fail")
+	}
+	if !strings.Contains(errOut.String(), "lowercase") {
+		t.Fatalf("stderr = %q", errOut.String())
+	}
+	if _, err := os.Stat(filepath.Join(home, "machine.key")); !os.IsNotExist(err) {
+		t.Fatal("machine.key should not have been written")
+	}
+}
+
+// accept must require a prior `join` on this machine, never generate a fresh machine key of its own.
+func TestAcceptRequiresExistingMachineKey(t *testing.T) {
+	bundle, _, _, _ := bundleAndCodes(t)
+
+	home := t.TempDir()
+	t.Setenv("AGENTNET_HOME", home)
+	withApprover(t, fakeApprover{})
+	_, errOut := withIO(t)
+
+	if code := Main([]string{"accept", bundle}, "v0"); code == 0 {
+		t.Fatal("accept without a prior join should fail")
+	}
+	if !strings.Contains(errOut.String(), "agentnet join") {
+		t.Fatalf("stderr = %q", errOut.String())
+	}
+	if _, err := os.Stat(filepath.Join(home, "machine.key")); !os.IsNotExist(err) {
+		t.Fatal("accept must not generate a machine key of its own")
+	}
+}
+
 func TestInitJoinAdmitAcceptFullFlow(t *testing.T) {
 	founderHome := t.TempDir()
 	joinerHome := t.TempDir()

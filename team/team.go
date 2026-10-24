@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/purnachand-jaddu/agentnet/identity"
+	"github.com/purnachand-jaddu/agentnet/internal/paths"
+	"github.com/purnachand-jaddu/agentnet/message"
 	"github.com/purnachand-jaddu/agentnet/store"
 )
 
@@ -127,6 +129,9 @@ func (st *State) save(s store.Store) error {
 
 // Create makes s the founder store of a new network: an admin cert for person@machine, signed by founder.
 func Create(s store.Store, keys identity.Keys, founder ed25519.PrivateKey, person, machine string, now time.Time) (*State, error) {
+	if !message.Slug(person) || !message.Slug(machine) {
+		return nil, errors.New("team: person and machine names must use lowercase letters, digits and -")
+	}
 	founderPub := founder.Public().(ed25519.PublicKey)
 	self := identity.Cert{
 		V: 1, Team: identity.TeamID(founderPub), Key: keys.Public(), Enc: keys.EncPublic(),
@@ -148,8 +153,22 @@ func NewRequest(keys identity.Keys, person, machine string) identity.JoinRequest
 	return identity.JoinRequest{V: 1, Person: person, Machine: machine, Key: keys.Public(), Enc: keys.EncPublic(), Nonce: nonce}
 }
 
-// Admit signs a cert for req and returns a bundle with the whole team.
-// ErrPersonTaken when another key already holds req.Person and samePerson is false.
+// bundle builds the identity.Bundle this founder hands back for cert, from st's current members and blocks.
+func (st *State) bundle(founderPub ed25519.PublicKey, cert identity.Cert) identity.Bundle {
+	members := make([]identity.Cert, 0, len(st.Members))
+	for _, c := range st.Members {
+		members = append(members, c)
+	}
+	blocks := make([]identity.Block, 0, len(st.Blocks))
+	for _, b := range st.Blocks {
+		blocks = append(blocks, b)
+	}
+	return identity.Bundle{V: 1, Founder: founderPub, Cert: cert, Members: members, Blocks: blocks}
+}
+
+// Admit signs a cert for req and returns a bundle with the whole team. Admitting the same request
+// (same key, person and machine) again is idempotent: it hands back the existing cert rather than erroring,
+// so a lost bundle can be re-issued. ErrPersonTaken when another key already holds req.Person and samePerson is false.
 func Admit(s store.Store, founder ed25519.PrivateKey, req identity.JoinRequest, samePerson bool, now time.Time) (identity.Bundle, error) {
 	founderPub := founder.Public().(ed25519.PublicKey)
 	st, err := Load(s)
@@ -164,8 +183,11 @@ func Admit(s store.Store, founder ed25519.PrivateKey, req identity.JoinRequest, 
 	}
 
 	reqKey := keyB64(req.Key)
-	if _, ok := st.Members[reqKey]; ok {
-		return identity.Bundle{}, fmt.Errorf("team: %s already has a certificate", req.Machine)
+	if existing, ok := st.Members[reqKey]; ok {
+		if existing.Person == req.Person && existing.Machine == req.Machine {
+			return st.bundle(founderPub, existing), nil
+		}
+		return identity.Bundle{}, fmt.Errorf("team: %s already has a certificate for a different identity", req.Machine)
 	}
 	if _, blocked := st.Blocks[reqKey]; blocked {
 		return identity.Bundle{}, errors.New("team: that key is blocked")
@@ -188,16 +210,7 @@ func Admit(s store.Store, founder ed25519.PrivateKey, req identity.JoinRequest, 
 	if err := st.save(s); err != nil {
 		return identity.Bundle{}, err
 	}
-
-	members := make([]identity.Cert, 0, len(st.Members))
-	for _, c := range st.Members {
-		members = append(members, c)
-	}
-	blocks := make([]identity.Block, 0, len(st.Blocks))
-	for _, b := range st.Blocks {
-		blocks = append(blocks, b)
-	}
-	return identity.Bundle{V: 1, Founder: founderPub, Cert: cert, Members: members, Blocks: blocks}, nil
+	return st.bundle(founderPub, cert), nil
 }
 
 // Accept verifies bundle b against b.Founder and this machine's keys, then merges it into s.
@@ -216,7 +229,7 @@ func Accept(s store.Store, keys identity.Keys, b identity.Bundle, now time.Time)
 		return nil, err
 	}
 	if existing != nil && !existing.Founder.Equal(founderPub) {
-		return nil, errors.New("team: already in another network; leave first (remove ~/.agentnet)")
+		return nil, fmt.Errorf("team: already in another network; leave first (remove %s)", paths.Home())
 	}
 
 	st := existing
@@ -252,6 +265,9 @@ func (st *State) Merge(certs []identity.Cert, blocks []identity.Block, now time.
 			continue
 		}
 		k := keyB64(c.Key)
+		if _, blocked := st.Blocks[k]; blocked {
+			continue // a block always wins over a gossiped cert, however fresh
+		}
 		if existing, ok := st.Members[k]; !ok || c.Issued > existing.Issued {
 			st.Members[k] = c
 			changed = true

@@ -9,16 +9,30 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/purnachand-jaddu/agentnet/config"
 	"github.com/purnachand-jaddu/agentnet/identity"
 	"github.com/purnachand-jaddu/agentnet/internal/paths"
 	"github.com/purnachand-jaddu/agentnet/ipc"
+	"github.com/purnachand-jaddu/agentnet/message"
+	"github.com/purnachand-jaddu/agentnet/store"
 	"github.com/purnachand-jaddu/agentnet/store/sqlite"
 	"github.com/purnachand-jaddu/agentnet/team"
 )
+
+// badNameMsg is printed when --person/--machine fails message.Slug, before any approver is asked.
+const badNameMsg = "person and machine names must use lowercase letters, digits and -"
+
+// openStoreIfExists opens the sqlite store at paths.DB(), or returns (nil, nil) without creating a
+// database file if one doesn't exist yet.
+func openStoreIfExists() (store.Store, error) {
+	if _, err := os.Stat(paths.DB()); err != nil {
+		return nil, nil
+	}
+	return sqlite.Open(paths.DB())
+}
 
 // personMachine resolves --person/--machine flags against config defaults.
 func personMachine(person, machine *string) (p, m string, err error) {
@@ -65,45 +79,37 @@ func loadOrGenerateMachineKeys() (identity.Keys, error) {
 	return keys, nil
 }
 
-// saveFounderKeyOnce writes priv's seed to path, 0600, atomically, refusing to overwrite an existing file.
+// saveFounderKeyOnce writes priv's seed to path, 0600, refusing to overwrite an existing file. O_EXCL makes
+// the create-and-check one atomic step (no link/rename trick needed, so this also works on exFAT/FAT media).
 func saveFounderKeyOnce(path string, priv ed25519.PrivateKey) error {
-	b := []byte(base64.RawURLEncoding.EncodeToString(priv.Seed()))
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".founder-*.tmp")
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath) // no-op once the link below succeeds
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmpPath, 0o600); err != nil {
-		return err
-	}
-	if err := os.Link(tmpPath, path); err != nil { // Link fails with EEXIST instead of clobbering an existing founder key
 		if os.IsExist(err) {
 			return errors.New("a network already exists here")
 		}
 		return err
 	}
-	return nil
+	defer f.Close()
+	if _, err := f.Write([]byte(base64.RawURLEncoding.EncodeToString(priv.Seed()))); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
-// loadFounderKey reads a founder key written by saveFounderKeyOnce.
+// loadFounderKey reads a founder key written by saveFounderKeyOnce, refusing one whose mode allows group or other access.
 func loadFounderKey(path string) (ed25519.PrivateKey, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if st.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("%s: mode %03o allows group or other access, chmod 600 it", path, st.Mode().Perm())
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	seed, err := base64.RawURLEncoding.DecodeString(string(b))
+	seed, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(string(b)))
 	if err != nil || len(seed) != ed25519.SeedSize {
 		return nil, fmt.Errorf("%s: not a valid founder key", path)
 	}
@@ -125,6 +131,28 @@ func cmdInit(args []string) int {
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
+	}
+	if !message.Slug(p) || !message.Slug(m) {
+		fmt.Fprintln(stderr, badNameMsg)
+		return 1
+	}
+
+	existingStore, err := openStoreIfExists()
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if existingStore != nil {
+		existing, err := team.Load(existingStore)
+		existingStore.Close()
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		if existing != nil {
+			fmt.Fprintf(stderr, "already in network %s\n", identity.TeamCode(existing.Founder))
+			return 1
+		}
 	}
 
 	ok, err := newApprover().Confirm(context.Background(),
@@ -156,6 +184,12 @@ func cmdInit(args []string) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			os.Remove(founderKeyPath) // this init failed after writing the founder key: don't leave it behind
+		}
+	}()
 
 	keys, err := loadOrGenerateMachineKeys()
 	if err != nil {
@@ -163,14 +197,14 @@ func cmdInit(args []string) int {
 		return 1
 	}
 
-	st, err := sqlite.Open(paths.DB())
+	dbStore, err := sqlite.Open(paths.DB())
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	defer st.Close()
+	defer dbStore.Close()
 
-	if _, err := team.Create(st, keys, founderPriv, p, m, time.Now()); err != nil {
+	if _, err := team.Create(dbStore, keys, founderPriv, p, m, time.Now()); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
@@ -178,6 +212,7 @@ func cmdInit(args []string) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
+	committed = true
 
 	fmt.Fprintln(stdout, identity.TeamCode(founderPriv.Public().(ed25519.PublicKey)))
 	fmt.Fprintf(stdout, "Add people with `agentnet admit <request>`. The founder key is at %s; keep it safe (moving it offline with --founder-key is recommended).\n", founderKeyPath)
@@ -197,6 +232,10 @@ func cmdJoin(args []string) int {
 	p, m, err := personMachine(person, machine)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if !message.Slug(p) || !message.Slug(m) {
+		fmt.Fprintln(stderr, badNameMsg)
 		return 1
 	}
 
@@ -262,7 +301,7 @@ func cmdAdmit(args []string) int {
 	}
 	founderPriv, err := loadFounderKey(founderKeyPath)
 	if err != nil {
-		fmt.Fprintln(stderr, "only the founder can admit people")
+		fmt.Fprintf(stderr, "only the founder can admit people: %v\n", err)
 		return 1
 	}
 
@@ -334,6 +373,11 @@ func cmdAccept(args []string) int {
 		return 1
 	}
 
+	if _, err := os.Stat(paths.MachineKey()); err != nil {
+		fmt.Fprintln(stderr, "run `agentnet join` on this machine first")
+		return 1
+	}
+
 	detail := fmt.Sprintf("Team code: %s\n\nAccept only if this matches the team code the founder told you.", identity.TeamCode(b.Founder))
 	ok, err := newApprover().Confirm(context.Background(), "Accept this network?", detail)
 	if err != nil {
@@ -350,7 +394,7 @@ func cmdAccept(args []string) int {
 		return 1
 	}
 
-	keys, err := loadOrGenerateMachineKeys()
+	keys, err := identity.LoadKeys(paths.MachineKey())
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1

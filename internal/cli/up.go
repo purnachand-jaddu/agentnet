@@ -4,11 +4,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"os"
 
 	"github.com/purnachand-jaddu/agentnet/identity"
-	"github.com/purnachand-jaddu/agentnet/internal/paths"
-	"github.com/purnachand-jaddu/agentnet/store/sqlite"
 	"github.com/purnachand-jaddu/agentnet/team"
 )
 
@@ -21,8 +18,23 @@ func cmdUp(args []string) int {
 		return 2
 	}
 
-	if teamCode, p, m, ok := currentTeam(); ok {
-		fmt.Fprintf(stdout, "In network %s as %s@%s\n", teamCode, p, m)
+	t, pending, err := upStatus()
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if t != nil {
+		fmt.Fprintf(stdout, "In network %s as %s@%s\n", identity.TeamCode(t.Founder), t.Self.Person, t.Self.Machine)
+		return 0
+	}
+	if pending != "" {
+		req, err := identity.DecodeJoinRequest(pending)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "waiting for the founder to admit you; pairing code %s\n", req.PairingCode())
+		fmt.Fprintln(stdout, pending)
 		return 0
 	}
 
@@ -56,19 +68,21 @@ func cmdUp(args []string) int {
 	return 0
 }
 
-// currentTeam reports this machine's team code, person and machine if it's already in a network.
-func currentTeam() (teamCode, person, machine string, ok bool) {
-	if _, err := os.Stat(paths.DB()); err != nil {
-		return "", "", "", false
-	}
-	st, err := sqlite.Open(paths.DB())
-	if err != nil {
-		return "", "", "", false
+// upStatus reports this machine's current team (nil if none) and any pending join request, without
+// creating a database file when neither exists yet.
+func upStatus() (t *team.State, pending string, err error) {
+	st, err := openStoreIfExists()
+	if err != nil || st == nil {
+		return nil, "", err
 	}
 	defer st.Close()
-	t, err := team.Load(st)
-	if err != nil || t == nil {
-		return "", "", "", false
+	t, err = team.Load(st)
+	if err != nil {
+		return nil, "", err
 	}
-	return identity.TeamCode(t.Founder), t.Self.Person, t.Self.Machine, true
+	b, err := st.Get("team", "pending")
+	if err != nil {
+		return nil, "", err
+	}
+	return t, string(b), nil
 }

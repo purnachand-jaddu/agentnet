@@ -1,6 +1,7 @@
 package team
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
@@ -141,7 +142,7 @@ func TestAdmitRefusesPersonTakenUnlessSamePerson(t *testing.T) {
 	}
 }
 
-func TestAdmitRefusesDuplicateKey(t *testing.T) {
+func TestAdmitRefusesSameKeyClaimingADifferentIdentity(t *testing.T) {
 	now := time.Now()
 	fs := storetest.SQLite(t)
 	_, fpriv := genFounder(t)
@@ -155,8 +156,36 @@ func TestAdmitRefusesDuplicateKey(t *testing.T) {
 	if _, err := Admit(fs, fpriv, req, false, now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Admit(fs, fpriv, req, false, now); err == nil {
-		t.Fatal("admitting the same request twice should fail")
+	relabelled := req
+	relabelled.Machine = "other"
+	if _, err := Admit(fs, fpriv, relabelled, false, now); err == nil {
+		t.Fatal("admitting the same key under a different claimed identity should fail")
+	}
+}
+
+// Admitting the exact same request again (e.g. a lost bundle) must be idempotent: it hands back the
+// existing cert rather than erroring or minting a new one.
+func TestAdmitIsIdempotentForSameRequest(t *testing.T) {
+	now := time.Now()
+	fs := storetest.SQLite(t)
+	_, fpriv := genFounder(t)
+	fkeys, _ := identity.GenerateKeys()
+	if _, err := Create(fs, fkeys, fpriv, "alex", "mbp", now); err != nil {
+		t.Fatal(err)
+	}
+
+	jkeys, _ := identity.GenerateKeys()
+	req := NewRequest(jkeys, "sam", "xps")
+	b1, err := Admit(fs, fpriv, req, false, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2, err := Admit(fs, fpriv, req, false, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("re-admitting the same request should succeed: %v", err)
+	}
+	if !bytes.Equal(b2.Cert.Sig, b1.Cert.Sig) {
+		t.Fatal("idempotent re-issue should return the existing cert, not sign a new one")
 	}
 }
 
@@ -228,5 +257,73 @@ func TestMergeKeepsLaterIssuedIgnoresStrangersAppliesBlocks(t *testing.T) {
 	}
 	if _, ok := st.Members[keyB64(mkeys.Public())]; ok {
 		t.Fatal("merge should have removed the blocked member")
+	}
+}
+
+// A block seen before a stale, still-validly-signed cert for the same key (e.g. arriving out of order via
+// gossip) must stick: the cert must never resurrect the key in Members.
+func TestMergeNeverResurrectsABlockedKey(t *testing.T) {
+	fpub, fpriv := genFounder(t)
+	st := &State{Founder: fpub, Members: map[string]identity.Cert{}, Blocks: map[string]identity.Block{}}
+	now := time.Now()
+
+	mkeys, _ := identity.GenerateKeys()
+	cert := identity.Cert{V: 1, Team: identity.TeamID(fpub), Key: mkeys.Public(), Enc: mkeys.EncPublic(), Person: "sam", Machine: "xps", Issued: 100}
+	cert.Sign(fpriv)
+
+	blk := identity.Block{Team: identity.TeamID(fpub), Key: mkeys.Public(), Reason: "lost laptop", TS: 1}
+	blk.Sign(fpriv)
+
+	if !st.Merge(nil, []identity.Block{blk}, now) {
+		t.Fatal("applying the block should report changed")
+	}
+	if st.Merge([]identity.Cert{cert}, nil, now) {
+		t.Fatal("merging a cert for an already-blocked key should report no change")
+	}
+	if _, ok := st.Members[keyB64(mkeys.Public())]; ok {
+		t.Fatal("blocked key resurrected in Members by a gossiped cert")
+	}
+}
+
+// Admit must refuse a request for a key the founder has already blocked, even without going through Merge.
+func TestAdmitRefusesBlockedKey(t *testing.T) {
+	now := time.Now()
+	fs := storetest.SQLite(t)
+	fpub, fpriv := genFounder(t)
+	fkeys, _ := identity.GenerateKeys()
+	if _, err := Create(fs, fkeys, fpriv, "alex", "mbp", now); err != nil {
+		t.Fatal(err)
+	}
+
+	jkeys, _ := identity.GenerateKeys()
+	req := NewRequest(jkeys, "sam", "xps")
+
+	// Hand-sign a block for the joiner's key, as if the founder had already blocked it, and persist it.
+	blk := identity.Block{Team: identity.TeamID(fpub), Key: jkeys.Public(), Reason: "pre-blocked", TS: 1}
+	blk.Sign(fpriv)
+	st, err := Load(fs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Merge(nil, []identity.Block{blk}, now)
+	if err := st.save(fs); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Admit(fs, fpriv, req, false, now); err == nil {
+		t.Fatal("admit should refuse a blocked key")
+	}
+}
+
+// Create must reject a person or machine name that isn't a valid slug.
+func TestCreateRejectsBadPersonOrMachine(t *testing.T) {
+	fs := storetest.SQLite(t)
+	_, fpriv := genFounder(t)
+	fkeys, _ := identity.GenerateKeys()
+	if _, err := Create(fs, fkeys, fpriv, "Alex", "mbp", time.Now()); err == nil {
+		t.Fatal("Create should reject a bad person name")
+	}
+	if _, err := Create(fs, fkeys, fpriv, "alex", "my mac", time.Now()); err == nil {
+		t.Fatal("Create should reject a bad machine name")
 	}
 }
