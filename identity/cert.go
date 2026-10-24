@@ -55,6 +55,9 @@ func (c *Cert) Sign(founder ed25519.PrivateKey) {
 
 // Verify checks c's version, team, key lengths, slugs, issue time and signature against founder.
 func (c Cert) Verify(founder ed25519.PublicKey, now time.Time) error {
+	if len(founder) != ed25519.PublicKeySize {
+		return fmt.Errorf("cert: bad founder key length %d", len(founder))
+	}
 	if c.V != 1 {
 		return fmt.Errorf("cert: unsupported version %d", c.V)
 	}
@@ -102,6 +105,9 @@ func (b *Block) Sign(founder ed25519.PrivateKey) {
 
 // Verify checks b's team, key length and signature against founder.
 func (b Block) Verify(founder ed25519.PublicKey) error {
+	if len(founder) != ed25519.PublicKeySize {
+		return fmt.Errorf("block: bad founder key length %d", len(founder))
+	}
 	if b.Team != TeamID(founder) {
 		return fmt.Errorf("block: team %q does not match founder", b.Team)
 	}

@@ -1,12 +1,15 @@
 package identity
 
 import (
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/purnachand-jaddu/agentnet/message"
 )
 
 const maxEnvelope = 64 * 1024
@@ -48,6 +51,18 @@ func DecodeJoinRequest(s string) (JoinRequest, error) {
 	if len(r.Nonce) < 8 {
 		return JoinRequest{}, fmt.Errorf("join request: nonce too short")
 	}
+	if !message.Slug(r.Person) {
+		return JoinRequest{}, fmt.Errorf("join request: bad person %q", r.Person)
+	}
+	if !message.Slug(r.Machine) {
+		return JoinRequest{}, fmt.Errorf("join request: bad machine %q", r.Machine)
+	}
+	if len(r.Key) != ed25519.PublicKeySize {
+		return JoinRequest{}, fmt.Errorf("join request: bad key length %d", len(r.Key))
+	}
+	if len(r.Enc) != 32 {
+		return JoinRequest{}, fmt.Errorf("join request: bad enc key length %d", len(r.Enc))
+	}
 	return r, nil
 }
 
@@ -75,6 +90,9 @@ func DecodeBundle(s string) (Bundle, error) {
 	}
 	if b.V != 1 {
 		return Bundle{}, fmt.Errorf("bundle: unsupported version %d", b.V)
+	}
+	if len(b.Founder) != ed25519.PublicKeySize {
+		return Bundle{}, fmt.Errorf("bundle: bad founder key length %d", len(b.Founder))
 	}
 	return b, nil
 }

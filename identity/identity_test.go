@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -121,6 +122,93 @@ func TestCertVerifyRejectsBadPersonSlug(t *testing.T) {
 	c.Sign(fpriv)
 	if err := c.Verify(fpub, now); err == nil {
 		t.Fatal("bad person slug accepted")
+	}
+}
+
+// LoadKeys must reject a truncated or garbage-length sign key, not misinterpret it.
+func TestLoadKeysRejectsCorruptSign(t *testing.T) {
+	k, _ := GenerateKeys()
+	p := filepath.Join(t.TempDir(), "machine.key")
+	if err := k.Save(p); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Truncate the base64 "sign" field so the decoded seed is short, not 32 bytes.
+	corrupt := strings.Replace(string(b), `"sign":"`, `"sign":"AAAA`, 1)
+	if err := os.WriteFile(p, []byte(corrupt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadKeys(p); err == nil {
+		t.Fatal("corrupt sign key accepted")
+	}
+}
+
+// LoadKeys must reject a wrong-length enc key.
+func TestLoadKeysRejectsCorruptEnc(t *testing.T) {
+	k, _ := GenerateKeys()
+	p := filepath.Join(t.TempDir(), "machine.key")
+	if err := k.Save(p); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := strings.Replace(string(b), `"enc":"`, `"enc":"AAAA`, 1)
+	if err := os.WriteFile(p, []byte(corrupt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadKeys(p); err == nil {
+		t.Fatal("corrupt enc key accepted")
+	}
+}
+
+// Cert.Verify and Block.Verify must error, not panic, on a short founder key.
+func TestVerifyRejectsShortFounderKey(t *testing.T) {
+	fpub, fpriv := founder(t)
+	k, _ := GenerateKeys()
+	now := time.Unix(1_800_000_000, 0)
+	c := Cert{V: 1, Team: TeamID(fpub), Key: k.Public(), Enc: k.EncPublic(), Person: "sam", Machine: "xps", Issued: now.Unix()}
+	c.Sign(fpriv)
+	if err := c.Verify(fpub[:8], now); err == nil {
+		t.Fatal("short founder key accepted by Cert.Verify")
+	}
+	blk := Block{Team: TeamID(fpub), Key: k.Public(), Reason: "lost laptop", TS: 1}
+	blk.Sign(fpriv)
+	if err := blk.Verify(fpub[:8]); err == nil {
+		t.Fatal("short founder key accepted by Block.Verify")
+	}
+}
+
+// DecodeBundle must reject a short Founder key.
+func TestDecodeBundleRejectsShortFounder(t *testing.T) {
+	b := Bundle{V: 1, Founder: []byte{1, 2, 3}}
+	if _, err := DecodeBundle(b.Encode()); err == nil {
+		t.Fatal("short founder key accepted")
+	}
+}
+
+// DecodeJoinRequest must validate Person/Machine slugs and Key/Enc lengths.
+func TestDecodeJoinRequestValidatesFields(t *testing.T) {
+	k, _ := GenerateKeys()
+	bad := JoinRequest{V: 1, Person: "Not_A_Slug!", Machine: "xps", Key: k.Public(), Enc: k.EncPublic(), Nonce: []byte("12345678")}
+	if _, err := DecodeJoinRequest(bad.Encode()); err == nil {
+		t.Fatal("bad person slug accepted")
+	}
+	bad = JoinRequest{V: 1, Person: "sam", Machine: "Not_A_Slug!", Key: k.Public(), Enc: k.EncPublic(), Nonce: []byte("12345678")}
+	if _, err := DecodeJoinRequest(bad.Encode()); err == nil {
+		t.Fatal("bad machine slug accepted")
+	}
+	bad = JoinRequest{V: 1, Person: "sam", Machine: "xps", Key: []byte{1, 2, 3}, Enc: k.EncPublic(), Nonce: []byte("12345678")}
+	if _, err := DecodeJoinRequest(bad.Encode()); err == nil {
+		t.Fatal("bad key length accepted")
+	}
+	bad = JoinRequest{V: 1, Person: "sam", Machine: "xps", Key: k.Public(), Enc: []byte{1, 2, 3}, Nonce: []byte("12345678")}
+	if _, err := DecodeJoinRequest(bad.Encode()); err == nil {
+		t.Fatal("bad enc length accepted")
 	}
 }
 

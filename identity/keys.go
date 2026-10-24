@@ -43,10 +43,10 @@ type keysFile struct {
 	Enc  string `json:"enc"`
 }
 
-// Save writes k to path as JSON, atomically (temp file + rename), mode 0600.
+// Save writes k to path as JSON (the ed25519 seed, not the full key), atomically (temp file + rename), mode 0600.
 func (k Keys) Save(path string) error {
 	f := keysFile{
-		Sign: base64.RawURLEncoding.EncodeToString(k.Sign),
+		Sign: base64.RawURLEncoding.EncodeToString(k.Sign.Seed()),
 		Enc:  base64.RawURLEncoding.EncodeToString(k.Enc.Bytes()),
 	}
 	b, err := json.Marshal(f)
@@ -63,6 +63,10 @@ func (k Keys) Save(path string) error {
 		tmp.Close()
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
@@ -72,7 +76,8 @@ func (k Keys) Save(path string) error {
 	return os.Rename(tmpPath, path)
 }
 
-// LoadKeys reads Keys from path, refusing a file whose mode allows group or other access.
+// LoadKeys reads Keys from path, refusing a file whose mode allows group or other access
+// or whose stored keys are not exactly seed-sized (32 bytes each).
 func LoadKeys(path string) (Keys, error) {
 	st, err := os.Stat(path)
 	if err != nil {
@@ -93,13 +98,19 @@ func LoadKeys(path string) (Keys, error) {
 	if err != nil {
 		return Keys{}, err
 	}
+	if len(signBytes) != ed25519.SeedSize {
+		return Keys{}, fmt.Errorf("%s: sign key is %d bytes, want %d-byte seed", path, len(signBytes), ed25519.SeedSize)
+	}
 	encBytes, err := base64.RawURLEncoding.DecodeString(f.Enc)
 	if err != nil {
 		return Keys{}, err
+	}
+	if len(encBytes) != 32 {
+		return Keys{}, fmt.Errorf("%s: enc key is %d bytes, want 32", path, len(encBytes))
 	}
 	enc, err := ecdh.X25519().NewPrivateKey(encBytes)
 	if err != nil {
 		return Keys{}, err
 	}
-	return Keys{Sign: ed25519.PrivateKey(signBytes), Enc: enc}, nil
+	return Keys{Sign: ed25519.NewKeyFromSeed(signBytes), Enc: enc}, nil
 }
