@@ -110,6 +110,11 @@ func register(t *testing.T, d *Daemon, c ipc.Conn, agent, id, cwd string, push b
 	return call[Registered](t, d, c, "register", RegisterArgs{Session: adapter.Session{Key: agent + ":" + id, Agent: agent, ID: id, Cwd: cwd}, MCPPush: push})
 }
 
+// init shortens the turn-watch poll so tests don't wait on the production 2s interval.
+func init() {
+	turnWatchInterval = 20 * time.Millisecond
+}
+
 func waitFor(t *testing.T, ok func() bool) {
 	t.Helper()
 	for i := 0; i < 200; i++ {

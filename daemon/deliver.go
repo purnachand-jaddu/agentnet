@@ -147,6 +147,13 @@ func (d *Daemon) pending(mailbox string) ([]message.Message, error) {
 func (d *Daemon) deliver(key, name string, msgs []message.Message, wake bool) message.Receipt {
 	to := d.opts.Person + "/" + name
 	d.mu.Lock()
+	waiting := d.waiting[key] > 0
+	close(d.arrived) // broadcast arrival to every long-polling "inbox" call, for any key, then replace for the next one
+	d.arrived = make(chan struct{})
+	if waiting {
+		d.mu.Unlock()
+		return message.Receipt{To: to, State: message.StateDelivered, Note: "delivered: the session was waiting for messages"}
+	}
 	l := d.live[key]
 	if l == nil {
 		d.mu.Unlock()
@@ -189,7 +196,7 @@ func (d *Daemon) deliver(key, name string, msgs []message.Message, wake bool) me
 		d.pushInBackground(a, sess, message.ForAgent(msgs), ids)
 		return message.Receipt{To: to, State: message.StatePushed}
 	case adapter.ChannelHook:
-		// Task 6 starts a TurnWatcher poll here when the adapter reports a running turn.
+		d.startTurnWatch(key, sess, a)
 		return message.Receipt{To: to, State: message.StateQueued, Note: "it sees it at its next tool call or when its turn ends"}
 	default: // ChannelPull
 		return message.Receipt{To: to, State: message.StateQueued, Note: pullNote}

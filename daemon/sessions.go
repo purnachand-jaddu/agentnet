@@ -146,9 +146,12 @@ func (d *Daemon) register(c ipc.Conn, a RegisterArgs) (Registered, error) {
 	} else {
 		l.s = mergeSession(l.s, a.Session)
 	}
-	l.conn = c
-	if a.MCPPush {
-		l.mcpPush = true
+	// A hook re-register must not touch conn/mcpPush: only an MCP register (or the reverse join below) owns those.
+	if !a.Hook || a.MCPPush || a.MCPPID != 0 {
+		l.conn = c
+		if a.MCPPush {
+			l.mcpPush = true
+		}
 	}
 	if a.MCPPID != 0 {
 		l.mcpPID = a.MCPPID

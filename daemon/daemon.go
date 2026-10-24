@@ -39,8 +39,13 @@ type Daemon struct {
 	inFlight map[string]time.Time
 	pairs    map[[2]string][]time.Time
 	arrived  chan struct{}
+	waiting  map[string]int  // keys with a long-polling "inbox" call in flight
+	watching map[string]bool // keys with a turn-watch goroutine already running
 	started  time.Time
 	shutdown chan struct{}
+
+	gitMu    sync.Mutex // guards gitCache; never held together with mu
+	gitCache map[string]gitInfo
 }
 
 // New builds a Daemon from o.
@@ -52,8 +57,11 @@ func New(o Options) *Daemon {
 		inFlight: map[string]time.Time{},
 		pairs:    map[[2]string][]time.Time{},
 		arrived:  make(chan struct{}),
+		waiting:  map[string]int{},
+		watching: map[string]bool{},
 		started:  o.Now(),
 		shutdown: make(chan struct{}),
+		gitCache: map[string]gitInfo{},
 	}
 }
 

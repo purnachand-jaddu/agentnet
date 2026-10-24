@@ -59,6 +59,42 @@ func (d *Daemon) Handle(ctx context.Context, c ipc.Conn, op string, args json.Ra
 		}
 		d.pushFailed(a)
 		return nil, nil
+	case "inbox":
+		var a InboxArgs
+		if err := json.Unmarshal(args, &a); err != nil {
+			return nil, err
+		}
+		return d.inbox(ctx, a)
+	case "unread":
+		var a InboxArgs
+		if err := json.Unmarshal(args, &a); err != nil {
+			return nil, err
+		}
+		return d.unread(a)
+	case "delivered":
+		var a DeliveredArgs
+		if err := json.Unmarshal(args, &a); err != nil {
+			return nil, err
+		}
+		return nil, d.delivered(a)
+	case "hook":
+		var a HookArgs
+		if err := json.Unmarshal(args, &a); err != nil {
+			return nil, err
+		}
+		return d.hook(c, a)
+	case "attach":
+		var a AttachArgs
+		if err := json.Unmarshal(args, &a); err != nil {
+			return nil, err
+		}
+		return d.attach(c, a)
+	case "who":
+		var a WhoArgs
+		if err := json.Unmarshal(args, &a); err != nil {
+			return nil, err
+		}
+		return d.who(a), nil
 	case "shutdown":
 		d.doShutdown()
 		return nil, nil

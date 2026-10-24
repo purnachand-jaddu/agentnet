@@ -192,6 +192,27 @@ func TestReverseJoinMCPThenHook(t *testing.T) {
 	}
 }
 
+// TestHookReRegisterDoesNotClearMCPConn checks that once an MCP process has forward-joined a hook
+// session, a later hook re-register leaves its conn/mcpPush alone, so closing the hook's own
+// (never-recorded) connection can't drop the MCP link.
+func TestHookReRegisterDoesNotClearMCPConn(t *testing.T) {
+	d := newTestDaemon(t, claudeFake(adapter.ChannelPull))
+	call[Registered](t, d, &fakeConn{id: 1}, "register", RegisterArgs{Session: adapter.Session{Key: "claude-code:c1", Agent: "claude-code", ID: "c1", Cwd: "/src/api", PID: 4242}, Hook: true})
+	call[Registered](t, d, &fakeConn{id: 2}, "register", RegisterArgs{Session: adapter.Session{Key: "proc:999", Agent: "claude-code", Cwd: "/src/api"}, MCPPush: true, MCPPID: 4242})
+
+	hookConn := &fakeConn{id: 3}
+	call[Registered](t, d, hookConn, "register", RegisterArgs{Session: adapter.Session{Key: "claude-code:c1", Agent: "claude-code", ID: "c1", Cwd: "/src/api", PID: 4242}, Hook: true})
+
+	d.ConnClosed(hookConn)
+
+	d.mu.Lock()
+	l, ok := d.live["claude-code:c1"]
+	d.mu.Unlock()
+	if !ok || !l.mcpPush || l.conn == nil {
+		t.Fatalf("hook re-register's conn closing broke the MCP link: live=%v, %+v", ok, l)
+	}
+}
+
 func TestFromClientExactMatch(t *testing.T) {
 	claude := claudeFake(adapter.ChannelPull)
 	codex := codexFake(adapter.ChannelPull)
