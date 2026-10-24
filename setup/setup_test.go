@@ -80,9 +80,7 @@ func findStep(t *testing.T, steps []Step, name string) Step {
 	return Step{}
 }
 
-// fakeDaemon is a minimal real ipc server at paths.Socket() that answers "shutdown" by stopping
-// itself, answers "status" with the service flag it was started with, and records whether
-// "shutdown" was ever sent.
+// fakeDaemon is a minimal real ipc server at paths.Socket() answering "shutdown" and "status".
 type fakeDaemon struct {
 	mu   sync.Mutex
 	got  bool

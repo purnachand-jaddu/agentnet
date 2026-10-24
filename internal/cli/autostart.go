@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"syscall"
 	"time"
@@ -17,8 +18,8 @@ import (
 const autostartRetry = 100 * time.Millisecond
 
 // autostartWait and serviceStartWait bound how long autostartDial waits for a freshly spawned
-// daemon, or a kickstarted/started service, to answer.
-const (
+// daemon, or a kickstarted/started service, to answer; vars so tests can shrink them.
+var (
 	autostartWait    = 3 * time.Second
 	serviceStartWait = 5 * time.Second
 )
@@ -29,9 +30,9 @@ var execCommand = exec.Command
 // runCommand runs an external command for the service-takeover path; a var so tests can fake it.
 var runCommand setup.Runner = setup.Exec
 
-// autostartDial dials the daemon's socket. When agentnet's background service is installed, a
-// missed dial asks it to (re)start instead of spawning a second, non-service daemon that would
-// race it for the socket; otherwise it spawns one detached, as before.
+// autostartDial dials the daemon's socket, preferring the installed service over spawning a
+// second daemon; if the service can't start (no GUI/user session, stale exe) it falls back to
+// spawning, so a dead service never leaves agentnet permanently unreachable.
 func autostartDial() (*ipc.Client, error) {
 	if c, err := ipc.Dial(paths.Socket()); err == nil {
 		return c, nil
@@ -41,21 +42,30 @@ func autostartDial() (*ipc.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	installed, err := setup.ServiceInstalled(home, runtime.GOOS)
-	if err != nil {
-		return nil, err
-	}
-	if installed {
-		if err := setup.StartService(runtime.GOOS, runCommand); err != nil {
+	if serviceAnswersThisHome(home) {
+		installed, err := setup.ServiceInstalled(home, runtime.GOOS)
+		if err != nil {
 			return nil, err
 		}
-		return waitForDial(serviceStartWait)
+		if installed {
+			setup.StartService(runtime.GOOS, runCommand) // best effort; spawn below is the fallback
+			if c, err := waitForDial(serviceStartWait); err == nil {
+				return c, nil
+			}
+		}
 	}
 
 	if err := spawnDaemon(); err != nil {
 		return nil, err
 	}
 	return waitForDial(autostartWait)
+}
+
+// serviceAnswersThisHome reports whether the installed service — which always serves the
+// default $HOME/.agentnet — would also be serving this process's AGENTNET_HOME.
+func serviceAnswersThisHome(home string) bool {
+	h := os.Getenv("AGENTNET_HOME")
+	return h == "" || h == filepath.Join(home, ".agentnet")
 }
 
 // waitForDial polls the daemon's socket until it answers, or returns an error after timeout.

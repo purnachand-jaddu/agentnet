@@ -107,7 +107,7 @@ func verifyServiceAnswering() error {
 		return fmt.Errorf("service did not start; see %s", paths.Log())
 	}
 	if !st.Service {
-		return fmt.Errorf("the running daemon (pid %d) is not the service; it will be replaced when it exits", st.PID)
+		return fmt.Errorf("the running daemon (pid %d) is not the service; re-run `agentnet setup` to hand over", st.PID)
 	}
 	return nil
 }
