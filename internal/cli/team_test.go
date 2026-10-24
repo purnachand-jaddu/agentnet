@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/purnachand-jaddu/agentnet/consent"
+	"github.com/purnachand-jaddu/agentnet/ipc"
 	"github.com/purnachand-jaddu/agentnet/store/sqlite"
 	"github.com/purnachand-jaddu/agentnet/team"
 )
@@ -322,5 +324,35 @@ func TestInitJoinAdmitAcceptFullFlow(t *testing.T) {
 		if !strictPairingCodeRE.MatchString(code) {
 			t.Fatalf("code %q doesn't match XXXX-XXXX-XXXX", code)
 		}
+	}
+}
+
+// init must restart a running daemon so it comes back up with the new network.
+func TestInitRestartsRunningDaemon(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "an")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(home) })
+	t.Setenv("AGENTNET_HOME", home)
+	withApprover(t, fakeApprover{})
+
+	got := make(chan string, 4)
+	startFakeDaemon(t, func(ctx context.Context, c ipc.Conn, op string, args json.RawMessage) (any, error) {
+		got <- op
+		return nil, nil
+	})
+
+	out, errOut := withIO(t)
+	if code := Main([]string{"init", "--person", "alex", "--machine", "mbp"}, "v0"); code != 0 {
+		t.Fatalf("init failed: stdout %q, stderr %q", out.String(), errOut.String())
+	}
+	select {
+	case op := <-got:
+		if op != "shutdown" {
+			t.Fatalf("op = %q, want shutdown", op)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("init did not send shutdown to the running daemon")
 	}
 }

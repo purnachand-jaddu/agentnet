@@ -221,6 +221,8 @@ func cmdInit(args []string) int {
 		fmt.Fprintf(stderr, "warning: could not save person/machine to config: %v\n", err)
 	}
 
+	restartDaemon()
+
 	fmt.Fprintln(stdout, identity.TeamCode(founderPriv.Public().(ed25519.PublicKey)))
 	fmt.Fprintf(stdout, "Add people with `agentnet admit <request>`. The founder key is at %s; keep it safe (moving it offline with --founder-key is recommended).\n", founderKeyPath)
 	return 0
