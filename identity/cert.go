@@ -18,13 +18,17 @@ func TeamID(founder ed25519.PublicKey) string {
 	return base64.RawURLEncoding.EncodeToString(sum[:])[:16]
 }
 
-var teamCodeAlphabet = base32.NewEncoding("0123456789ABCDEFGHJKMNPQRSTVWXYZ").WithPadding(base32.NoPadding)
+var crockford32 = base32.NewEncoding("0123456789ABCDEFGHJKMNPQRSTVWXYZ").WithPadding(base32.NoPadding)
+
+// code12 formats the first 12 Crockford base32 characters of sum as "XXXX-XXXX-XXXX".
+func code12(sum [sha256.Size]byte) string {
+	s := crockford32.EncodeToString(sum[:])[:12]
+	return s[:4] + "-" + s[4:8] + "-" + s[8:12]
+}
 
 // TeamCode is the human-readable code the founder reads out and the joiner checks, e.g. "ABCD-EFGH-JKLM".
 func TeamCode(founder ed25519.PublicKey) string {
-	sum := sha256.Sum256(append([]byte("agentnet/team-code/v1"), founder...))
-	s := teamCodeAlphabet.EncodeToString(sum[:])[:12]
-	return s[:4] + "-" + s[4:8] + "-" + s[8:12]
+	return code12(sha256.Sum256(append([]byte("agentnet/team-code/v1"), founder...)))
 }
 
 // signPayload is the bytes a founder signs for kind: "agentnet/<kind>/v1\n" + JSON.

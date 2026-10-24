@@ -4,7 +4,6 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -24,12 +23,9 @@ type JoinRequest struct {
 	Nonce   []byte `json:"nonce"`
 }
 
-// PairingCode is "123-456-789" from sha256 of the encoded request: what the joiner reads to the founder.
+// PairingCode is "ABCD-EFGH-JKLM" from sha256("agentnet/pairing-code/v1"+Encode()): what the joiner reads to the founder.
 func (r JoinRequest) PairingCode() string {
-	sum := sha256.Sum256([]byte(r.Encode()))
-	n := binary.BigEndian.Uint64(sum[:8]) % 1_000_000_000
-	s := fmt.Sprintf("%09d", n)
-	return s[:3] + "-" + s[3:6] + "-" + s[6:9]
+	return code12(sha256.Sum256(append([]byte("agentnet/pairing-code/v1"), []byte(r.Encode())...)))
 }
 
 // Encode is the wire form: "agentnet-join1:" + base64url(no padding)(json).

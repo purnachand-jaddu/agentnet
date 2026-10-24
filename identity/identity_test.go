@@ -62,7 +62,7 @@ func TestJoinRoundTripAndCodes(t *testing.T) {
 	k, _ := GenerateKeys()
 	r := JoinRequest{V: 1, Person: "sam", Machine: "xps", Key: k.Public(), Enc: k.EncPublic(), Nonce: []byte("12345678")}
 	got, err := DecodeJoinRequest(r.Encode())
-	if err != nil || got.PairingCode() != r.PairingCode() || len(r.PairingCode()) != 11 {
+	if err != nil || got.PairingCode() != r.PairingCode() || len(r.PairingCode()) != 14 {
 		t.Fatalf("round trip: %v, code %q", err, r.PairingCode())
 	}
 	fpub, _ := founder(t)
@@ -209,6 +209,24 @@ func TestDecodeJoinRequestValidatesFields(t *testing.T) {
 	bad = JoinRequest{V: 1, Person: "sam", Machine: "xps", Key: k.Public(), Enc: []byte{1, 2, 3}, Nonce: []byte("12345678")}
 	if _, err := DecodeJoinRequest(bad.Encode()); err == nil {
 		t.Fatal("bad enc length accepted")
+	}
+}
+
+// PairingCode must not collide with TeamCode on related inputs, and must change with the nonce.
+func TestPairingCodeDistinctFromTeamCode(t *testing.T) {
+	fpub, _ := founder(t)
+	k, _ := GenerateKeys()
+	r := JoinRequest{V: 1, Person: "sam", Machine: "xps", Key: k.Public(), Enc: k.EncPublic(), Nonce: []byte("12345678")}
+	if r.PairingCode() == TeamCode(fpub) {
+		t.Fatalf("pairing code collides with team code: %q", r.PairingCode())
+	}
+	if r.PairingCode() == TeamCode(k.Public()) {
+		t.Fatalf("pairing code collides with team code over the request's own key: %q", r.PairingCode())
+	}
+	r2 := r
+	r2.Nonce = []byte("87654321")
+	if r.PairingCode() == r2.PairingCode() {
+		t.Fatal("pairing code did not change with the nonce")
 	}
 }
 
