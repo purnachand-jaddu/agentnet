@@ -1,17 +1,13 @@
 package main
 
 import (
-	"fmt"
 	"os"
+
+	"github.com/purnachand-jaddu/agentnet/internal/cli"
 )
 
 var version = "dev"
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "version" {
-		fmt.Println(version)
-		return
-	}
-	fmt.Fprintln(os.Stderr, "usage: agentnet <command>")
-	os.Exit(2)
+	os.Exit(cli.Main(os.Args[1:], version))
 }

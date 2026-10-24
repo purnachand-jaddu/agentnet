@@ -19,6 +19,9 @@ func New() *Adapter { return &Adapter{name: "mcp"} }
 // WithEnv returns a generic adapter named name whose EnvSessionID reads envVar.
 func WithEnv(name, envVar string) *Adapter { return &Adapter{name: name, envVar: envVar} }
 
+// CLI returns the pull-only adapter for `agentnet listen`'s "cli" sessions.
+func CLI() *Adapter { return &Adapter{name: "cli"} }
+
 func (a *Adapter) Name() string  { return a.name }
 func (a *Adapter) Short() string { return a.name }
 
