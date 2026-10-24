@@ -8,15 +8,18 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"strings"
 	"time"
 
 	hmdns "github.com/hashicorp/mdns"
 
 	"github.com/purnachand-jaddu/agentnet/discovery"
+	"github.com/purnachand-jaddu/agentnet/internal/netaddr"
 )
 
 // service is the mDNS service type agentnet announces and browses.
@@ -36,8 +39,9 @@ var discardLogger = log.New(io.Discard, "", 0)
 
 // Discoverer finds agentnet peers over mDNS.
 type Discoverer struct {
-	Self     []byte        // if set, Browse drops entries whose key equals Self
-	Interval time.Duration // Browse's query interval; defaultInterval if zero
+	Self     []byte                   // if set, Browse drops entries whose key equals Self
+	Interval time.Duration            // Browse's query interval; defaultInterval if zero
+	IPs      func() ([]net.IP, error) // LAN IPv4 addresses Announce advertises; netaddr.LocalIPv4 if nil
 }
 
 // New makes an mDNS Discoverer.
@@ -65,16 +69,22 @@ func parseTXT(fields []string) (k, t string) {
 }
 
 // Announce starts an mDNS responder advertising key on port for team, shutting down once ctx is done.
+// It advertises this machine's own LAN IPv4 addresses (via IPs, or netaddr.LocalIPv4 if unset) rather
+// than letting hashicorp/mdns resolve os.Hostname() itself, which can land on a loopback /etc/hosts entry.
 func (d *Discoverer) Announce(ctx context.Context, key []byte, team string, port int) error {
-	instance := base64.RawURLEncoding.EncodeToString(key)
-	if len(instance) > 12 {
-		instance = instance[:12]
+	ipsFn := d.IPs
+	if ipsFn == nil {
+		ipsFn = netaddr.LocalIPv4
 	}
-	txt := []string{
-		"k=" + base64.RawURLEncoding.EncodeToString(key),
-		"t=" + tag(team),
+	ips, err := ipsFn()
+	if err != nil {
+		return err
 	}
-	svc, err := hmdns.NewMDNSService(instance, service, "", "", port, nil, txt)
+	if len(ips) == 0 {
+		return errors.New("no LAN IPv4 address to announce")
+	}
+
+	svc, err := newZone(key, team, port, ips)
 	if err != nil {
 		return err
 	}
@@ -87,6 +97,19 @@ func (d *Discoverer) Announce(ctx context.Context, key []byte, team string, port
 		srv.Shutdown()
 	}()
 	return nil
+}
+
+// newZone builds the mDNS service record for key on port for team, advertising ips.
+func newZone(key []byte, team string, port int, ips []net.IP) (*hmdns.MDNSService, error) {
+	instance := base64.RawURLEncoding.EncodeToString(key)
+	if len(instance) > 12 {
+		instance = instance[:12]
+	}
+	txt := []string{
+		"k=" + base64.RawURLEncoding.EncodeToString(key),
+		"t=" + tag(team),
+	}
+	return hmdns.NewMDNSService(instance, service, "", "", port, ips, txt)
 }
 
 // Browse queries for agentnet peers every Interval, reporting those whose team tag matches; it blocks until ctx is done.
@@ -112,7 +135,7 @@ func (d *Discoverer) Browse(ctx context.Context, team string, found func(discove
 
 // query runs one mDNS lookup and reports matching entries; it blocks for up to queryTimeout.
 func (d *Discoverer) query(ctx context.Context, want string, found func(discovery.Found)) {
-	entries := make(chan *hmdns.ServiceEntry, 32)
+	entries := make(chan *hmdns.ServiceEntry, 256)
 	err := hmdns.QueryContext(ctx, &hmdns.QueryParam{
 		Service:     service,
 		Domain:      "local",

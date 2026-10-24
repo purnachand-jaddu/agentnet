@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/purnachand-jaddu/agentnet/envelope"
+	"github.com/purnachand-jaddu/agentnet/internal/netaddr"
 	"github.com/purnachand-jaddu/agentnet/transport"
 )
 
@@ -117,30 +118,13 @@ func (t *Transport) addresses(port int) ([]string, error) {
 	if ip := net.ParseIP(t.bind); ip != nil && !ip.IsUnspecified() {
 		return []string{fmt.Sprintf("lan://%s:%d", ip.String(), port)}, nil
 	}
-	ifaces, err := net.Interfaces()
+	ips, err := netaddr.LocalIPv4()
 	if err != nil {
 		return nil, err
 	}
 	var addrs []string
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		ifaceAddrs, err := iface.Addrs()
-		if err != nil {
-			continue // ponytail: skip interfaces we can't enumerate rather than fail Listen entirely
-		}
-		for _, a := range ifaceAddrs {
-			ipnet, ok := a.(*net.IPNet)
-			if !ok {
-				continue
-			}
-			ip4 := ipnet.IP.To4()
-			if ip4 == nil || ip4.IsLinkLocalUnicast() {
-				continue
-			}
-			addrs = append(addrs, fmt.Sprintf("lan://%s:%d", ip4.String(), port))
-		}
+	for _, ip := range ips {
+		addrs = append(addrs, fmt.Sprintf("lan://%s:%d", ip.String(), port))
 	}
 	return addrs, nil
 }

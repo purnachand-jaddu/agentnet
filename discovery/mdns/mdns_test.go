@@ -1,11 +1,16 @@
 package mdns
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"net"
 	"os"
 	"sync"
 	"testing"
 	"time"
+
+	hmdns "github.com/hashicorp/mdns"
 
 	"github.com/purnachand-jaddu/agentnet/discovery"
 )
@@ -32,6 +37,88 @@ func TestParseTXT(t *testing.T) {
 	k, tg = parseTXT(nil)
 	if k != "" || tg != "" {
 		t.Fatalf("want empty on no fields, got k=%q t=%q", k, tg)
+	}
+}
+
+// TestReport is a deterministic, non-networked check of the entry filter.
+func TestReport(t *testing.T) {
+	goodKey := bytes32(5)
+	selfKey := bytes32(9)
+	wantTag := tag("team-a")
+	goodTXT := []string{"k=" + base64.RawURLEncoding.EncodeToString(goodKey), "t=" + wantTag}
+
+	cases := []struct {
+		name string
+		self []byte
+		e    *hmdns.ServiceEntry
+		want bool
+	}{
+		{"wrong tag", nil, &hmdns.ServiceEntry{AddrV4: net.ParseIP("10.0.0.1"), Port: 4000,
+			InfoFields: []string{"k=" + base64.RawURLEncoding.EncodeToString(goodKey), "t=" + tag("team-b")}}, false},
+		{"bad key", nil, &hmdns.ServiceEntry{AddrV4: net.ParseIP("10.0.0.1"), Port: 4000,
+			InfoFields: []string{"k=not-valid-base64!!", "t=" + wantTag}}, false},
+		{"short key", nil, &hmdns.ServiceEntry{AddrV4: net.ParseIP("10.0.0.1"), Port: 4000,
+			InfoFields: []string{"k=" + base64.RawURLEncoding.EncodeToString([]byte("too-short")), "t=" + wantTag}}, false},
+		{"self key", selfKey, &hmdns.ServiceEntry{AddrV4: net.ParseIP("10.0.0.1"), Port: 4000,
+			InfoFields: []string{"k=" + base64.RawURLEncoding.EncodeToString(selfKey), "t=" + wantTag}}, false},
+		{"nil AddrV4", nil, &hmdns.ServiceEntry{AddrV4: nil, Port: 4000, InfoFields: goodTXT}, false},
+		{"match", nil, &hmdns.ServiceEntry{AddrV4: net.ParseIP("10.0.0.1"), Port: 4000, InfoFields: goodTXT}, true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			d := &Discoverer{Self: c.self}
+			var got *discovery.Found
+			d.report(c.e, wantTag, func(f discovery.Found) { got = &f })
+
+			if c.want != (got != nil) {
+				t.Fatalf("report called = %v, want %v", got != nil, c.want)
+			}
+			if c.want {
+				if !bytes.Equal(got.Key, goodKey) {
+					t.Errorf("Key = %x, want %x", got.Key, goodKey)
+				}
+				if len(got.Addrs) != 1 || got.Addrs[0] != "lan://10.0.0.1:4000" {
+					t.Errorf("Addrs = %v, want [lan://10.0.0.1:4000]", got.Addrs)
+				}
+			}
+		})
+	}
+}
+
+// TestNewZoneAdvertisesInjectedIPs guards against NewMDNSService falling back to os.Hostname()
+// resolution (which can land on a loopback /etc/hosts entry): the service must carry exactly the
+// IPs we hand it, never a 127/8 address.
+func TestNewZoneAdvertisesInjectedIPs(t *testing.T) {
+	ips := []net.IP{net.ParseIP("10.1.2.3"), net.ParseIP("10.1.2.4")}
+	svc, err := newZone(bytes32(1), "team-a", 4000, ips)
+	if err != nil {
+		t.Fatalf("newZone: %v", err)
+	}
+	if len(svc.IPs) != len(ips) {
+		t.Fatalf("got %d IPs, want %d: %v", len(svc.IPs), len(ips), svc.IPs)
+	}
+	for i, want := range ips {
+		if !svc.IPs[i].Equal(want) {
+			t.Errorf("IP %d = %v, want %v", i, svc.IPs[i], want)
+		}
+		if svc.IPs[i].IsLoopback() {
+			t.Errorf("IP %d = %v is a loopback address", i, svc.IPs[i])
+		}
+	}
+}
+
+// TestAnnounceErrorsWithNoIPs checks Announce refuses to start rather than silently falling back
+// to hashicorp/mdns's own hostname resolution when no LAN IPv4 address is available.
+func TestAnnounceErrorsWithNoIPs(t *testing.T) {
+	d := New()
+	d.IPs = func() ([]net.IP, error) { return nil, nil }
+	err := d.Announce(context.Background(), bytes32(1), "team-a", 4000)
+	if err == nil {
+		t.Fatal("want an error when no LAN IPv4 address is available")
+	}
+	if err.Error() != "no LAN IPv4 address to announce" {
+		t.Errorf("err = %q, want %q", err.Error(), "no LAN IPv4 address to announce")
 	}
 }
 
