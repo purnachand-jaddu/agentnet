@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -125,8 +127,12 @@ func TestBodyTooLarge(t *testing.T) {
 	}
 	e := testEnvelope("big")
 	e.Sealed = bytes.Repeat([]byte("a"), 2<<20)
-	if _, err := a.Send(context.Background(), bAddr, e); err == nil {
+	_, err = a.Send(context.Background(), bAddr, e)
+	if err == nil {
 		t.Fatal("Send of an oversized envelope should error")
+	}
+	if !strings.Contains(err.Error(), "413") {
+		t.Fatalf("Send error = %q, want it to mention 413", err)
 	}
 }
 
@@ -209,5 +215,88 @@ func TestListenReturnsBoundPort(t *testing.T) {
 	}
 	if len(addrs) != 1 || strings.HasSuffix(addrs[0], ":0") {
 		t.Fatalf("addrs = %v, want a single address with a real port", addrs)
+	}
+}
+
+// addresses doesn't touch the network for a specific bind IP, so a documentation-range IP (never actually bound) is safe to use here.
+func TestAddressesSpecificNonLoopbackBind(t *testing.T) {
+	tr := New("203.0.113.5", 4321)
+	addrs, err := tr.addresses(4321)
+	if err != nil {
+		t.Fatalf("addresses: %v", err)
+	}
+	want := []string{"lan://203.0.113.5:4321"}
+	if len(addrs) != 1 || addrs[0] != want[0] {
+		t.Fatalf("addrs = %v, want %v", addrs, want)
+	}
+}
+
+// httpClient's Transport.Proxy must be nil. net/http's env-proxy lookup already exempts loopback/localhost
+// targets (see net/http's useProxy), so a t.Setenv HTTP_PROXY test against our loopback-only test servers
+// would pass even with the bug reintroduced; this direct field check is the one that actually catches it.
+func TestHTTPClientHasNoProxy(t *testing.T) {
+	tr, ok := httpClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("httpClient.Transport is %T, want *http.Transport", httpClient.Transport)
+	}
+	if tr.Proxy != nil {
+		t.Fatal("httpClient's Transport.Proxy must be nil, so Send never honors HTTP_PROXY/HTTPS_PROXY")
+	}
+}
+
+func TestSendIgnoresProxyEnv(t *testing.T) {
+	// A proxy nothing listens on: if Send honoured it, the request would fail to connect instead of succeeding.
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:1")
+
+	_, bAddr := listenLoopback(t, func(ctx context.Context, e envelope.Envelope) envelope.Ack {
+		return envelope.Ack{ID: e.ID, State: message.StateQueued}
+	})
+	a := New("127.0.0.1", 0)
+	t.Cleanup(func() { a.Close() })
+	if _, err := a.Listen(context.Background(), nil); err != nil {
+		t.Fatalf("A.Listen: %v", err)
+	}
+
+	ack, err := a.Send(context.Background(), bAddr, testEnvelope("proxy-test"))
+	if err != nil {
+		t.Fatalf("Send: %v (Send must not honor HTTP_PROXY for lan:// peers)", err)
+	}
+	if ack.State != message.StateQueued {
+		t.Fatalf("ack.State = %q, want %q", ack.State, message.StateQueued)
+	}
+}
+
+func TestSendRetryAfter(t *testing.T) {
+	cases := []struct {
+		name   string
+		header string
+		want   time.Duration
+	}{
+		{"explicit seconds", "7", 7 * time.Second},
+		{"missing header", "", defaultRetryAfter},
+		{"unparseable header", "soon", defaultRetryAfter},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if c.header != "" {
+					w.Header().Set("Retry-After", c.header)
+				}
+				w.WriteHeader(http.StatusTooManyRequests)
+			}))
+			defer srv.Close()
+
+			a := New("127.0.0.1", 0)
+			t.Cleanup(func() { a.Close() })
+			_, err := a.Send(context.Background(), "lan://"+strings.TrimPrefix(srv.URL, "http://"), testEnvelope("x"))
+
+			var rae *RetryAfterError
+			if !errors.As(err, &rae) {
+				t.Fatalf("err = %v, want *RetryAfterError", err)
+			}
+			if rae.After != c.want {
+				t.Fatalf("After = %v, want %v", rae.After, c.want)
+			}
+		})
 	}
 }

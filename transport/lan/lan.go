@@ -19,11 +19,21 @@ import (
 	"github.com/purnachand-jaddu/agentnet/transport"
 )
 
-// maxEnvelopeBytes caps the request body: a 1 MiB sealed payload plus its base64 and envelope-field overhead.
-const maxEnvelopeBytes = 1<<20 + 64<<10
+// maxEnvelopeBytes caps the request body: a 1 MiB sealed payload, base64-encoded in JSON, plus 64 KiB for the rest of the envelope.
+const maxEnvelopeBytes = 4*((1<<20+2)/3) + 64<<10
 
 // maxAckBytes caps the Ack response body Send will read.
 const maxAckBytes = 64 << 10
+
+// httpClient ignores HTTP_PROXY/HTTPS_PROXY: a LAN envelope must go straight to the peer, never through an env-configured proxy.
+var httpClient = &http.Client{
+	Timeout: 5 * time.Second,
+	Transport: &http.Transport{
+		Proxy:               nil,
+		MaxIdleConnsPerHost: 2,
+		IdleConnTimeout:     30 * time.Second,
+	},
+}
 
 // Transport is a transport.Transport that moves envelopes over HTTP between machines on the same network.
 type Transport struct {
@@ -99,10 +109,13 @@ func (t *Transport) Listen(ctx context.Context, h transport.Handler) ([]string, 
 	return addrs, nil
 }
 
-// addresses lists this machine's lan:// addresses for the bound port: loopback if bind is loopback, else one per up, non-loopback IPv4 interface address.
+// addresses lists this machine's lan:// addresses for the bound port: loopback if bind is loopback, the bind IP alone if it's a specific non-loopback address, else one per up, non-loopback IPv4 interface address.
 func (t *Transport) addresses(port int) ([]string, error) {
 	if ip := net.ParseIP(t.bind); ip != nil && ip.IsLoopback() {
 		return []string{fmt.Sprintf("lan://127.0.0.1:%d", port)}, nil
+	}
+	if ip := net.ParseIP(t.bind); ip != nil && !ip.IsUnspecified() {
+		return []string{fmt.Sprintf("lan://%s:%d", ip.String(), port)}, nil
 	}
 	ifaces, err := net.Interfaces()
 	if err != nil {
@@ -171,6 +184,27 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
+// RetryAfterError is returned by Send when the peer answered 429; After is how long it asked the caller to wait.
+type RetryAfterError struct {
+	After time.Duration
+}
+
+func (e *RetryAfterError) Error() string {
+	return fmt.Sprintf("lan: rate limited, retry after %s", e.After)
+}
+
+// defaultRetryAfter is used when a 429 response has no Retry-After header, or an unparseable one.
+const defaultRetryAfter = 10 * time.Second
+
+// parseRetryAfter reads a Retry-After header's seconds form, falling back to defaultRetryAfter.
+func parseRetryAfter(v string) time.Duration {
+	secs, err := strconv.Atoi(v)
+	if err != nil || secs < 0 {
+		return defaultRetryAfter
+	}
+	return time.Duration(secs) * time.Second
+}
+
 // Send posts e to addr's /v1/envelope and returns its signed Ack.
 func (t *Transport) Send(ctx context.Context, addr string, e envelope.Envelope) (envelope.Ack, error) {
 	u, err := url.Parse(addr)
@@ -191,12 +225,14 @@ func (t *Transport) Send(ctx context.Context, addr string, e envelope.Envelope) 
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return envelope.Ack{}, fmt.Errorf("lan: send to %s: %w", addr, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return envelope.Ack{}, &RetryAfterError{After: parseRetryAfter(resp.Header.Get("Retry-After"))}
+	}
 	if resp.StatusCode != http.StatusOK {
 		return envelope.Ack{}, fmt.Errorf("lan: %s returned %s", addr, resp.Status)
 	}
