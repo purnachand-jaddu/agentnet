@@ -47,7 +47,7 @@ type PushFailedArgs struct {
 }
 
 // send handles the "send" op: validates, resolves recipients, stores one message per recipient and delivers it.
-func (d *Daemon) send(a SendArgs) (SendResult, error) {
+func (d *Daemon) send(ctx context.Context, a SendArgs) (SendResult, error) {
 	if a.Body == "" {
 		return SendResult{}, fmt.Errorf("empty message body")
 	}
@@ -79,7 +79,7 @@ func (d *Daemon) send(a SendArgs) (SendResult, error) {
 			ReplyTo: a.ReplyTo, Body: a.Body, Wake: a.Wake, SentAt: d.opts.Now(),
 		}
 		if tg.peer != "" {
-			r, ok := d.sendRemote(tg, msg)
+			r, ok := d.sendRemote(ctx, tg, msg)
 			if ok {
 				res.IDs = append(res.IDs, msg.ID)
 			}

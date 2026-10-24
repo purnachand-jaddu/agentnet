@@ -58,7 +58,7 @@ func (d *Daemon) Handle(ctx context.Context, c ipc.Conn, op string, args json.Ra
 		if err := json.Unmarshal(args, &a); err != nil {
 			return nil, err
 		}
-		return d.send(a)
+		return d.send(ctx, a)
 	case "push_failed":
 		var a PushFailedArgs
 		if err := json.Unmarshal(args, &a); err != nil {

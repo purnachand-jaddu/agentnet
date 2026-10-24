@@ -80,7 +80,7 @@ func (d *Daemon) resolveRemote(fromKey string, addr message.Address) ([]target, 
 }
 
 // sendRemote queues msg for tg's machine, then makes one attempt; ok is false if it couldn't be queued.
-func (d *Daemon) sendRemote(tg target, msg message.Message) (r message.Receipt, ok bool) {
+func (d *Daemon) sendRemote(ctx context.Context, tg target, msg message.Message) (r message.Receipt, ok bool) {
 	r.To = tg.name
 	mu := d.peerLock(tg.peer)
 	mu.Lock()
@@ -94,7 +94,7 @@ func (d *Daemon) sendRemote(tg target, msg message.Message) (r message.Receipt, 
 		r.State, r.Note = message.StateQueued, unreachableNote
 		return r, true
 	}
-	r.State, r.Note, _ = d.attempt(context.Background(), cert, msg)
+	r.State, r.Note, _ = d.attempt(ctx, cert, msg)
 	return r, true
 }
 
@@ -144,7 +144,7 @@ func (d *Daemon) memberCert(peer string) (identity.Cert, bool) {
 	return d.opts.Team.CertFor(k)
 }
 
-// outboxLoop resends queued messages every OutboxEvery, and flushes a peer at once when its presence arrives.
+// outboxLoop resends queued messages every OutboxEvery, and starts flushers whenever a flush is requested.
 func (d *Daemon) outboxLoop(ctx context.Context) {
 	tick := time.NewTicker(d.opts.OutboxEvery)
 	defer tick.Stop()
@@ -154,8 +154,8 @@ func (d *Daemon) outboxLoop(ctx context.Context) {
 			return
 		case <-tick.C:
 			d.outboxTick(ctx)
-		case peer := <-d.flushNow:
-			d.flushAsync(ctx, peer, d.opts.Now())
+		case <-d.kick:
+			d.startFlushers(ctx)
 		}
 	}
 }
@@ -173,32 +173,59 @@ func (d *Daemon) outboxTick(ctx context.Context) {
 		d.opts.Log("daemon: outbox peers: %v", err)
 		return
 	}
+	d.mu.Lock()
 	for _, p := range peers {
-		d.flushAsync(ctx, p, now.Add(-outboxMinAge))
+		d.requestFlush(p, now.Add(-outboxMinAge))
+	}
+	d.mu.Unlock()
+	d.startFlushers(ctx)
+}
+
+// requestFlush marks peer dirty for entries queued at or before cutoff and wakes the outbox loop. Caller holds mu.
+func (d *Daemon) requestFlush(peer string, cutoff time.Time) {
+	if cutoff.After(d.dirty[peer]) {
+		d.dirty[peer] = cutoff
+	}
+	select {
+	case d.kick <- struct{}{}:
+	default: // a wake-up is already pending; it sees this peer too
 	}
 }
 
-// flushAsync starts flushing peer's entries queued at or before olderThan, unless a flush for it is already running.
-func (d *Daemon) flushAsync(ctx context.Context, peer string, olderThan time.Time) {
+// startFlushers starts a flusher for every dirty peer that has none running.
+func (d *Daemon) startFlushers(ctx context.Context) {
 	d.mu.Lock()
-	busy := d.flushing[peer]
-	d.flushing[peer] = true
-	d.mu.Unlock()
-	if busy {
-		return
+	var start []string
+	for p := range d.dirty {
+		if !d.flushing[p] {
+			d.flushing[p] = true
+			start = append(start, p)
+		}
 	}
-	d.netGo(func() {
-		defer func() {
-			d.mu.Lock()
+	d.mu.Unlock()
+	for _, p := range start {
+		d.netGo(func() { d.flusher(ctx, p) })
+	}
+}
+
+// flusher flushes peer while it is dirty, clearing the flag at the start of each pass, so no request is lost.
+func (d *Daemon) flusher(ctx context.Context, peer string) {
+	for {
+		d.mu.Lock()
+		cutoff, dirty := d.dirty[peer]
+		delete(d.dirty, peer)
+		if !dirty || ctx.Err() != nil {
 			delete(d.flushing, peer)
 			d.mu.Unlock()
-		}()
-		d.flushPeer(ctx, peer, olderThan)
-	})
+			return
+		}
+		d.mu.Unlock()
+		d.flushPeer(ctx, peer, cutoff)
+	}
 }
 
-// flushPeer resends up to outboxBatch of peer's entries queued at or before olderThan, oldest first, stopping at the first one still pending.
-func (d *Daemon) flushPeer(ctx context.Context, peer string, olderThan time.Time) {
+// flushPeer resends up to outboxBatch of peer's entries queued at or before cutoff, oldest first, stopping when the peer is unreachable.
+func (d *Daemon) flushPeer(ctx context.Context, peer string, cutoff time.Time) {
 	cert, ok := d.memberCert(peer)
 	if !ok {
 		return // blocked or unknown: its entries age out via OutboxPrune
@@ -206,14 +233,14 @@ func (d *Daemon) flushPeer(ctx context.Context, peer string, olderThan time.Time
 	mu := d.peerLock(peer)
 	mu.Lock()
 	defer mu.Unlock()
-	msgs, err := d.opts.Store.OutboxFor(peer, olderThan)
+	msgs, err := d.opts.Store.OutboxFor(peer, cutoff)
 	if err != nil {
 		d.opts.Log("daemon: outbox for %s: %v", cert.Machine, err)
 		return
 	}
 	for _, m := range msgs[:min(len(msgs), outboxBatch)] {
-		if _, _, done := d.attempt(ctx, cert, m); !done {
-			return
+		if st, _, done := d.attempt(ctx, cert, m); !done && st != message.StateRetry {
+			return // no valid ack: the rest would fail the same way
 		}
 	}
 }

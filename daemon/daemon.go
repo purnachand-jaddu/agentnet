@@ -82,8 +82,9 @@ type Daemon struct {
 	netWG    sync.WaitGroup       // network goroutines Run waits for
 
 	sendMu   map[string]*sync.Mutex // per-peer lock serialising message sends; guarded by mu
-	flushing map[string]bool        // peers with an outbox flush running; guarded by mu
-	flushNow chan string            // peers whose presence just arrived, for the outbox loop
+	flushing map[string]bool        // peers with a flusher running; guarded by mu
+	dirty    map[string]time.Time   // peers with a flush requested, and the newest cutoff asked for; guarded by mu
+	kick     chan struct{}          // wakes the outbox loop to start flushers for dirty peers
 }
 
 // New builds a Daemon from o.
@@ -113,7 +114,8 @@ func New(o Options) *Daemon {
 		addrSkip: map[string]time.Time{},
 		sendMu:   map[string]*sync.Mutex{},
 		flushing: map[string]bool{},
-		flushNow: make(chan string, 16),
+		dirty:    map[string]time.Time{},
+		kick:     make(chan struct{}, 1),
 	}
 }
 
