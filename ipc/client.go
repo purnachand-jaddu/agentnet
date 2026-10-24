@@ -24,14 +24,14 @@ type wireMsg struct {
 
 // Client is one connection to the daemon.
 type Client struct {
-	nc        net.Conn
-	writeMu   sync.Mutex // serializes writes so concurrent Calls don't interleave mid-line
-	mu        sync.Mutex
-	pending   map[uint64]chan Reply
-	nextID    atomic.Uint64
-	events    chan Event
-	closed    chan struct{}
-	closeOnce sync.Once
+	nc         net.Conn
+	writeMu    sync.Mutex // serializes writes so concurrent Calls don't interleave mid-line
+	mu         sync.Mutex
+	pending    map[uint64]chan Reply
+	nextID     atomic.Uint64
+	events     chan Event
+	closed     chan struct{}
+	closedOnce sync.Once // guards close(c.closed), which both Close and readLoop may reach
 }
 
 // Dial connects to the daemon's socket and starts routing replies and pushed events.
@@ -107,19 +107,17 @@ func (c *Client) Events() <-chan Event { return c.events }
 // Close tears down the connection; pending Calls then error and Events() closes.
 func (c *Client) Close() error {
 	err := c.nc.Close()
-	c.shutdown()
+	c.closedOnce.Do(func() { close(c.closed) })
 	return err
 }
 
-func (c *Client) shutdown() {
-	c.closeOnce.Do(func() {
-		close(c.closed)
-		close(c.events)
-	})
-}
-
 func (c *Client) readLoop() {
-	defer c.shutdown()
+	// Only this goroutine ever sends on c.events (via deliver), so only it may close it —
+	// closing from Close() too would race a concurrent deliver() and panic.
+	defer func() {
+		c.closedOnce.Do(func() { close(c.closed) })
+		close(c.events)
+	}()
 	sc := bufio.NewScanner(c.nc)
 	sc.Buffer(make([]byte, 4096), maxLine)
 	for sc.Scan() {

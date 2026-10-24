@@ -90,14 +90,22 @@ func (c *conn) writeLoop() {
 
 // Serve accepts connections on l until ctx is cancelled (which closes l) or Accept fails, running h for every request and calling onClose exactly once per connection.
 func Serve(ctx context.Context, l net.Listener, h Handler, onClose func(Conn)) error {
+	stop := make(chan struct{})
+	defer close(stop) // let the watcher below exit even when Serve returns for a reason other than ctx
 	go func() {
-		<-ctx.Done()
-		l.Close()
+		select {
+		case <-ctx.Done():
+			l.Close()
+		case <-stop:
+		}
 	}()
 	var nextID atomic.Uint64
 	for {
 		nc, err := l.Accept()
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return err
 		}
 		c := newConn(nextID.Add(1), nc)
@@ -106,6 +114,7 @@ func Serve(ctx context.Context, l net.Listener, h Handler, onClose func(Conn)) e
 }
 
 func serveConn(ctx context.Context, c *conn, h Handler, onClose func(Conn)) {
+	connCtx, cancel := context.WithCancel(ctx)
 	go c.writeLoop()
 	defer func() {
 		c.close()
@@ -122,9 +131,10 @@ func serveConn(ctx context.Context, c *conn, h Handler, onClose func(Conn)) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			handleLine(ctx, c, h, line)
+			handleLine(connCtx, c, h, line)
 		}()
 	}
+	cancel() // the client is gone; unblock any handler (e.g. a long-poll) waiting on ctx.Done() before we wait on it
 	wg.Wait()
 }
 
@@ -134,7 +144,7 @@ func handleLine(ctx context.Context, c *conn, h Handler, line []byte) {
 		reply(c, Reply{ID: 0, OK: false, Error: err.Error()})
 		return
 	}
-	result, err := h(ctx, c, req.Op, req.Args)
+	result, err := invokeHandler(ctx, c, h, req.Op, req.Args)
 	if err != nil {
 		reply(c, Reply{ID: req.ID, OK: false, Error: err.Error()})
 		return
@@ -149,6 +159,16 @@ func handleLine(ctx context.Context, c *conn, h Handler, line []byte) {
 		raw = b
 	}
 	reply(c, Reply{ID: req.ID, OK: true, Result: raw})
+}
+
+// invokeHandler runs h, turning a panic into an error so one bad handler can't take down the daemon.
+func invokeHandler(ctx context.Context, c *conn, h Handler, op string, args json.RawMessage) (result any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("internal error: %v", r)
+		}
+	}()
+	return h(ctx, c, op, args)
 }
 
 func reply(c *conn, r Reply) {
