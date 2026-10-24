@@ -63,19 +63,47 @@ func TestDialogGaveUp(t *testing.T) {
 	}
 }
 
-// fakeExitError mimics *exec.ExitError's ExitCode() for the cancel-button case.
+// fakeExitError mimics *exec.ExitError's ExitCode() for a failed osascript run.
 type fakeExitError struct{ code int }
 
 func (e fakeExitError) Error() string { return "exit status" }
 func (e fakeExitError) ExitCode() int { return e.code }
 
+// osascriptFails returns a runner that exits 1 printing stderr, as osascript does for every AppleScript error.
+func osascriptFails(stderr string) func(context.Context, string, ...string) ([]byte, error) {
+	return func(context.Context, string, ...string) ([]byte, error) {
+		return []byte(stderr), fakeExitError{code: 1}
+	}
+}
+
 func TestDialogCancelIsNotAnError(t *testing.T) {
-	d := Dialog{Run: func(context.Context, string, ...string) ([]byte, error) {
-		return nil, fakeExitError{code: 1}
-	}}
+	d := Dialog{Run: osascriptFails("0:153: execution error: User canceled. (-128)\n")}
 	ok, err := d.Confirm(context.Background(), "t", "d")
 	if ok || err != nil {
 		t.Fatalf("cancel should be (false, nil), got (%v, %v)", ok, err)
+	}
+	if got, err := d.Choose(context.Background(), "t", "d", []string{"a"}); got != "" || err != nil {
+		t.Fatalf("cancelled choose: got %q, %v", got, err)
+	}
+}
+
+// With no GUI session (e.g. over SSH) osascript fails with -1713: that is "no person to ask", not a denial.
+func TestDialogNoGUIIsNoHuman(t *testing.T) {
+	d := Dialog{Run: osascriptFails("0:153: execution error: No user interaction allowed. (-1713)\n")}
+	if ok, err := d.Confirm(context.Background(), "t", "d"); ok || !errors.Is(err, ErrNoHuman) {
+		t.Fatalf("Confirm = %v, %v; want false, ErrNoHuman", ok, err)
+	}
+	if _, err := d.Choose(context.Background(), "t", "d", []string{"a"}); !errors.Is(err, ErrNoHuman) {
+		t.Fatalf("Choose err = %v, want ErrNoHuman", err)
+	}
+}
+
+// Any other AppleScript error is reported with osascript's own message, never read as a denial.
+func TestDialogOtherAppleScriptErrorCarriesStderr(t *testing.T) {
+	d := Dialog{Run: osascriptFails("0:10: syntax error: Expected end of line. (-2741)\n")}
+	ok, err := d.Confirm(context.Background(), "t", "d")
+	if ok || err == nil || !strings.Contains(err.Error(), "Expected end of line. (-2741)") {
+		t.Fatalf("Confirm = %v, %v; want an error carrying stderr", ok, err)
 	}
 }
 

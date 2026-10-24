@@ -2,7 +2,7 @@ package consent
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"os/exec"
 	"strings"
 )
@@ -12,8 +12,17 @@ type Dialog struct {
 	Run func(ctx context.Context, name string, args ...string) ([]byte, error)
 }
 
-// exitCoder matches *exec.ExitError: osascript exits 1 when the person cancels.
-type exitCoder interface{ ExitCode() int }
+// osascriptErr maps a failed osascript run: cancel (-128) is nil, no GUI session (-1713) is ErrNoHuman, else an error with its output.
+func osascriptErr(out []byte, err error) error {
+	msg := strings.TrimSpace(string(out))
+	switch {
+	case strings.Contains(msg, "(-128)"):
+		return nil
+	case strings.Contains(msg, "(-1713)"):
+		return ErrNoHuman
+	}
+	return fmt.Errorf("osascript: %w: %s", err, msg)
+}
 
 // runOsascript is Dialog's real runner, shelling out to osascript.
 func runOsascript(ctx context.Context, name string, args ...string) ([]byte, error) {
@@ -32,11 +41,7 @@ func (d Dialog) Confirm(ctx context.Context, title, detail string) (bool, error)
 		`" buttons {"Deny", "Approve"} default button "Deny" cancel button "Deny" giving up after 300 with icon caution`
 	out, err := d.Run(ctx, "osascript", "-e", script)
 	if err != nil {
-		var ec exitCoder
-		if errors.As(err, &ec) && ec.ExitCode() == 1 {
-			return false, nil // cancel button
-		}
-		return false, err
+		return false, osascriptErr(out, err)
 	}
 	s := string(out)
 	return strings.Contains(s, "button returned:Approve") && !strings.Contains(s, "gave up:true"), nil
@@ -52,11 +57,7 @@ func (d Dialog) Choose(ctx context.Context, title, detail string, options []stri
 		`" with prompt "` + escapeAppleScript(detail) + `"`
 	out, err := d.Run(ctx, "osascript", "-e", script)
 	if err != nil {
-		var ec exitCoder
-		if errors.As(err, &ec) && ec.ExitCode() == 1 {
-			return "", nil // cancel button
-		}
-		return "", err
+		return "", osascriptErr(out, err)
 	}
 	choice := strings.TrimSpace(string(out))
 	for _, o := range options {
