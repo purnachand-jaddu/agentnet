@@ -21,14 +21,13 @@ const (
 
 // peer is one remote member machine as this daemon knows it.
 type peer struct {
-	cert      identity.Cert // from its latest presence
-	sessions  []WhoEntry    // its local sessions; Address is the bare session name
-	verified  []string      // from its own signed presence, or an address that produced its signed ack
-	hints     []string      // unverified, from discovery
-	lastSeen  time.Time     // when its latest presence arrived
-	lastTS    int64         // its latest presence timestamp (unix ms); older ones are ignored
-	skew      time.Duration // now minus its presence timestamp, for doctor
-	skipUntil time.Time     // set from its Retry-After
+	cert     identity.Cert // from its latest presence
+	sessions []WhoEntry    // its local sessions; Address is the bare session name
+	verified []string      // from its own signed presence, or an address that produced its signed ack
+	hints    []string      // unverified, from discovery
+	lastSeen time.Time     // when its latest presence arrived
+	lastTS   int64         // its latest presence timestamp (unix ms); older ones are ignored
+	skew     time.Duration // now minus its presence timestamp, for doctor
 }
 
 // peerKey is a machine key as the peers map key.
@@ -83,19 +82,19 @@ func (d *Daemon) found(f discovery.Found) {
 	}
 }
 
-// applyPresence replaces from's directory entries and verified addresses, unless p is older than what we have.
+// applyPresence marks from alive as of now, and replaces its directory entries and verified addresses unless p is older.
 func (d *Daemon) applyPresence(from identity.Cert, p presence, now time.Time) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	pr := d.peerFor(peerKey(from.Key))
-	if p.TS <= pr.lastTS {
-		return
-	}
 	if !d.online(pr, now) {
 		d.netDirty = true // it just (re)appeared: tell it about us now
 	}
-	pr.cert = from
-	pr.lastTS, pr.lastSeen, pr.skew = p.TS, now, now.Sub(time.UnixMilli(p.TS))
+	pr.cert, pr.lastSeen, pr.skew = from, now, now.Sub(time.UnixMilli(p.TS))
+	if p.TS <= pr.lastTS {
+		return // an older snapshot (e.g. its clock stepped back) still proves liveness
+	}
+	pr.lastTS = p.TS
 	pr.sessions = cleanSessions(p.Sessions)
 	pr.verified = cleanAddrs(p.Addrs)
 	pr.hints = slices.DeleteFunc(pr.hints, func(a string) bool { return slices.Contains(pr.verified, a) })
@@ -134,21 +133,32 @@ func cleanAddrs(in []string) []string {
 	return out
 }
 
-// addrsFor returns where to reach key: verified addresses, then hints and static peers; skip while it asked us to wait.
-func (d *Daemon) addrsFor(key string, now time.Time) (verified, fallback []string, skip bool) {
+// addrsFor returns where to reach key: verified addresses, then hints and static peers, minus endpoints backing off.
+func (d *Daemon) addrsFor(key string, now time.Time) (verified, fallback []string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	p := d.peerFor(key)
-	if now.Before(p.skipUntil) {
-		return nil, nil, true
+	for _, a := range p.verified {
+		if d.usable(a, now) {
+			verified = append(verified, a)
+		}
 	}
-	verified = slices.Clone(p.verified)
 	for _, a := range append(slices.Clone(p.hints), d.statics...) {
-		if !slices.Contains(verified, a) && !slices.Contains(fallback, a) {
+		if d.usable(a, now) && !slices.Contains(p.verified, a) && !slices.Contains(fallback, a) {
 			fallback = append(fallback, a)
 		}
 	}
-	return verified, fallback, false
+	return verified, fallback
+}
+
+// usable reports whether addr isn't backing off, forgetting expired backoffs. Caller holds mu.
+func (d *Daemon) usable(addr string, now time.Time) bool {
+	until, ok := d.addrSkip[addr]
+	if ok && !now.Before(until) {
+		delete(d.addrSkip, addr)
+		ok = false
+	}
+	return !ok
 }
 
 // markVerified records that addr produced key's signed ack.
@@ -162,11 +172,11 @@ func (d *Daemon) markVerified(key, addr string) {
 	p.hints = slices.DeleteFunc(p.hints, func(a string) bool { return a == addr })
 }
 
-// backoff skips key for after (clamped to maxRetryAfter).
-func (d *Daemon) backoff(key string, after time.Duration) {
+// backoff skips the endpoint addr for after (clamped to maxRetryAfter); other addresses of the same machine are unaffected.
+func (d *Daemon) backoff(addr string, after time.Duration) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.peerFor(key).skipUntil = d.opts.Now().Add(min(after, maxRetryAfter))
+	d.addrSkip[addr] = d.opts.Now().Add(min(after, maxRetryAfter))
 }
 
 // remoteWho lists remote sessions as person/session, adding @machine where that person has the name on two machines.

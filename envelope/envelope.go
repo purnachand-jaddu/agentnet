@@ -20,6 +20,14 @@ import (
 // maxSealed is the largest Sealed payload Open accepts.
 const maxSealed = 1 << 20
 
+// Public refusal reasons Open's errors wrap; errors.Is them to tell a caller why without detail.
+var (
+	ErrNotMember    = errors.New("not a member")
+	ErrBadSignature = errors.New("bad signature")
+	ErrStale        = errors.New("stale or replayed")
+	ErrMalformed    = errors.New("malformed")
+)
+
 // Envelope is a signed, HPKE-sealed message between two machines.
 type Envelope struct {
 	V      int           `json:"v"`
@@ -106,38 +114,42 @@ type Verifier struct {
 // Open checks cert, signature, recipient, time window and replay, then decrypts.
 func (v Verifier) Open(e Envelope, self identity.Keys, s seal.Sealer) ([]byte, error) {
 	if e.V != 1 {
-		return nil, fmt.Errorf("envelope: unsupported version %d", e.V)
+		return nil, fmt.Errorf("envelope: unsupported version %d: %w", e.V, ErrMalformed)
 	}
 	if e.Kind != "msg" && e.Kind != "presence" {
-		return nil, fmt.Errorf("envelope: unknown kind %q", e.Kind)
+		return nil, fmt.Errorf("envelope: unknown kind %q: %w", e.Kind, ErrMalformed)
 	}
 	if len(e.Sealed) > maxSealed {
-		return nil, fmt.Errorf("envelope: sealed payload too large (%d bytes)", len(e.Sealed))
+		return nil, fmt.Errorf("envelope: sealed payload too large (%d bytes): %w", len(e.Sealed), ErrMalformed)
 	}
 	if err := v.Team.Verify(e.Cert, v.Now()); err != nil {
-		return nil, fmt.Errorf("envelope: sender cert: %w", err)
+		return nil, fmt.Errorf("envelope: sender cert: %w: %w", ErrNotMember, err)
 	}
 	if len(e.Cert.Key) != ed25519.PublicKeySize {
-		return nil, fmt.Errorf("envelope: bad sender key length %d", len(e.Cert.Key))
+		return nil, fmt.Errorf("envelope: bad sender key length %d: %w", len(e.Cert.Key), ErrMalformed)
 	}
 	if !ed25519.Verify(e.Cert.Key, envelopeSignBytes(e), e.Sig) {
-		return nil, errors.New("envelope: bad signature")
+		return nil, fmt.Errorf("envelope: %w", ErrBadSignature)
 	}
 	if !bytes.Equal(e.To, self.Public()) {
-		return nil, errors.New("envelope: not for this machine")
+		return nil, fmt.Errorf("envelope: not for this machine: %w", ErrMalformed)
 	}
 	now := v.Now()
 	if d := now.Sub(time.UnixMilli(e.TS)); d > v.Window || d < -v.Window {
-		return nil, errors.New("envelope: too old or from the future; check clocks")
+		return nil, fmt.Errorf("envelope: too old or from the future; check clocks: %w", ErrStale)
 	}
 	if !message.ValidID(e.ID) {
-		return nil, fmt.Errorf("envelope: bad id %q", e.ID)
+		return nil, fmt.Errorf("envelope: bad id %q: %w", e.ID, ErrMalformed)
 	}
 	replayKey := base64.RawURLEncoding.EncodeToString(e.Cert.Key) + "/" + e.ID
 	if !v.Replay.Check(replayKey, now) {
-		return nil, errors.New("envelope: replayed")
+		return nil, fmt.Errorf("envelope: replayed: %w", ErrStale)
 	}
-	return s.Open(self.Enc, sealInfo(e.Kind, e.ID, e.Cert.Key, self.Public()), e.Sealed)
+	plain, err := s.Open(self.Enc, sealInfo(e.Kind, e.ID, e.Cert.Key, self.Public()), e.Sealed)
+	if err != nil {
+		return nil, fmt.Errorf("envelope: open: %w: %w", ErrMalformed, err)
+	}
+	return plain, nil
 }
 
 // ackSignBytes is what the receiver signs and the verifier checks, with a.Sig cleared.

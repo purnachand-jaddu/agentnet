@@ -19,6 +19,9 @@ import (
 	"github.com/purnachand-jaddu/agentnet/transport"
 )
 
+// maxTSMismatch is how far a presence payload's TS may differ from its envelope's.
+const maxTSMismatch = 5 * time.Second
+
 // sendTimeout bounds one presence send to one member across all its addresses; verified ones get the first half.
 const sendTimeout = 5 * time.Second
 
@@ -108,6 +111,7 @@ func (d *Daemon) gossip(ctx context.Context) {
 		dirty := d.netDirty
 		d.netDirty = false
 		d.mu.Unlock()
+		d.persistTeam()
 		if now := d.opts.Now(); dirty || !bytes.Equal(snap, lastSnap) || now.Sub(lastSent) >= d.opts.PresenceEvery {
 			lastSnap, lastSent = snap, now
 			d.broadcast(ctx, sessions)
@@ -150,8 +154,8 @@ func (d *Daemon) broadcast(ctx context.Context, sessions []WhoEntry) {
 func (d *Daemon) sendPresence(ctx context.Context, to identity.Cert, payload []byte) {
 	key := peerKey(to.Key)
 	now := d.opts.Now()
-	verified, fallback, skip := d.addrsFor(key, now)
-	if skip || len(verified)+len(fallback) == 0 {
+	verified, fallback := d.addrsFor(key, now)
+	if len(verified)+len(fallback) == 0 {
 		return
 	}
 	e, err := envelope.Build("presence", message.NewID(), d.opts.Keys, d.opts.Team.Self, to, payload, d.opts.Sealer, now)
@@ -162,10 +166,10 @@ func (d *Daemon) sendPresence(ctx context.Context, to identity.Cert, payload []b
 	ctx, cancel := context.WithTimeout(ctx, sendTimeout)
 	defer cancel()
 	first, cancelFirst := context.WithTimeout(ctx, sendTimeout/2)
-	addr, ok := d.race(first, key, to, e, verified)
+	addr, ok := d.race(first, to, e, verified)
 	cancelFirst()
 	if !ok {
-		addr, ok = d.race(ctx, key, to, e, fallback)
+		addr, ok = d.race(ctx, to, e, fallback)
 	}
 	if ok {
 		d.markVerified(key, addr)
@@ -173,7 +177,7 @@ func (d *Daemon) sendPresence(ctx context.Context, to identity.Cert, payload []b
 }
 
 // race sends e to every addr at once and returns the first address whose reply is to's signed "delivered" ack.
-func (d *Daemon) race(ctx context.Context, key string, to identity.Cert, e envelope.Envelope, addrs []string) (string, bool) {
+func (d *Daemon) race(ctx context.Context, to identity.Cert, e envelope.Envelope, addrs []string) (string, bool) {
 	if len(addrs) == 0 {
 		return "", false
 	}
@@ -189,7 +193,7 @@ func (d *Daemon) race(ctx context.Context, key string, to identity.Cert, e envel
 			var ra *transport.RetryAfterError
 			switch {
 			case errors.As(err, &ra):
-				d.backoff(key, ra.After)
+				d.backoff(a, ra.After)
 			case err != nil:
 			case ack.State == message.StateDelivered && envelope.VerifyAck(ack, to, e.ID) == nil:
 				won <- a
@@ -224,7 +228,8 @@ func (d *Daemon) handleEnvelope(_ context.Context, e envelope.Envelope) envelope
 	switch e.Kind {
 	case "presence":
 		if err := d.receivePresence(e); err != nil {
-			ack.State, ack.Note = message.StateRefused, err.Error()
+			d.opts.Log("daemon: refused presence from %s: %v", e.Cert.Machine, err)
+			ack.State, ack.Note = message.StateRefused, publicReason(err)
 		}
 	default: // "msg" arrives with verified receive
 		ack.State, ack.Note = message.StateRefused, "not yet supported"
@@ -241,17 +246,40 @@ func (d *Daemon) receivePresence(e envelope.Envelope) error {
 	}
 	var p presence
 	if err := json.Unmarshal(plain, &p); err != nil {
-		return fmt.Errorf("presence: %w", err)
+		return fmt.Errorf("presence: %v: %w", err, envelope.ErrMalformed)
+	}
+	if diff := time.Duration(p.TS-e.TS) * time.Millisecond; diff > maxTSMismatch || diff < -maxTSMismatch {
+		return fmt.Errorf("presence: payload ts %d vs envelope ts %d: %w", p.TS, e.TS, envelope.ErrMalformed)
 	}
 	now := d.opts.Now()
 	if d.opts.Team.Merge(append(p.Certs, e.Cert), p.Blocks, now) {
-		if err := d.opts.Team.Persist(d.opts.Store); err != nil {
-			d.opts.Log("daemon: persist team: %v", err)
-		}
+		d.unsaved.Store(true)
 	}
+	d.persistTeam()
 	if err := d.opts.Team.Verify(e.Cert, now); err != nil { // its own presence may carry its block
-		return err
+		return fmt.Errorf("presence: %w: %w", envelope.ErrNotMember, err)
 	}
 	d.applyPresence(e.Cert, p, now)
 	return nil
+}
+
+// persistTeam saves the team if a merged change hasn't reached the store yet; a failure stays pending for the next call.
+func (d *Daemon) persistTeam() {
+	if !d.unsaved.Swap(false) {
+		return
+	}
+	if err := d.opts.Team.Persist(d.opts.Store); err != nil {
+		d.unsaved.Store(true)
+		d.opts.Log("daemon: persist team (will retry): %v", err)
+	}
+}
+
+// publicReason maps a refusal to the stable reason told to the caller; the detail is only logged.
+func publicReason(err error) string {
+	for _, r := range []error{envelope.ErrNotMember, envelope.ErrBadSignature, envelope.ErrStale, envelope.ErrMalformed} {
+		if errors.Is(err, r) {
+			return r.Error()
+		}
+	}
+	return envelope.ErrMalformed.Error()
 }

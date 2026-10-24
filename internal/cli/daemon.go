@@ -187,7 +187,7 @@ func newDaemon(logger *log.Logger, service bool) (*daemon.Daemon, io.Closer, err
 		return nil, nil, err
 	}
 	o := daemon.Options{
-		Person: cfg.Person, Machine: cfg.Machine, Store: st, Adapters: adapters(),
+		Person: cfg.Person, Machine: cfg.Machine, Store: st, Adapters: adapters(), Config: cfg,
 		FolderAllowed: folderAllowed(paths.Config()), Now: time.Now, Service: service,
 		Log: func(format string, args ...any) { logger.Printf(format, args...) },
 	}

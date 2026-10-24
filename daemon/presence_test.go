@@ -7,7 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -264,5 +267,174 @@ func TestNotInNetworkNeverListens(t *testing.T) {
 				t.Fatalf("Listen calls = %d, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+// flakyStore fails Put while fail is set, standing in for a transient storage error.
+type flakyStore struct {
+	store.Store
+	fail atomic.Bool
+}
+
+func (s *flakyStore) Put(ns, key string, val []byte) error {
+	if s.fail.Load() {
+		return fmt.Errorf("disk full")
+	}
+	return s.Store.Put(ns, key, val)
+}
+
+func TestFailedPersistIsRetried(t *testing.T) {
+	f := newTeamFixture(t)
+	now := time.Now()
+	fs := &flakyStore{Store: f.bStore}
+	b := newNetDaemon(t, "sam", "xps", fs, f.bTeam, f.bKeys, 0)
+
+	dKeys, _ := identity.GenerateKeys()
+	dBundle, err := team.Admit(f.aStore, f.fpriv, team.NewRequest(dKeys, "pat", "tp"), false, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	send := func() envelope.Ack {
+		ts := time.Now()
+		payload, _ := json.Marshal(presence{Certs: []identity.Cert{dBundle.Cert}, TS: ts.UnixMilli()})
+		env, _ := envelope.Build("presence", message.NewID(), f.aKeys, f.aTeam.Self, f.bTeam.Self, payload, seal.HPKE{}, ts)
+		return b.handleEnvelope(context.Background(), env)
+	}
+	persisted := func() bool {
+		st, _ := team.Load(f.bStore)
+		_, ok := st.CertFor(dKeys.Public())
+		return ok
+	}
+
+	fs.fail.Store(true)
+	if ack := send(); ack.State != message.StateDelivered {
+		t.Fatalf("ack %+v", ack)
+	}
+	if persisted() {
+		t.Fatal("persisted despite failing store")
+	}
+	fs.fail.Store(false)
+	send() // same certs: Merge reports no change, but the pending save must still happen
+	if !persisted() {
+		t.Fatal("pending team change never persisted after the store recovered")
+	}
+}
+
+func TestRetryAfterFromHintDoesNotSilenceMember(t *testing.T) {
+	f := newTeamFixture(t)
+	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "300")
+		http.Error(w, "slow down", http.StatusTooManyRequests)
+	}))
+	t.Cleanup(evil.Close)
+	evilAddr := "lan://" + strings.TrimPrefix(evil.URL, "http://")
+	// A's first send races the 429 endpoint against B's real address in the same phase.
+
+	pa, pb := freePort(t), freePort(t)
+	a := newNetDaemon(t, "alex", "mbp", f.aStore, f.aTeam, f.aKeys, pa, evilAddr, lanAddr(pb))
+	b := newNetDaemon(t, "sam", "xps", f.bStore, f.bTeam, f.bKeys, pb) // B learns A only from A's presence
+	register(t, a, &fakeConn{id: 1}, "codex", "a1", "/tmp/alpha", false)
+	runDaemon(t, b)
+	runDaemon(t, a)
+	waitUntil(t, 5*time.Second, "B sees A", func() bool { return statusOf(b, "alex/alpha-codex") == "idle" })
+
+	register(t, a, &fakeConn{id: 2}, "codex", "a2", "/tmp/gamma", false)
+	waitUntil(t, 5*time.Second, "B sees A's new session despite the 429 endpoint", func() bool {
+		return statusOf(b, "alex/gamma-codex") == "idle"
+	})
+}
+
+// fakeClock is a settable clock for daemon tests.
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *fakeClock) Now() time.Time  { c.mu.Lock(); defer c.mu.Unlock(); return c.now }
+func (c *fakeClock) Set(t time.Time) { c.mu.Lock(); c.now = t; c.mu.Unlock() }
+
+// presenceFrom builds A's presence to B with envelope time envTS and payload TS payTS, listing sessions.
+func presenceFrom(t *testing.T, f teamFixture, envTS, payTS time.Time, sessions ...string) envelope.Envelope {
+	t.Helper()
+	var es []WhoEntry
+	for _, s := range sessions {
+		es = append(es, WhoEntry{Address: "alex/" + s, Agent: "codex", Status: "idle"})
+	}
+	payload, _ := json.Marshal(presence{Sessions: es, TS: payTS.UnixMilli()})
+	env, err := envelope.Build("presence", message.NewID(), f.aKeys, f.aTeam.Self, f.bTeam.Self, payload, seal.HPKE{}, envTS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return env
+}
+
+func TestBackwardClockKeepsLivenessNotSnapshot(t *testing.T) {
+	f := newTeamFixture(t)
+	t0 := time.Now()
+	clk := &fakeClock{now: t0}
+	b := newNetDaemon(t, "sam", "xps", f.bStore, f.bTeam, f.bKeys, 0)
+	b.opts.Now, b.verifier.Now, b.opts.OfflineAfter = clk.Now, clk.Now, 3*time.Minute
+
+	if ack := b.handleEnvelope(context.Background(), presenceFrom(t, f, t0, t0, "old")); ack.State != message.StateDelivered {
+		t.Fatalf("first: %+v", ack)
+	}
+	// Two minutes later A's clock has stepped back 3 minutes: an older snapshot, but proof A is alive.
+	clk.Set(t0.Add(2 * time.Minute))
+	back := t0.Add(-time.Minute)
+	if ack := b.handleEnvelope(context.Background(), presenceFrom(t, f, back, back, "new")); ack.State != message.StateDelivered {
+		t.Fatalf("second: %+v", ack)
+	}
+	clk.Set(t0.Add(4 * time.Minute))
+	if got := statusOf(b, "alex/old"); got != "idle" {
+		t.Fatalf("alex/old status = %q, want idle (liveness from receipt, newer snapshot kept)", got)
+	}
+	if got := statusOf(b, "alex/new"); got != "" {
+		t.Fatalf("older snapshot replaced the directory: alex/new = %q", got)
+	}
+}
+
+func TestMismatchedPayloadTimestampRefused(t *testing.T) {
+	f := newTeamFixture(t)
+	b := newNetDaemon(t, "sam", "xps", f.bStore, f.bTeam, f.bKeys, 0)
+	now := time.Now()
+	ack := b.handleEnvelope(context.Background(), presenceFrom(t, f, now, now.Add(time.Hour), "pinned"))
+	if ack.State != message.StateRefused || ack.Note != "malformed" {
+		t.Fatalf("ack %+v, want refused/malformed", ack)
+	}
+	if statusOf(b, "alex/pinned") != "" {
+		t.Fatal("mismatched presence reached the directory")
+	}
+	// A correct one afterwards is applied, so nothing was pinned.
+	if ack := b.handleEnvelope(context.Background(), presenceFrom(t, f, now, now, "ok")); ack.State != message.StateDelivered {
+		t.Fatalf("ack %+v", ack)
+	}
+	if statusOf(b, "alex/ok") != "idle" {
+		t.Fatal("valid presence not applied")
+	}
+}
+
+func TestRefusalNotesArePublicReasons(t *testing.T) {
+	f := newTeamFixture(t)
+	b := newNetDaemon(t, "sam", "xps", f.bStore, f.bTeam, f.bKeys, 0)
+	now := time.Now()
+
+	env := presenceFrom(t, f, now, now, "x")
+	if ack := b.handleEnvelope(context.Background(), env); ack.State != message.StateDelivered {
+		t.Fatalf("ack %+v", ack)
+	}
+	if ack := b.handleEnvelope(context.Background(), env); ack.Note != "stale or replayed" {
+		t.Fatalf("replay note = %q", ack.Note)
+	}
+	bad := presenceFrom(t, f, now, now, "x")
+	bad.Sig[0] ^= 1
+	if ack := b.handleEnvelope(context.Background(), bad); ack.Note != "bad signature" {
+		t.Fatalf("bad sig note = %q", ack.Note)
+	}
+	_, epriv, _ := ed25519.GenerateKey(rand.Reader)
+	eKeys, _ := identity.GenerateKeys()
+	eTeam, _ := team.Create(storetest.SQLite(t), eKeys, epriv, "eve", "evil", now)
+	foreign, _ := envelope.Build("presence", message.NewID(), eKeys, eTeam.Self, f.bTeam.Self, []byte("{}"), seal.HPKE{}, now)
+	if ack := b.handleEnvelope(context.Background(), foreign); ack.Note != "not a member" {
+		t.Fatalf("non-member note = %q", ack.Note)
 	}
 }

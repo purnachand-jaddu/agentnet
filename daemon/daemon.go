@@ -5,9 +5,11 @@ import (
 	"cmp"
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/purnachand-jaddu/agentnet/adapter"
+	"github.com/purnachand-jaddu/agentnet/config"
 	"github.com/purnachand-jaddu/agentnet/discovery"
 	"github.com/purnachand-jaddu/agentnet/envelope"
 	"github.com/purnachand-jaddu/agentnet/identity"
@@ -35,6 +37,7 @@ type Options struct {
 	Now             func() time.Time
 	Log             func(format string, args ...any)
 	Service         bool // true when this process was started as the background service (--service)
+	Config          config.Config
 
 	Team          *team.State // nil when not in a network: no networking at all
 	Keys          identity.Keys
@@ -66,11 +69,13 @@ type Daemon struct {
 	gitCache map[string]gitInfo
 
 	verifier envelope.Verifier
-	peers    map[string]*peer // remote member machines, keyed by peerKey; guarded by mu
-	statics  []string         // keyless discovery hints (static peers); guarded by mu
-	myAddrs  []string         // this machine's transport addresses; guarded by mu
-	netDirty bool             // something changed that warrants sending presence now; guarded by mu
-	netWG    sync.WaitGroup   // network goroutines Run waits for
+	peers    map[string]*peer     // remote member machines, keyed by peerKey; guarded by mu
+	statics  []string             // keyless discovery hints (static peers); guarded by mu
+	myAddrs  []string             // this machine's transport addresses; guarded by mu
+	netDirty bool                 // something changed that warrants sending presence now; guarded by mu
+	addrSkip map[string]time.Time // endpoints that asked us to wait, until when; guarded by mu
+	unsaved  atomic.Bool          // a merged team change hasn't reached the store yet
+	netWG    sync.WaitGroup       // network goroutines Run waits for
 }
 
 // New builds a Daemon from o.
@@ -96,6 +101,7 @@ func New(o Options) *Daemon {
 		gitCache: map[string]gitInfo{},
 		verifier: envelope.Verifier{Team: o.Team, Replay: envelope.NewReplay(2 * o.Window), Now: o.Now, Window: o.Window},
 		peers:    map[string]*peer{},
+		addrSkip: map[string]time.Time{},
 	}
 }
 
