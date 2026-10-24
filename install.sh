@@ -95,6 +95,11 @@ main() {
 	rm -rf "$tmp_dir"
 	trap - EXIT
 
+	if [ $# -eq 0 ]; then
+		echo "install.sh: installed $bin_dir/agentnet; run \`agentnet up\` to create or join a network" >&2
+		exit 0
+	fi
+
 	# An openable /dev/tty lets `curl ... | sh -s -- up` still prompt for consent even though stdin
 	# is the pipe. `-r` can be true with no controlling terminal to back it, so open it for real in
 	# a subshell first rather than trusting the permission bit alone.

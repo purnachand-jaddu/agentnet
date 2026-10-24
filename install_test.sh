@@ -189,6 +189,25 @@ set -e
 if [ "$status" -ne 0 ]; then pass "gh-verify-fail: install.sh aborted"; else fail_test "gh-verify-fail: install.sh exited 0"; fi
 if [ ! -e "$bin5/agentnet" ]; then pass "gh-verify-fail: nothing installed"; else fail_test "gh-verify-fail: binary was installed anyway"; fi
 
+# --- no args (plain `curl ... | sh`): installs and exits 0 without running the bare binary.
+rel6="$work/rel6"
+bin6="$work/bin6"
+fake6="$work/fake6"
+tmp6="$work/tmp6"
+mkdir -p "$rel6" "$bin6" "$fake6" "$tmp6"
+make_release "$rel6"
+fake_gh "$fake6" 0 0
+set +e
+out=$(run_installer "$rel6" "$bin6" "$fake6" "$tmp6")
+status=$?
+set -e
+if [ "$status" -eq 0 ]; then pass "no-args: install.sh exited 0"; else fail_test "no-args: install.sh exited $status"; fi
+if [ -x "$bin6/agentnet" ]; then pass "no-args: binary installed"; else fail_test "no-args: binary not installed"; fi
+case "$out" in
+	*"agentnet-dummy"*) fail_test "no-args: ran the bare binary: $out" ;;
+	*) pass "no-args: did not run the binary" ;;
+esac
+
 if [ "$fail" -ne 0 ]; then
 	echo "install_test.sh: FAILED" >&2
 	exit 1
