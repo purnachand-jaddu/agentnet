@@ -34,6 +34,22 @@ func TestReturningSessionGetsItsNameBack(t *testing.T) {
 	}
 }
 
+// TestHookRegisterClearsInboxFromOtherSessionsOfSameAgent checks that only the most recent key
+// claiming an inbox socket keeps it: a stale pre-/clear hook can't re-arm direct posts into it.
+func TestHookRegisterClearsInboxFromOtherSessionsOfSameAgent(t *testing.T) {
+	d := newTestDaemon(t, codexFake(adapter.ChannelHook))
+	call[Registered](t, d, &fakeConn{id: 1}, "register", RegisterArgs{Session: adapter.Session{Key: "codex:x1", Agent: "codex", ID: "x1", Cwd: "/src/web", Inbox: "/tmp/sock"}, Hook: true})
+	call[Registered](t, d, &fakeConn{id: 2}, "register", RegisterArgs{Session: adapter.Session{Key: "codex:x2", Agent: "codex", ID: "x2", Cwd: "/src/web2", Inbox: "/tmp/sock"}, Hook: true})
+
+	d.mu.Lock()
+	inbox1 := d.live["codex:x1"].s.Inbox
+	inbox2 := d.live["codex:x2"].s.Inbox
+	d.mu.Unlock()
+	if inbox1 != "" || inbox2 != "/tmp/sock" {
+		t.Fatalf("expected only the latest key to hold the inbox, got x1=%q x2=%q", inbox1, inbox2)
+	}
+}
+
 func TestMCPAttachesToHookSessionByPID(t *testing.T) {
 	d := newTestDaemon(t, claudeFake(adapter.ChannelPull))
 	call[Registered](t, d, &fakeConn{id: 1}, "register", RegisterArgs{Session: adapter.Session{Key: "claude-code:c1", Agent: "claude-code", ID: "c1", Cwd: "/src/api", PID: 4242}, Hook: true})

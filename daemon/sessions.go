@@ -174,6 +174,16 @@ func (d *Daemon) register(c ipc.Conn, a RegisterArgs) (Registered, error) {
 		l.hookSeen = true
 		l.lastHook = d.opts.Now()
 	}
+	// One inbox socket serves one session at a time: a stale pre-/clear hook must not stay armed
+	// to push into a socket that now belongs to a different conversation.
+	if a.Hook && a.Session.Inbox != "" {
+		for k, other := range d.live {
+			if k != key && other.s.Agent == a.Session.Agent && other.s.Inbox == a.Session.Inbox {
+				other.s.Inbox = ""
+				other.s.InboxToken = ""
+			}
+		}
+	}
 	return Registered{Key: key, Address: d.opts.Person + "/" + l.name, Name: l.name}, nil
 }
 
