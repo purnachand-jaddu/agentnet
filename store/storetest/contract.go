@@ -54,6 +54,82 @@ func Run(t *testing.T, open func(t *testing.T) store.Store) {
 			t.Fatalf("absent MessageByID = %+v, %q, %v", got, mailbox, err)
 		}
 	})
+	t.Run("accept stores once per id and keeps its tombstone", func(t *testing.T) {
+		s := open(t)
+		at := time.Unix(1000, 0)
+		m := msg("A1", "bob/x")
+		accept := func(m message.Message, sender string) store.AcceptOutcome {
+			t.Helper()
+			out, err := s.Accept(m, "x", false, sender, at)
+			must(t, err)
+			return out
+		}
+		if out := accept(m, "peerA/alice/a"); out != store.Inserted {
+			t.Fatalf("first Accept = %v", out)
+		}
+		sender, recipient, ok, err := s.Received("A1")
+		must(t, err)
+		if !ok || sender != "peerA/alice/a" || recipient != "bob/x" {
+			t.Fatalf("Received = %q, %q, %v", sender, recipient, ok)
+		}
+		if out := accept(m, "peerA/alice/a"); out != store.Duplicate {
+			t.Fatalf("same sender and recipient = %v, want Duplicate", out)
+		}
+		other := m
+		other.To = "bob/y"
+		if out := accept(other, "peerA/alice/a"); out != store.Conflict {
+			t.Fatalf("other recipient = %v, want Conflict", out)
+		}
+		if out := accept(m, "peerB/carol/c"); out != store.Conflict {
+			t.Fatalf("other sender = %v, want Conflict", out)
+		}
+		got, err := s.Pending("x")
+		must(t, err)
+		if len(got) != 1 || got[0].From != "alice/a" {
+			t.Fatalf("Pending = %+v", got)
+		}
+
+		must(t, s.MarkRead([]string{"A1"}, at))
+		must(t, s.Drop([]string{"A1"}))
+		if _, _, ok, _ := s.Received("A1"); !ok {
+			t.Fatal("Drop removed the tombstone")
+		}
+		if out := accept(m, "peerA/alice/a"); out != store.Duplicate {
+			t.Fatalf("after Drop = %v, want Duplicate", out)
+		}
+		if m, _, _ := s.MessageByID("A1"); m != nil {
+			t.Fatal("a dropped message was stored again")
+		}
+
+		_, err = s.PutMessage(msg("L1", "bob/x"), "x", false) // a local message: no tombstone
+		must(t, err)
+		if out := accept(msg("L1", "bob/x"), "peerA/alice/a"); out != store.Conflict {
+			t.Fatalf("id of a local message = %v, want Conflict", out)
+		}
+		if _, _, ok, _ := s.Received("L1"); ok {
+			t.Fatal("a conflicting Accept left a tombstone")
+		}
+
+		sender, recipient, ok, err = s.Received("nope")
+		if sender != "" || recipient != "" || ok || err != nil {
+			t.Fatalf("absent Received = %q, %q, %v, %v", sender, recipient, ok, err)
+		}
+	})
+	t.Run("prune received drops only old tombstones", func(t *testing.T) {
+		s := open(t)
+		t0 := time.Unix(1000, 0)
+		_, err := s.Accept(msg("old", "bob/x"), "x", false, "p", t0)
+		must(t, err)
+		_, err = s.Accept(msg("new", "bob/x"), "x", false, "p", t0.Add(time.Hour))
+		must(t, err)
+		n, err := s.PruneReceived(t0.Add(time.Minute))
+		must(t, err)
+		_, _, oldOK, _ := s.Received("old")
+		_, _, newOK, _ := s.Received("new")
+		if n != 1 || oldOK || !newOK {
+			t.Fatalf("pruned %d, old kept %v, new kept %v", n, oldOK, newOK)
+		}
+	})
 	t.Run("read messages leave pending", func(t *testing.T) {
 		s := open(t)
 		_, err := s.PutMessage(msg("1", "bob/x"), "x", false)

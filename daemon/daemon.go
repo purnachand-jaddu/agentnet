@@ -83,9 +83,7 @@ type Daemon struct {
 	flushing map[string]bool        // peers with a flusher running; guarded by mu
 	dirty    map[string]time.Time   // peers with a flush requested, and the newest cutoff asked for; guarded by mu
 	kick     chan struct{}          // wakes the outbox loop to start flushers for dirty peers
-
-	recvMu sync.Mutex             // serialises dedupe-check-and-store of incoming messages; taken before mu. ponytail: global, per-id locks if receive throughput matters
-	rate   map[string][]time.Time // recent incoming message times per sender peerKey; guarded by mu
+	rate     map[string][]time.Time // recent incoming message times per sender peerKey; guarded by mu
 }
 
 // New builds a Daemon from o.
@@ -141,6 +139,7 @@ func (d *Daemon) Run(ctx context.Context) {
 		case <-touch.C:
 			d.touchLive()
 		case <-forget.C:
+			d.pruneReceived()
 			if d.opts.Now().Sub(d.started) >= forgetAfter {
 				d.forgetOld()
 			}

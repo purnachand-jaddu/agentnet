@@ -33,22 +33,23 @@ type remoteB struct {
 // retryBody is a body B's store fails to keep, so B answers retry for that message alone.
 const retryBody = "please retry"
 
-// recvStore counts verified msg envelopes (each looks its id up once) and fails to store retryBody.
+// recvStore counts verified msg envelopes (each looks its id up once) and fails to store retryBody, or anything while fail is set.
 type recvStore struct {
 	store.Store
-	got atomic.Int32
+	got  atomic.Int32
+	fail atomic.Bool
 }
 
-func (s *recvStore) MessageByID(id string) (*message.Message, string, error) {
+func (s *recvStore) Received(id string) (string, string, bool, error) {
 	s.got.Add(1)
-	return s.Store.MessageByID(id)
+	return s.Store.Received(id)
 }
 
-func (s *recvStore) PutMessage(m message.Message, mailbox string, held bool) (bool, error) {
-	if m.Body == retryBody {
-		return false, errors.New("disk full")
+func (s *recvStore) Accept(m message.Message, mailbox string, held bool, sender string, at time.Time) (store.AcceptOutcome, error) {
+	if m.Body == retryBody || s.fail.Load() {
+		return 0, errors.New("disk full")
 	}
-	return s.Store.PutMessage(m, mailbox, held)
+	return s.Store.Accept(m, mailbox, held, sender, at)
 }
 
 // newB builds B on port (not running) with session web-codex.
@@ -108,8 +109,8 @@ func TestRemoteSendQueuedThenFlushedOnPresence(t *testing.T) {
 	bk := peerKey(f.bKeys.Public())
 
 	res := sendOne(t, a, "cli:terminal", "sam/web-codex")
-	if r := res.Receipts[0]; r.State != message.StatePushed || r.To != "sam/web-codex" {
-		t.Fatalf("receipt %+v, want pushed to sam/web-codex", r)
+	if r := res.Receipts[0]; r.State != message.StateQueued || r.Note != acceptedNote || r.To != "sam/web-codex" {
+		t.Fatalf("receipt %+v, want queued/accepted to sam/web-codex", r)
 	}
 	waitUntil(t, 2*time.Second, "B's adapter gets it", func() bool { return len(b.fake.Pushed()) == 1 })
 	if n := outboxLen(t, f.aStore, bk); n != 0 {

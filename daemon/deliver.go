@@ -123,6 +123,16 @@ func (d *Daemon) loopAllowed(from, to string) bool {
 	return ok
 }
 
+// loopRelease gives back one loopAllowed reservation for the pair, for a message that wasn't stored.
+func (d *Daemon) loopRelease(from, to string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	key := [2]string{from, to}
+	if n := len(d.pairs[key]); n > 0 {
+		d.pairs[key] = d.pairs[key][:n-1]
+	}
+}
+
 // admitIn drops ts entries at or before now-window, then appends now if fewer than limit remain, reporting whether it did.
 func admitIn(ts []time.Time, now time.Time, window time.Duration, limit int) ([]time.Time, bool) {
 	cutoff := now.Add(-window)

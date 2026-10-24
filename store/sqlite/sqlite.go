@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS outbox (
 CREATE TABLE IF NOT EXISTS sessions (
   name TEXT PRIMARY KEY, key TEXT NOT NULL UNIQUE, agent TEXT NOT NULL,
   cwd TEXT NOT NULL, last_seen INTEGER NOT NULL, kept INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS received (
+  id TEXT PRIMARY KEY, sender TEXT NOT NULL, recipient TEXT NOT NULL, at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS kv (ns TEXT NOT NULL, key TEXT NOT NULL, val BLOB NOT NULL, PRIMARY KEY (ns, key));
 `
 
@@ -152,6 +154,64 @@ func (s *Store) MessageByID(id string) (*message.Message, string, error) {
 		return nil, "", err
 	}
 	return &m, mailbox, nil
+}
+
+// Accept stores m in mailbox with its tombstone (sender, m.To, at) in one transaction, unless the id is already taken.
+func (s *Store) Accept(m message.Message, mailbox string, held bool, sender string, at time.Time) (store.AcceptOutcome, error) {
+	body, err := json.Marshal(m)
+	if err != nil {
+		return 0, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var prevSender, prevRecipient string
+	err = tx.QueryRow(`SELECT sender, recipient FROM received WHERE id = ?`, m.ID).Scan(&prevSender, &prevRecipient)
+	if err == nil {
+		if prevSender == sender && prevRecipient == m.To {
+			return store.Duplicate, nil
+		}
+		return store.Conflict, nil
+	}
+	if err != sql.ErrNoRows {
+		return 0, err
+	}
+	res, err := tx.Exec(
+		`INSERT OR IGNORE INTO messages (id, mailbox, msg, held, seq)
+		 VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(seq),0)+1 FROM messages))`,
+		m.ID, mailbox, body, held)
+	if err != nil {
+		return 0, err
+	}
+	if n, err := res.RowsAffected(); err != nil || n == 0 {
+		return store.Conflict, err // a message with no tombstone (a local one) holds the id
+	}
+	if _, err := tx.Exec(`INSERT INTO received (id, sender, recipient, at) VALUES (?, ?, ?, ?)`,
+		m.ID, sender, m.To, toMillis(at)); err != nil {
+		return 0, err
+	}
+	return store.Inserted, tx.Commit()
+}
+
+// Received returns id's tombstone, or "", "", false, nil if there is none.
+func (s *Store) Received(id string) (sender, recipient string, ok bool, err error) {
+	err = s.db.QueryRow(`SELECT sender, recipient FROM received WHERE id = ?`, id).Scan(&sender, &recipient)
+	if err == sql.ErrNoRows {
+		return "", "", false, nil
+	}
+	return sender, recipient, err == nil, err
+}
+
+// PruneReceived deletes tombstones recorded before before, returning the count removed.
+func (s *Store) PruneReceived(before time.Time) (int, error) {
+	res, err := s.db.Exec(`DELETE FROM received WHERE at < ?`, toMillis(before))
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
 }
 
 // Held returns every held message, with its mailbox, oldest first.

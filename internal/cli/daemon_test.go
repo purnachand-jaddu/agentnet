@@ -100,14 +100,26 @@ func TestSecondNonServiceDaemonExitsZeroWhileFirstHoldsLock(t *testing.T) {
 	}
 }
 
-func TestConfigReloaderReadsPausedAndFolders(t *testing.T) {
+func TestConfigReloaderSeesChangesAfterInterval(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "config.json")
-	if err := (config.Config{Person: "alex", Machine: "mbp", Folders: []string{dir}, Paused: true}).Save(p); err != nil {
+	base := config.Config{Person: "alex", Machine: "mbp"}
+	if err := base.Save(p); err != nil {
 		t.Fatal(err)
 	}
-	c := configReloader(p)()
-	if !c.Paused || !c.Allowed(dir) {
-		t.Fatalf("reloaded %+v, want paused with %s allowed", c, dir)
+	current := configReloader(p, 50*time.Millisecond)
+	if c := current(); c.Paused || c.Allowed(dir) {
+		t.Fatalf("initial %+v", c)
+	}
+	base.Paused, base.Folders = true, []string{dir}
+	if err := base.Save(p); err != nil {
+		t.Fatal(err)
+	}
+	if c := current(); c.Paused || c.Allowed(dir) {
+		t.Fatalf("reloaded before the interval: %+v", c)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if c := current(); !c.Paused || !c.Allowed(dir) {
+		t.Fatalf("after the interval %+v, want paused with %s allowed", c, dir)
 	}
 }

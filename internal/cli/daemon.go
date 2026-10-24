@@ -186,7 +186,7 @@ func newDaemon(logger *log.Logger, service bool) (*daemon.Daemon, io.Closer, err
 		st.Close()
 		return nil, nil, err
 	}
-	current := configReloader(paths.Config())
+	current := configReloader(paths.Config(), 2*time.Second)
 	o := daemon.Options{
 		Person: cfg.Person, Machine: cfg.Machine, Store: st, Adapters: adapters(), Config: cfg,
 		FolderAllowed: func(dir string) bool { return current().Allowed(dir) },
@@ -218,16 +218,16 @@ func withNetwork(o *daemon.Options, cfg config.Config, st *sqlite.Store, logger 
 	return nil
 }
 
-// configReloader returns a func giving cfgPath's config, reloaded at most once every 2s, so `folder add` and pausing
+// configReloader returns a func giving cfgPath's config, reloaded at most once per every, so `folder add` and pausing
 // take effect without a restart.
-func configReloader(cfgPath string) func() config.Config {
+func configReloader(cfgPath string, every time.Duration) func() config.Config {
 	var mu sync.Mutex
 	var cfg config.Config
 	var loaded time.Time
 	return func() config.Config {
 		mu.Lock()
 		defer mu.Unlock()
-		if time.Since(loaded) > 2*time.Second {
+		if time.Since(loaded) > every {
 			if c, err := config.Load(cfgPath); err == nil {
 				cfg = c
 			}
