@@ -200,3 +200,113 @@ func TestTwoMachinesExchangeMessages(t *testing.T) {
 		return false, "codex.log missing expected push:\n" + s
 	})
 }
+
+// TestHeldMessageApprovedThenDelivered proves the default policy (Inbound: hold) holds a new
+// sender's first message, that `held`/`approve` work over the real socket, and that approving a
+// person both delivers their held mail and lets their next message straight through.
+func TestHeldMessageApprovedThenDelivered(t *testing.T) {
+	if buildErr != nil {
+		t.Fatalf("agentnet build failed: %v", buildErr)
+	}
+
+	ports := freePorts(t, 2)
+	portA, portB := ports[0], ports[1]
+	a := newMachine(t, portA, portB, nil)
+	b := newMachine(t, portB, portA, nil) // no People override: B's default Inbound (hold) applies to alex
+
+	if _, errOut, err := a.run(nil, "init", "--person", "alex", "--machine", "mbp"); err != nil {
+		t.Fatalf("init: %v\n%s", err, errOut)
+	}
+	joinOut, errOut, err := b.run(nil, "join", "--person", "sam", "--machine", "xps")
+	if err != nil {
+		t.Fatalf("join: %v\n%s", err, errOut)
+	}
+	request := strings.SplitN(joinOut, "\n", 2)[0]
+	admitOut, errOut, err := a.run(nil, "admit", request)
+	if err != nil {
+		t.Fatalf("admit: %v\n%s", err, errOut)
+	}
+	bundle := strings.SplitN(admitOut, "\n", 2)[0]
+	if _, errOut, err := b.run(nil, "accept", bundle); err != nil {
+		t.Fatalf("accept: %v\n%s", err, errOut)
+	}
+
+	startDaemon(t, "A", a)
+	startDaemon(t, "B", b)
+
+	codexLog := filepath.Join(b.tmp, "codex.log")
+	codexScript := fmt.Sprintf("#!/bin/sh\necho \"$@\" >> %s\n", codexLog)
+	if err := os.WriteFile(filepath.Join(b.bin, "codex"), []byte(codexScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	srcWeb := filepath.Join(b.src, "web")
+	if err := os.MkdirAll(srcWeb, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	codexStdin, _ := json.Marshal(struct {
+		SessionID string `json:"session_id"`
+		Cwd       string `json:"cwd"`
+	}{"x1", srcWeb})
+	if _, errOut, err := b.run(codexStdin, "hook", "codex", "session-start"); err != nil {
+		t.Fatalf("codex hook: %v\n%s", err, errOut)
+	}
+	waitUntil(t, 15*time.Second, func() (bool, string) {
+		out, _, err := a.run(nil, "who")
+		if err != nil {
+			return false, "who: " + err.Error()
+		}
+		if strings.Contains(out, "sam/web-codex") {
+			return true, ""
+		}
+		return false, "who missing sam/web-codex:\n" + out
+	})
+
+	out, errOut, err := a.run(nil, "send", "sam/web-codex", "hi")
+	if err != nil {
+		t.Fatalf("send: %v\n%s", err, errOut)
+	}
+	if !strings.Contains(out, "held") {
+		t.Fatalf("send receipt doesn't say held: %s", out)
+	}
+
+	held, errOut, err := b.run(nil, "held")
+	if err != nil {
+		t.Fatalf("held: %v\n%s", err, errOut)
+	}
+	if !strings.Contains(held, "alex/terminal") || !strings.Contains(held, "hi") {
+		t.Fatalf("held listing missing the message:\n%s", held)
+	}
+
+	approveOut, errOut, err := b.run(nil, "approve", "alex")
+	if err != nil {
+		t.Fatalf("approve: %v\n%s", err, errOut)
+	}
+	if !strings.Contains(approveOut, "released 1") {
+		t.Fatalf("approve output = %q, want \"released 1\"", approveOut)
+	}
+
+	waitUntil(t, 10*time.Second, func() (bool, string) {
+		b, err := os.ReadFile(codexLog)
+		if err != nil {
+			return false, "codex.log: " + err.Error()
+		}
+		s := string(b)
+		if strings.Contains(s, "hi") {
+			return true, ""
+		}
+		return false, "codex.log missing the approved message:\n" + s
+	})
+
+	// B's daemon reloads config.json at most once every 2s, so the new accept policy may take a
+	// moment to take effect; retry the second send until it gets through.
+	waitUntil(t, 10*time.Second, func() (bool, string) {
+		out, errOut, err := a.run(nil, "send", "sam/web-codex", "hi again")
+		if err != nil {
+			return false, fmt.Sprintf("second send: %v\n%s", err, errOut)
+		}
+		if strings.Contains(out, "held") || strings.Contains(out, "refused") {
+			return false, "second send receipt says held/refused after approve: " + out
+		}
+		return true, ""
+	})
+}

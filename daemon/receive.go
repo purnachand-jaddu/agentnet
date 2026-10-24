@@ -30,7 +30,9 @@ func (d *Daemon) receiveMsg(e envelope.Envelope) (message.State, string) {
 		d.opts.Log("daemon: refused message from %s: %v", e.Cert.Machine, err)
 		return message.StateRefused, publicReason(err)
 	}
-	return d.admitMsg(e.Cert, m, to)
+	st, note := d.admitMsg(e.Cert, m, to)
+	d.audit("in", m.ID, m.From, m.To, st, m.Body)
+	return st, note
 }
 
 // openMsg verifies e (without the in-memory replay set), decodes its message and checks it against the envelope and sender cert.
@@ -129,13 +131,22 @@ func (d *Daemon) admitLock(id string) *sync.Mutex {
 	return &d.admitMu[h.Sum32()%uint32(len(d.admitMu))]
 }
 
-// duplicateAck answers an id already received: its own sender's retry is re-acked, anything else is refused and logged.
+// duplicateAck answers an id already stored: its own sender's retry is re-acked with its current state
+// (held or delivered); anything else is refused and logged. A held lookup failure answers retry.
 func (d *Daemon) duplicateAck(cert identity.Cert, id string, same bool) (message.State, string) {
-	if same {
-		return message.StateDelivered, alreadyNote
+	if !same {
+		d.opts.Log("daemon: refused message %s from %s: that id was received from another sender or for another recipient", id, cert.Machine)
+		return message.StateRefused, envelope.ErrMalformed.Error()
 	}
-	d.opts.Log("daemon: refused message %s from %s: that id was received from another sender or for another recipient", id, cert.Machine)
-	return message.StateRefused, envelope.ErrMalformed.Error()
+	held, err := d.opts.Store.IsHeld(id)
+	if err != nil {
+		d.opts.Log("daemon: look up held %s: %v", id, err)
+		return message.StateRetry, storeRetry
+	}
+	if held {
+		return message.StateHeld, heldNote(cert.Person)
+	}
+	return message.StateDelivered, alreadyNote
 }
 
 // pruneReceived drops message tombstones older than receivedKeep.
@@ -143,11 +154,6 @@ func (d *Daemon) pruneReceived() {
 	if _, err := d.opts.Store.PruneReceived(d.opts.Now().Add(-receivedKeep)); err != nil {
 		d.opts.Log("daemon: prune received: %v", err)
 	}
-}
-
-// inboundPolicy decides whether m from cert is accepted (delivered), held or refused; it accepts everything until Task 24.
-func (d *Daemon) inboundPolicy(identity.Cert, message.Message) (message.State, string) {
-	return message.StateDelivered, ""
 }
 
 // localSession returns to's session on this machine, live or remembered, or nil if there is none.

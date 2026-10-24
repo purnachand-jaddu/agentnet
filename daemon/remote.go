@@ -100,6 +100,7 @@ func (d *Daemon) sendRemote(ctx context.Context, tg target, msg message.Message)
 
 // attempt sends queued msg to cert once, removing it from the outbox unless no valid ack came back or the ack says retry. Caller holds the peer's lock.
 func (d *Daemon) attempt(ctx context.Context, cert identity.Cert, msg message.Message) (st message.State, note string, done bool) {
+	defer func() { d.audit("out", msg.ID, msg.From, msg.To, st, msg.Body) }()
 	payload, err := json.Marshal(msg)
 	if err != nil {
 		d.opts.Log("daemon: encode message %s: %v", msg.ID, err)

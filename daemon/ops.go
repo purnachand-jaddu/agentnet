@@ -102,6 +102,20 @@ func (d *Daemon) Handle(ctx context.Context, c ipc.Conn, op string, args json.Ra
 			return nil, err
 		}
 		return d.who(a), nil
+	case "held":
+		return d.held()
+	case "approve":
+		var a ApproveArgs
+		if err := json.Unmarshal(args, &a); err != nil {
+			return nil, err
+		}
+		return d.approve(a)
+	case "refuse_person":
+		var a RefusePersonArgs
+		if err := json.Unmarshal(args, &a); err != nil {
+			return nil, err
+		}
+		return d.refusePerson(a)
 	case "shutdown":
 		d.doShutdown()
 		return nil, nil

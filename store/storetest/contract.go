@@ -162,6 +162,11 @@ func Run(t *testing.T, open func(t *testing.T) store.Store) {
 		if len(h) != 2 || h[0].Message.ID != "1" || h[1].Message.ID != "2" || h[0].Mailbox != "x" {
 			t.Fatalf("Held = %+v", h)
 		}
+		held, err := s.IsHeld("1")
+		must(t, err)
+		if !held {
+			t.Fatal("IsHeld(1) = false before Release")
+		}
 		must(t, s.Release([]string{"1", "2"}))
 		got, err = s.Pending("x")
 		must(t, err)
@@ -172,6 +177,16 @@ func Run(t *testing.T, open func(t *testing.T) store.Store) {
 		must(t, err)
 		if !ok {
 			t.Fatal("Has(1) after Release = false")
+		}
+		held, err = s.IsHeld("1")
+		must(t, err)
+		if held {
+			t.Fatal("IsHeld(1) = true after Release")
+		}
+		held, err = s.IsHeld("nope")
+		must(t, err)
+		if held {
+			t.Fatal("IsHeld of an absent id = true")
 		}
 	})
 	t.Run("drop removes a held message from Held and Pending", func(t *testing.T) {

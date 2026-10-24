@@ -237,6 +237,16 @@ func (s *Store) Held() ([]store.Held, error) {
 	return out, rows.Err()
 }
 
+// IsHeld reports whether id is currently held; false, nil if absent or not held.
+func (s *Store) IsHeld(id string) (bool, error) {
+	var held bool
+	err := s.db.QueryRow(`SELECT held FROM messages WHERE id = ?`, id).Scan(&held)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return held, err
+}
+
 // Release clears the held flag on ids.
 func (s *Store) Release(ids []string) error {
 	stmt, err := s.db.Prepare(`UPDATE messages SET held = 0 WHERE id = ?`)

@@ -1,5 +1,5 @@
 // Package cli is agentnet's command-line entry: daemon, mcp, hook, send, who, listen, folder, setup,
-// init, join, admit, accept, up, version.
+// init, join, admit, accept, up, held, approve, refuse, pause, resume, version.
 package cli
 
 import (
@@ -59,6 +59,16 @@ func Main(args []string, version string) int {
 		return cmdAccept(args[1:])
 	case "up":
 		return cmdUp(args[1:])
+	case "held":
+		return cmdHeld(args[1:])
+	case "approve":
+		return cmdApprove(args[1:])
+	case "refuse":
+		return cmdRefuse(args[1:])
+	case "pause":
+		return cmdPause(args[1:])
+	case "resume":
+		return cmdResume(args[1:])
 	default:
 		usage()
 		return 2
@@ -67,5 +77,5 @@ func Main(args []string, version string) int {
 
 // usage prints the command summary to stderr.
 func usage() {
-	fmt.Fprintln(stderr, "usage: agentnet daemon|mcp|hook|send|who|listen|folder|setup|init|join|admit|accept|up|version")
+	fmt.Fprintln(stderr, "usage: agentnet daemon|mcp|hook|send|who|listen|folder|setup|init|join|admit|accept|up|held|approve|refuse|pause|resume|version")
 }

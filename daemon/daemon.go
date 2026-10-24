@@ -34,7 +34,10 @@ type Options struct {
 	Store           store.Store
 	Adapters        *adapter.Registry
 	FolderAllowed   func(dir string) bool
-	Paused          func() bool // true refuses every incoming message; nil is never paused
+	Paused          func() bool                       // true refuses every incoming message; nil is never paused
+	PolicyFor       func(person string) config.Policy // inbound policy for person; nil accepts everyone
+	ConfigPath      string                            // config.json, for approve/refuse to edit via config.Save
+	Auditor         Auditor                           // nil defaults to NoAudit
 	Now             func() time.Time
 	Log             func(format string, args ...any)
 	Service         bool // true when this process was started as the background service (--service)
@@ -91,6 +94,9 @@ type Daemon struct {
 func New(o Options) *Daemon {
 	if o.Sealer == nil {
 		o.Sealer = seal.HPKE{}
+	}
+	if o.Auditor == nil {
+		o.Auditor = NoAudit{}
 	}
 	o.Window = cmp.Or(o.Window, 5*time.Minute)
 	o.PresenceEvery = cmp.Or(o.PresenceEvery, time.Minute)

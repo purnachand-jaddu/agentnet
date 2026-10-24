@@ -187,12 +187,20 @@ func newDaemon(logger *log.Logger, service bool) (*daemon.Daemon, io.Closer, err
 		return nil, nil, err
 	}
 	current := configReloader(paths.Config(), 2*time.Second)
+	logFn := func(format string, args ...any) { logger.Printf(format, args...) }
 	o := daemon.Options{
 		Person: cfg.Person, Machine: cfg.Machine, Store: st, Adapters: adapters(), Config: cfg,
 		FolderAllowed: func(dir string) bool { return current().Allowed(dir) },
 		Paused:        func() bool { return current().Paused },
+		PolicyFor:     func(person string) config.Policy { return current().PolicyFor(person, cfg.Person) },
+		ConfigPath:    paths.Config(),
 		Now:           time.Now, Service: service,
-		Log: func(format string, args ...any) { logger.Printf(format, args...) },
+		Log: logFn,
+	}
+	if au, err := daemon.NewFileAuditor(paths.Audit(), logFn); err != nil {
+		logger.Printf("daemon: audit log unavailable: %v", err)
+	} else {
+		o.Auditor = au
 	}
 	if err := withNetwork(&o, cfg, st, logger); err != nil {
 		st.Close()
