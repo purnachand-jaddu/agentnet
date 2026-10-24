@@ -3,6 +3,8 @@ package daemon
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"sync"
 	"time"
 
 	"github.com/purnachand-jaddu/agentnet/envelope"
@@ -70,6 +72,9 @@ func (d *Daemon) admitMsg(cert identity.Cert, m message.Message, to message.Addr
 	}
 	machine := peerKey(cert.Key)
 	sender := machine + "/" + m.From
+	mu := d.admitLock(m.ID)
+	mu.Lock()
+	defer mu.Unlock()
 	prevSender, prevTo, seen, err := d.opts.Store.Received(m.ID)
 	if err != nil {
 		d.opts.Log("daemon: look up message %s: %v", m.ID, err)
@@ -115,6 +120,13 @@ func (d *Daemon) admitMsg(cert identity.Cert, m message.Message, to message.Addr
 	}
 	d.safeGo(func() { d.deliver(tg.key, tg.name, []message.Message{m}, m.Wake) })
 	return message.StateQueued, acceptedNote
+}
+
+// admitLock returns the mutex serialising admission (tombstone lookup through Accept) of every message with id.
+func (d *Daemon) admitLock(id string) *sync.Mutex {
+	h := fnv.New32a()
+	h.Write([]byte(id))
+	return &d.admitMu[h.Sum32()%uint32(len(d.admitMu))]
 }
 
 // duplicateAck answers an id already received: its own sender's retry is re-acked, anything else is refused and logged.

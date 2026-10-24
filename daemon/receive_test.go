@@ -430,3 +430,27 @@ func TestReceiveConcurrentSameIDDifferentSenders(t *testing.T) {
 		t.Fatalf("B's session got it %d times, want 1", n)
 	}
 }
+
+func TestReceiveConcurrentRetryAtLoopLimit(t *testing.T) {
+	f := newTeamFixture(t)
+	b := newB(t, f, 0)
+	for range loopMax - 1 {
+		wantAck(t, fromA(t, f, b, newMsg("alex/web-codex", "sam/web-codex")), message.StateQueued, acceptedNote)
+	}
+	settledPushes(t, b)
+	before := len(b.fake.Pushed())
+	e := sealMsg(t, f.aKeys, f.aTeam.Self, f.bTeam.Self, newMsg("alex/web-codex", "sam/web-codex"))
+	acks := race(t, b, []envelope.Envelope{e, e})
+	got := map[string]int{}
+	for _, ack := range acks {
+		got[string(ack.State)+"/"+ack.Note]++
+	}
+	if got["queued/"+acceptedNote] != 1 || got["delivered/"+alreadyNote] != 1 {
+		t.Fatalf("acks %v, want one accepted and one already received", got)
+	}
+	waitUntil(t, 2*time.Second, "the new message is delivered", func() bool { return len(b.fake.Pushed()) > before })
+	time.Sleep(100 * time.Millisecond)
+	if n := len(b.fake.Pushed()) - before; n != 1 {
+		t.Fatalf("delivered %d times, want 1", n)
+	}
+}

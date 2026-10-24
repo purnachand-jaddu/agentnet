@@ -84,6 +84,7 @@ type Daemon struct {
 	dirty    map[string]time.Time   // peers with a flush requested, and the newest cutoff asked for; guarded by mu
 	kick     chan struct{}          // wakes the outbox loop to start flushers for dirty peers
 	rate     map[string][]time.Time // recent incoming message times per sender peerKey; guarded by mu
+	admitMu  [64]sync.Mutex         // admission locks for incoming messages, sharded by id hash; taken before mu, never inside it
 }
 
 // New builds a Daemon from o.
