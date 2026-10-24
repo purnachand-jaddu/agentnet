@@ -14,7 +14,6 @@ import (
 	"github.com/purnachand-jaddu/agentnet/envelope"
 	"github.com/purnachand-jaddu/agentnet/identity"
 	"github.com/purnachand-jaddu/agentnet/ipc"
-	"github.com/purnachand-jaddu/agentnet/message"
 	"github.com/purnachand-jaddu/agentnet/seal"
 	"github.com/purnachand-jaddu/agentnet/store"
 	"github.com/purnachand-jaddu/agentnet/team"
@@ -35,6 +34,7 @@ type Options struct {
 	Store           store.Store
 	Adapters        *adapter.Registry
 	FolderAllowed   func(dir string) bool
+	Paused          func() bool // true refuses every incoming message; nil is never paused
 	Now             func() time.Time
 	Log             func(format string, args ...any)
 	Service         bool // true when this process was started as the background service (--service)
@@ -50,8 +50,6 @@ type Options struct {
 	OfflineAfter  time.Duration // a machine silent this long is offline; 3 min if zero
 	Debounce      time.Duration // how often local changes are checked and sent; 2 s if zero
 	OutboxEvery   time.Duration // outbox retry interval; 30 s if zero
-
-	testAcceptMsg func(message.Message) message.State // test-only stand-in for verified receive; nil in production
 }
 
 // Daemon is one running agentnet daemon: session registry plus (later tasks) send/deliver and hooks.
@@ -85,6 +83,9 @@ type Daemon struct {
 	flushing map[string]bool        // peers with a flusher running; guarded by mu
 	dirty    map[string]time.Time   // peers with a flush requested, and the newest cutoff asked for; guarded by mu
 	kick     chan struct{}          // wakes the outbox loop to start flushers for dirty peers
+
+	recvMu sync.Mutex             // serialises dedupe-check-and-store of incoming messages; taken before mu. ponytail: global, per-id locks if receive throughput matters
+	rate   map[string][]time.Time // recent incoming message times per sender peerKey; guarded by mu
 }
 
 // New builds a Daemon from o.
@@ -116,6 +117,7 @@ func New(o Options) *Daemon {
 		flushing: map[string]bool{},
 		dirty:    map[string]time.Time{},
 		kick:     make(chan struct{}, 1),
+		rate:     map[string][]time.Time{},
 	}
 }
 

@@ -244,19 +244,3 @@ func (d *Daemon) flushPeer(ctx context.Context, peer string, cutoff time.Time) {
 		}
 	}
 }
-
-// receiveMsg answers a "msg" envelope; verified receive is not built yet, so only the test-only hook accepts one.
-func (d *Daemon) receiveMsg(e envelope.Envelope) (message.State, string) {
-	if d.opts.testAcceptMsg == nil {
-		return message.StateRefused, "not yet supported"
-	}
-	plain, err := d.verifier.Open(e, d.opts.Keys, d.opts.Sealer)
-	if err != nil {
-		return message.StateRefused, publicReason(err)
-	}
-	var m message.Message
-	if err := json.Unmarshal(plain, &m); err != nil {
-		return message.StateRefused, envelope.ErrMalformed.Error()
-	}
-	return d.opts.testAcceptMsg(m), ""
-}

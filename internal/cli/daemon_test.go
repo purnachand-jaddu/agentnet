@@ -3,9 +3,11 @@ package cli
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/purnachand-jaddu/agentnet/config"
 	"github.com/purnachand-jaddu/agentnet/daemon"
 	"github.com/purnachand-jaddu/agentnet/internal/paths"
 	"github.com/purnachand-jaddu/agentnet/ipc"
@@ -95,5 +97,17 @@ func TestSecondNonServiceDaemonExitsZeroWhileFirstHoldsLock(t *testing.T) {
 	code := Main([]string{"daemon"}, "test")
 	if code != 0 {
 		t.Fatalf("second daemon exited %d, want 0", code)
+	}
+}
+
+func TestConfigReloaderReadsPausedAndFolders(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.json")
+	if err := (config.Config{Person: "alex", Machine: "mbp", Folders: []string{dir}, Paused: true}).Save(p); err != nil {
+		t.Fatal(err)
+	}
+	c := configReloader(p)()
+	if !c.Paused || !c.Allowed(dir) {
+		t.Fatalf("reloaded %+v, want paused with %s allowed", c, dir)
 	}
 }

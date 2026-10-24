@@ -22,6 +22,9 @@ const (
 	loopMax    = 12
 )
 
+// loopNote is the receipt note when the loop guard refuses a message.
+const loopNote = "too many messages between these two sessions; is this a loop?"
+
 // pullNote is the receipt note for a session that will pick its mail up on its own, with no push channel reaching it right now.
 const pullNote = "it sees it when it checks its inbox"
 
@@ -70,8 +73,7 @@ func (d *Daemon) send(ctx context.Context, a SendArgs) (SendResult, error) {
 			to = tg.name
 		}
 		if a.From != "cli:terminal" && !d.loopAllowed(a.From, tg.key) {
-			res.Receipts = append(res.Receipts, message.Receipt{To: to, State: message.StateRefused,
-				Note: "too many messages between these two sessions; is this a loop?"})
+			res.Receipts = append(res.Receipts, message.Receipt{To: to, State: message.StateRefused, Note: loopNote})
 			continue
 		}
 		msg := message.Message{
@@ -116,20 +118,24 @@ func (d *Daemon) loopAllowed(from, to string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	key := [2]string{from, to}
-	now := d.opts.Now()
-	cutoff := now.Add(-loopWindow)
-	kept := d.pairs[key][:0]
-	for _, t := range d.pairs[key] {
+	var ok bool
+	d.pairs[key], ok = admitIn(d.pairs[key], d.opts.Now(), loopWindow, loopMax)
+	return ok
+}
+
+// admitIn drops ts entries at or before now-window, then appends now if fewer than limit remain, reporting whether it did.
+func admitIn(ts []time.Time, now time.Time, window time.Duration, limit int) ([]time.Time, bool) {
+	cutoff := now.Add(-window)
+	kept := ts[:0]
+	for _, t := range ts {
 		if t.After(cutoff) {
 			kept = append(kept, t)
 		}
 	}
-	if len(kept) >= loopMax {
-		d.pairs[key] = kept
-		return false
+	if len(kept) >= limit {
+		return kept, false
 	}
-	d.pairs[key] = append(kept, now)
-	return true
+	return append(kept, now), true
 }
 
 // pending returns mailbox's unread messages, hiding ids pushed within inFlightWindow.

@@ -394,3 +394,21 @@ func TestSameIDFromDifferentSendersIsNotAReplay(t *testing.T) {
 		t.Fatalf("got %q, want %q", got2, "from c")
 	}
 }
+
+// A nil Replay skips the replay check: the caller dedupes durably instead.
+func TestNilReplaySkipsReplayCheck(t *testing.T) {
+	now := time.Now()
+	_, _, a, b, _ := setup(t, now)
+	s := seal.HPKE{}
+	e, err := Build("msg", message.NewID(), a.keys, a.cert, b.cert, []byte("hello"), s, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := newVerifier(b.team, now, 5*time.Minute)
+	v.Replay = nil
+	for i := range 2 {
+		if _, err := v.Open(e, b.keys, s); err != nil {
+			t.Fatalf("open %d: %v", i, err)
+		}
+	}
+}

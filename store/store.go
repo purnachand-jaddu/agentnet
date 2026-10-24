@@ -25,6 +25,7 @@ type Store interface {
 	Pending(mailbox string) ([]message.Message, error) // unread, not held, oldest first
 	MarkRead(ids []string, at time.Time) error
 	Has(id string) (bool, error)
+	MessageByID(id string) (m *message.Message, mailbox string, err error) // nil, "", nil when absent
 	Held() ([]Held, error)
 	Release(ids []string) error
 	Drop(ids []string) error

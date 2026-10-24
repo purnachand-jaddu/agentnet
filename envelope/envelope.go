@@ -106,12 +106,12 @@ func (r *Replay) Check(key string, now time.Time) bool {
 // Verifier opens envelopes addressed to self.
 type Verifier struct {
 	Team   *team.State
-	Replay *Replay
+	Replay *Replay // nil skips the replay check, for callers that dedupe durably
 	Now    func() time.Time
 	Window time.Duration // 5 minutes
 }
 
-// Open checks cert, signature, recipient, time window and replay, then decrypts.
+// Open checks cert, signature, recipient, time window and replay (skipped when Replay is nil), then decrypts.
 func (v Verifier) Open(e Envelope, self identity.Keys, s seal.Sealer) ([]byte, error) {
 	if e.V != 1 {
 		return nil, fmt.Errorf("envelope: unsupported version %d: %w", e.V, ErrMalformed)
@@ -142,7 +142,7 @@ func (v Verifier) Open(e Envelope, self identity.Keys, s seal.Sealer) ([]byte, e
 		return nil, fmt.Errorf("envelope: bad id %q: %w", e.ID, ErrMalformed)
 	}
 	replayKey := base64.RawURLEncoding.EncodeToString(e.Cert.Key) + "/" + e.ID
-	if !v.Replay.Check(replayKey, now) {
+	if v.Replay != nil && !v.Replay.Check(replayKey, now) {
 		return nil, fmt.Errorf("envelope: replayed: %w", ErrStale)
 	}
 	plain, err := s.Open(self.Enc, sealInfo(e.Kind, e.ID, e.Cert.Key, self.Public()), e.Sealed)

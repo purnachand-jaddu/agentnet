@@ -229,10 +229,10 @@ func TestPresenceFromNonMemberRefused(t *testing.T) {
 		t.Fatal("merged cert was not persisted")
 	}
 
-	// "msg" is not handled yet: a signed refusal.
+	// A "msg" whose payload isn't a message for this envelope: a signed refusal.
 	env, _ = envelope.Build("msg", message.NewID(), f.aKeys, f.aTeam.Self, f.bTeam.Self, []byte("{}"), seal.HPKE{}, now)
-	if ack := b.handleEnvelope(context.Background(), env); ack.State != message.StateRefused || ack.Note != "not yet supported" {
-		t.Fatalf("msg: ack %+v, want refused/not yet supported", ack)
+	if ack := b.handleEnvelope(context.Background(), env); ack.State != message.StateRefused || ack.Note != "malformed" {
+		t.Fatalf("msg: ack %+v, want refused/malformed", ack)
 	}
 }
 

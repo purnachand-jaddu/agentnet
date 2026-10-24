@@ -186,9 +186,12 @@ func newDaemon(logger *log.Logger, service bool) (*daemon.Daemon, io.Closer, err
 		st.Close()
 		return nil, nil, err
 	}
+	current := configReloader(paths.Config())
 	o := daemon.Options{
 		Person: cfg.Person, Machine: cfg.Machine, Store: st, Adapters: adapters(), Config: cfg,
-		FolderAllowed: folderAllowed(paths.Config()), Now: time.Now, Service: service,
+		FolderAllowed: func(dir string) bool { return current().Allowed(dir) },
+		Paused:        func() bool { return current().Paused },
+		Now:           time.Now, Service: service,
 		Log: func(format string, args ...any) { logger.Printf(format, args...) },
 	}
 	if err := withNetwork(&o, cfg, st, logger); err != nil {
@@ -215,22 +218,21 @@ func withNetwork(o *daemon.Options, cfg config.Config, st *sqlite.Store, logger 
 	return nil
 }
 
-// folderAllowed returns a FolderAllowed func that reloads cfgPath at most once every 2s, so `folder add` takes
-// effect without a restart.
-func folderAllowed(cfgPath string) func(string) bool {
+// configReloader returns a func giving cfgPath's config, reloaded at most once every 2s, so `folder add` and pausing
+// take effect without a restart.
+func configReloader(cfgPath string) func() config.Config {
 	var mu sync.Mutex
 	var cfg config.Config
 	var loaded time.Time
-	return func(dir string) bool {
+	return func() config.Config {
 		mu.Lock()
+		defer mu.Unlock()
 		if time.Since(loaded) > 2*time.Second {
 			if c, err := config.Load(cfgPath); err == nil {
 				cfg = c
 			}
 			loaded = time.Now()
 		}
-		c := cfg
-		mu.Unlock()
-		return c.Allowed(dir)
+		return cfg
 	}
 }

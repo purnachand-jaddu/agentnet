@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -20,48 +21,55 @@ import (
 	"github.com/purnachand-jaddu/agentnet/team"
 )
 
-// remoteB is one run of member B with a command-channel adapter and the test-only msg hook.
+// remoteB is member B with session web-codex on a command-channel adapter, a counting store and a pause switch.
 type remoteB struct {
-	d     *Daemon
-	fake  *fakeAdapter
-	got   atomic.Int32                  // msg envelopes that reached the hook
-	state atomic.Pointer[message.State] // what the hook answers
-	stop  func()
+	d      *Daemon
+	fake   *fakeAdapter
+	st     *recvStore
+	paused atomic.Bool
+	stop   func()
 }
 
-// retryBody makes B's hook answer retry for that message alone.
+// retryBody is a body B's store fails to keep, so B answers retry for that message alone.
 const retryBody = "please retry"
 
-// startB runs B on port with session web-codex, its hook delivering locally while state is pushed.
-func startB(t *testing.T, f teamFixture, port, aPort int) *remoteB {
-	r := &remoteB{fake: codexFake(adapter.ChannelCommand)}
-	r.setState(message.StatePushed)
-	r.d = newNetDaemon(t, "sam", "xps", f.bStore, f.bTeam, f.bKeys, port, lanAddr(aPort))
-	r.d.opts.Adapters = adapter.NewRegistry(r.fake)
-	r.d.opts.testAcceptMsg = func(m message.Message) message.State {
-		r.got.Add(1)
-		if m.Body == retryBody {
-			return message.StateRetry
-		}
-		if st := *r.state.Load(); st != message.StatePushed {
-			return st
-		}
-		addr, _ := message.ParseAddress(m.To)
-		tgs, err := r.d.resolveTo("cli:terminal", addr.Session)
-		if err != nil {
-			return message.StateRefused
-		}
-		if _, err := r.d.opts.Store.PutMessage(m, tgs[0].key, false); err != nil {
-			return message.StateRefused
-		}
-		return r.d.deliver(tgs[0].key, tgs[0].name, []message.Message{m}, m.Wake).State
+// recvStore counts verified msg envelopes (each looks its id up once) and fails to store retryBody.
+type recvStore struct {
+	store.Store
+	got atomic.Int32
+}
+
+func (s *recvStore) MessageByID(id string) (*message.Message, string, error) {
+	s.got.Add(1)
+	return s.Store.MessageByID(id)
+}
+
+func (s *recvStore) PutMessage(m message.Message, mailbox string, held bool) (bool, error) {
+	if m.Body == retryBody {
+		return false, errors.New("disk full")
 	}
+	return s.Store.PutMessage(m, mailbox, held)
+}
+
+// newB builds B on port (not running) with session web-codex.
+func newB(t *testing.T, f teamFixture, port int, peers ...string) *remoteB {
+	r := &remoteB{fake: codexFake(adapter.ChannelCommand), st: &recvStore{Store: f.bStore}}
+	r.d = newNetDaemon(t, "sam", "xps", r.st, f.bTeam, f.bKeys, port, peers...)
+	r.d.opts.Adapters = adapter.NewRegistry(r.fake)
+	r.d.opts.Paused = r.paused.Load
 	register(t, r.d, &fakeConn{id: 1}, "codex", "b1", "/tmp/web", false)
+	return r
+}
+
+// startB runs B on port, pointed at A.
+func startB(t *testing.T, f teamFixture, port, aPort int) *remoteB {
+	r := newB(t, f, port, lanAddr(aPort))
 	r.stop = runDaemon(t, r.d)
 	return r
 }
 
-func (r *remoteB) setState(s message.State) { r.state.Store(&s) }
+// got is how many verified msg envelopes reached B's store.
+func (r *remoteB) got() int32 { return r.st.got.Load() }
 
 // startRemotePair runs A and B and waits until A lists B's web-codex.
 func startRemotePair(t *testing.T, f teamFixture) (a *Daemon, b *remoteB, aPort int) {
@@ -118,10 +126,10 @@ func TestRemoteSendQueuedThenFlushedOnPresence(t *testing.T) {
 	}
 
 	b2 := startB(t, f, freePort(t), aPort) // same store, new port; OutboxEvery is 30 s, so only presence can flush
-	waitUntil(t, 5*time.Second, "B's restart receives the queued message", func() bool { return b2.got.Load() == 1 })
+	waitUntil(t, 5*time.Second, "B's restart receives the queued message", func() bool { return b2.got() == 1 })
 	waitUntil(t, 2*time.Second, "A's outbox empties", func() bool { return outboxLen(t, f.aStore, bk) == 0 })
 	time.Sleep(1500 * time.Millisecond) // more presence rounds: any further flush would resend
-	if n := b2.got.Load(); n != 1 {
+	if n := b2.got(); n != 1 {
 		t.Fatalf("B received the queued message %d times, want 1", n)
 	}
 	if p := b2.fake.Pushed(); len(p) != 1 || !strings.Contains(p[0], "hello sam/web-codex") {
@@ -134,23 +142,26 @@ func TestRemoteRetryKeepsRefusedRemoves(t *testing.T) {
 	a, b, _ := startRemotePair(t, f)
 	bk := peerKey(f.bKeys.Public())
 
-	b.setState(message.StateRetry)
-	if r := sendOne(t, a, "cli:terminal", "sam/web-codex").Receipts[0]; r.State != message.StateRetry {
+	res, err := a.send(context.Background(), SendArgs{From: "cli:terminal", To: "sam/web-codex", Body: retryBody, Wake: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := res.Receipts[0]; r.State != message.StateRetry {
 		t.Fatalf("receipt %+v, want retry", r)
 	}
 	if n := outboxLen(t, f.aStore, bk); n != 1 {
 		t.Fatalf("outbox holds %d after a retry ack, want 1", n)
 	}
 
-	b.setState(message.StateRefused)
-	if r := sendOne(t, a, "cli:terminal", "sam/web-codex").Receipts[0]; r.State != message.StateRefused {
+	b.paused.Store(true)
+	if r := sendOne(t, a, "cli:terminal", "sam/web-codex").Receipts[0]; r.State != message.StateRefused || r.Note != "paused" {
 		t.Fatalf("receipt %+v, want refused", r)
 	}
 	if n := outboxLen(t, f.aStore, bk); n != 1 {
 		t.Fatalf("outbox holds %d after a refused ack, want only the retry one", n)
 	}
-	if n := b.got.Load(); n != 2 {
-		t.Fatalf("hook saw %d messages, want 2", n)
+	if n := b.got(); n != 2 {
+		t.Fatalf("B checked %d messages, want 2", n)
 	}
 }
 
@@ -248,7 +259,7 @@ func TestOutboxTickResendsOnlyAgedEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.outboxTick(context.Background())
-	waitUntil(t, 3*time.Second, "B receives the aged entry", func() bool { return b.got.Load() == 1 })
+	waitUntil(t, 3*time.Second, "B receives the aged entry", func() bool { return b.got() == 1 })
 	waitUntil(t, 2*time.Second, "only the fresh entry stays queued", func() bool {
 		msgs, _ := f.aStore.OutboxFor(bk, now.Add(time.Hour))
 		return len(msgs) == 1 && msgs[0].ID == fresh.ID
@@ -284,7 +295,7 @@ func TestFlushContinuesPastARetryAck(t *testing.T) {
 	queue(t, f.aStore, bk, "second", now.Add(-time.Minute))
 
 	a.outboxTick(context.Background())
-	waitUntil(t, 3*time.Second, "B is offered both", func() bool { return b.got.Load() == 2 })
+	waitUntil(t, 3*time.Second, "B is offered both", func() bool { return b.got() == 2 })
 	waitUntil(t, 2*time.Second, "only the retried one stays queued", func() bool {
 		msgs, _ := f.aStore.OutboxFor(bk, now.Add(time.Hour))
 		return len(msgs) == 1 && msgs[0].ID == first.ID
@@ -318,7 +329,7 @@ func TestPresenceDuringFailedFlushFlushesAgain(t *testing.T) {
 		t.Fatalf("presence ack %+v", ack)
 	}
 	close(release) // the in-flight attempt fails
-	waitUntil(t, 5*time.Second, "B receives it via the new address", func() bool { return b.got.Load() == 1 })
+	waitUntil(t, 5*time.Second, "B receives it via the new address", func() bool { return b.got() == 1 })
 	waitUntil(t, 2*time.Second, "A's outbox empties", func() bool { return outboxLen(t, f.aStore, bk) == 0 })
 }
 

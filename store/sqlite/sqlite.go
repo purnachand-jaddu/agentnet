@@ -136,6 +136,24 @@ func (s *Store) Has(id string) (bool, error) {
 	return n > 0, err
 }
 
+// MessageByID returns the stored message id and its mailbox, or nil, "", nil if absent.
+func (s *Store) MessageByID(id string) (*message.Message, string, error) {
+	var body []byte
+	var mailbox string
+	err := s.db.QueryRow(`SELECT msg, mailbox FROM messages WHERE id = ?`, id).Scan(&body, &mailbox)
+	if err == sql.ErrNoRows {
+		return nil, "", nil
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	var m message.Message
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, "", err
+	}
+	return &m, mailbox, nil
+}
+
 // Held returns every held message, with its mailbox, oldest first.
 func (s *Store) Held() ([]store.Held, error) {
 	rows, err := s.db.Query(`SELECT msg, mailbox FROM messages WHERE held = 1 ORDER BY seq`)

@@ -39,6 +39,21 @@ func Run(t *testing.T, open func(t *testing.T) store.Store) {
 			t.Fatal("Has(2) = false")
 		}
 	})
+	t.Run("message by id round trip", func(t *testing.T) {
+		s := open(t)
+		want := msg("1", "bob/x")
+		_, err := s.PutMessage(want, "x", false)
+		must(t, err)
+		got, mailbox, err := s.MessageByID("1")
+		must(t, err)
+		if got == nil || *got != want || mailbox != "x" {
+			t.Fatalf("MessageByID = %+v, %q", got, mailbox)
+		}
+		got, mailbox, err = s.MessageByID("nope")
+		if got != nil || mailbox != "" || err != nil {
+			t.Fatalf("absent MessageByID = %+v, %q, %v", got, mailbox, err)
+		}
+	})
 	t.Run("read messages leave pending", func(t *testing.T) {
 		s := open(t)
 		_, err := s.PutMessage(msg("1", "bob/x"), "x", false)
