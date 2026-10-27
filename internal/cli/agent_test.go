@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"context"
+	"io"
 	"testing"
 
 	"github.com/purnachand-jaddu/agentnet/hook"
@@ -46,5 +48,27 @@ func TestHookArgsParsesPluginInvocation(t *testing.T) {
 		if agent != tc.agent || event != tc.event || flags != tc.flags {
 			t.Errorf("%s: agent=%q event=%q flags=%+v, want %q %q %+v", tc.name, agent, event, flags, tc.agent, tc.event, tc.flags)
 		}
+	}
+}
+
+// TestCmdHookParsesPluginArgv pins the wiring itself: the plugin's exact argv must come out of
+// cmdHook as the right agent/event for hook.Run, not just out of the parser in isolation.
+func TestCmdHookParsesPluginArgv(t *testing.T) {
+	var agent, event string
+	var flags hook.Flags
+	calls := 0
+	orig := hookRun
+	hookRun = func(_ context.Context, a, e string, _ io.Reader, _ io.Writer, _ func(ctx context.Context, op string, args, result any) error, _ func(string) string, f hook.Flags) error {
+		agent, event, flags, calls = a, e, f, calls+1
+		return nil
+	}
+	defer func() { hookRun = orig }()
+
+	code := cmdHook([]string{"opencode", "status", "--session", "ses_1", "--state", "busy"})
+	if code != 0 || calls != 1 {
+		t.Fatalf("code=%d calls=%d, want 0/1", code, calls)
+	}
+	if agent != "opencode" || event != "status" || flags.SessionID != "ses_1" || flags.State != "busy" {
+		t.Fatalf("hook.Run got agent=%q event=%q flags=%+v", agent, event, flags)
 	}
 }

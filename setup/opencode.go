@@ -151,9 +151,14 @@ func opencodeConfigApplied(configPath, exe string) (bool, error) {
 }
 
 // applyOpencodePlugin writes the plugin file, embedding the quoted exe path. A file at plugins/agentnet.ts
-// that isn't agentnet's is refused, not truncated: --remove keeps strangers' files, so must setup.
+// that isn't agentnet's is refused, not truncated: --remove keeps strangers' files, so must setup —
+// and a file that can't be read can't be proven foreign-or-ours, so it is refused too.
 func applyOpencodePlugin(pluginPath, exe string) error {
-	if data, err := os.ReadFile(pluginPath); err == nil && !strings.Contains(string(data), opencodePluginMarker) {
+	data, err := os.ReadFile(pluginPath)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err == nil && !strings.Contains(string(data), opencodePluginMarker) {
 		return fmt.Errorf("%s already exists and isn't agentnet's; move or remove it, then re-run `agentnet setup`", pluginPath)
 	}
 	content := strings.Replace(opencodePluginTemplate, "AGENTNET_ENGINE_PLACEHOLDER", strconv.Quote(exe), 1)

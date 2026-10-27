@@ -54,9 +54,13 @@ func cmdHook(args []string) int {
 		defer client.Close()
 		call = client.Call
 	}
-	hook.Run(context.Background(), agent, event, stdin, stdout, call, os.Getenv, flags)
+	hookRun(context.Background(), agent, event, stdin, stdout, call, os.Getenv, flags)
 	return 0
 }
+
+// hookRun is `agentnet hook`'s call into the hook package, as a var so tests can pin how cmdHook
+// wires a parsed argv (the plugin's exact invocation shape) into hook.Run.
+var hookRun = hook.Run
 
 // hookArgs parses `agentnet hook` arguments: agent and event are positional, and --session/--state may
 // sit on either side of them — opencode's plugin calls with the positionals first, and Go's flag

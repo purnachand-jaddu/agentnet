@@ -344,7 +344,7 @@ func opencodeLine(a doctorAgents) line {
 	case a.OpenCodeMCP && a.OpenCodePlugin:
 		return okLine("opencode: wired")
 	case a.OpenCodeJSONC && !a.OpenCodeMCP:
-		return badLine("opencode: plugin " + wired(a.OpenCodePlugin) + ", but the MCP snippet must be hand-added to opencode.jsonc (`agentnet setup --dry-run` prints it)")
+		return badLine("opencode: plugin " + wired(a.OpenCodePlugin) + ", but the MCP snippet must be hand-added to opencode.jsonc — `agentnet setup` prints the exact snippet and never edits that file")
 	case !a.OpenCodeMCP && !a.OpenCodePlugin:
 		return badLine("opencode: installed but not wired (MCP and plugin both missing); re-run `agentnet setup`")
 	case a.OpenCodeMCP:

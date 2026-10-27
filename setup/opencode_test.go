@@ -323,6 +323,55 @@ func TestOpencodeApplyRefusesForeignPluginFile(t *testing.T) {
 	}
 }
 
+// TestOpencodeApplyRefusesUnreadablePluginFile pins that a file agentnet can't read is treated as
+// foreign (never silently overwritten): the README's setup-refusal claim counts on this.
+func TestOpencodeApplyRefusesUnreadablePluginFile(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, ".config", "opencode")
+	if err := os.MkdirAll(filepath.Join(dir, "plugins"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "plugins", "agentnet.ts")
+	if err := os.WriteFile(path, []byte("unreadable foreign plugin"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o000); err != nil { // unreadable, so ownership can't be proven
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+
+	if err := opencodeStep(home, "/exe", Exec).Apply(); err == nil {
+		t.Fatal("apply should refuse a plugin file it cannot inspect")
+	}
+}
+
+// TestOpencodeBothFilesPrefersJSON: with opencode.json AND opencode.jsonc already present, setup
+// writes the parseable json file (the jsonc side stays the person's hand-edited file, untouched).
+func TestOpencodeBothFilesPrefersJSON(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, ".config", "opencode")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	jsonc := "{\"plugin\":[\"x\"] // note\n}"
+	if err := os.WriteFile(filepath.Join(dir, "opencode.jsonc"), []byte(jsonc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "opencode.json"), []byte("{\"theme\":\"x\"}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := opencodeStep(home, "/exe", Exec).Apply(); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(filepath.Join(dir, "opencode.jsonc")); err != nil || string(data) != jsonc {
+		t.Fatalf("opencode.jsonc must be untouched: %v %s", err, data)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "opencode.json")); err != nil {
+		t.Fatalf("opencode.json should still be written when it exists: %v", err)
+	}
+}
+
 // TestOpencodeCheckSeesBothPieces: a step whose config is applied but whose plugin was removed
 // (or never applied) must not read as already applied.
 func TestOpencodeCheckSeesBothPieces(t *testing.T) {

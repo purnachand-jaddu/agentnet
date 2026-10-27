@@ -8,13 +8,13 @@ const ENGINE = AGENTNET_ENGINE_PLACEHOLDER
 
 // windowsHide: opencode's background server has no console on Windows, so each hook call (a poll
 // every few seconds per idle session) would open a console window of its own that closes at once.
-const run = (args: string[], cwd: string) =>
+// execFile leaves stdin an open pipe, and agentnet's hook doesn't need it (--session is a flag):
+// leaving it open would make the hook wait its whole stdin-read deadline on every call.
+const run = (args: string[], cwd?: string) =>
   new Promise<string>((resolve) => {
     const child: ChildProcess = execFile(ENGINE, args, { cwd, timeout: 10_000, windowsHide: true }, (err, out) =>
       resolve(err ? "" : String(out).trim()),
     )
-    // execFile leaves stdin as an open pipe; agentnet's hook doesn't need it (--session is a flag),
-    // and an open pipe would make the hook wait its full stdin-read deadline on every call.
     child.stdin?.end()
   })
 
@@ -28,30 +28,40 @@ const network = (prompt: (id: string, text: string) => Promise<unknown>) => {
   // the session ends. agentnet's delivery prints then confirms, so a rejected prompt must be ours
   // to recover, not mail silently lost.
   const undelivered = new Map<string, string>()
+  // Which delivery attempt is the newest per session: only that one clears the idle flag when it
+  // finishes, or it could erase an idle state that arrived while a prompt was still running.
+  const stamps = new Map<string, number>()
+  // Status reports are launched in arrival order per session: subprocesses otherwise race, and a
+  // late status-busy landing after its idle would leave the daemon showing a busy session.
+  const statusChain = new Map<string, Promise<unknown>>()
 
   const deliver = async (id: string) => {
     if (delivering.has(id) || subagents.has(id)) return
     delivering.add(id)
+    const stamp = (stamps.get(id) ?? 0) + 1
+    stamps.set(id, stamp)
     try {
-      const polled = undelivered.get(id) ?? (await run(["hook", "opencode", "poll", "--session", id], dirs.get(id)!))
+      const polled = undelivered.get(id) ?? (await run(["hook", "opencode", "poll", "--session", id], dirs.get(id)))
       undelivered.delete(id)
       if (!polled) return
-      // The session may have ended while the poll ran; mail for a session opencode forgot would
-      // only fail again.
-      if (!dirs.has(id)) return
+      // The session may have ended or become a subagent while the poll ran; mail for it would only
+      // fail again.
+      if (!dirs.has(id) || subagents.has(id)) return
       try {
         await prompt(id, polled)
       } catch {
         undelivered.set(id, polled)
       } finally {
-        idle.delete(id)
+        if (stamps.get(id) === stamp) {
+          idle.delete(id)
+        }
       }
     } finally {
       delivering.delete(id)
     }
   }
   const timer = setInterval(() => {
-    for (const [id, text] of [...undelivered]) {
+    for (const [id] of [...undelivered]) {
       void deliver(id)
     }
     for (const id of [...idle]) {
@@ -64,37 +74,55 @@ const network = (prompt: (id: string, text: string) => Promise<unknown>) => {
     status: async (id: string, state: string, dir: string) => {
       if (subagents.has(id)) return
       dirs.set(id, dir)
-      void run(["hook", "opencode", "status", "--session", id, "--state", state], dir)
+      const next = (statusChain.get(id) ?? Promise.resolve()).catch(() => {}).then(() =>
+        run(["hook", "opencode", "status", "--session", id, "--state", state], dir),
+      )
+      statusChain.set(id, next)
       if (state === "idle") {
         idle.add(id)
         await deliver(id)
       } else idle.delete(id)
     },
     stop: () => clearInterval(timer),
-    // Off the network: the session is gone, or opencode unloaded this plugin and nothing delivers to it any more.
+    // Off the network: the session is gone, or opencode unloaded this plugin and nothing delivers
+    // to it any more. Known sessions end with their folder's cwd, so the daemon's folder check
+    // passes; a session the plugin never saw still sends its end (no cwd), so the daemon can
+    // retire it.
     end: (id?: string) => {
+      if (id) {
+        const dir = dirs.get(id)
+        idle.delete(id)
+        undelivered.delete(id)
+        stamps.delete(id)
+        statusChain.delete(id)
+        dirs.delete(id)
+        void run(["hook", "opencode", "session-end", "--session", id], dir)
+        return
+      }
       for (const [s, dir] of [...dirs]) {
-        if (id && s !== id) continue
         idle.delete(s)
         dirs.delete(s)
         void run(["hook", "opencode", "session-end", "--session", s], dir)
       }
-      if (id) undelivered.delete(id)
-      else undelivered.clear()
+      undelivered.clear()
+      stamps.clear()
     },
   }
 }
 
 const Agentnet: Plugin = async ({ client, directory }) => {
+  // throwOnError: a rejected prompt must throw into our catch (and retry), not resolve as an
+  // unnoticed error result — the generated SDK otherwise swallows errors by default.
   const net = network((id, text) =>
-    client.session.promptAsync({ path: { id }, body: { parts: [{ type: "text", text }] } }),
+    client.session.promptAsync({ path: { id }, body: { parts: [{ type: "text", text }] }, throwOnError: true }),
   )
   return {
     event: async ({ event }) => {
       const e = event as { type?: string; properties?: { info?: { id?: string; parentID?: string }; sessionID?: string; status?: { type?: string } } }
       if (e.type === "session.created" && e.properties?.info?.parentID) net.subagent(e.properties.info.id)
       if (e.type === "session.status") await net.status(e.properties?.sessionID ?? "", e.properties?.status?.type ?? "", directory)
-      if (e.type === "session.deleted") net.end(e.properties?.sessionID)
+      // 1.x names the deleted session properties.info.id; 2.x-style payloads under 1.x's shape vary.
+      if (e.type === "session.deleted") net.end(e.properties?.info?.id ?? e.properties?.sessionID)
     },
     dispose: async () => {
       net.stop()
