@@ -387,7 +387,7 @@ func TestOpencodeBothFilesPrefersJSON(t *testing.T) {
 	if entry == nil || entry["type"] != "local" {
 		t.Fatalf("opencode.json must carry agentnet's server entry, got %v", doc)
 	}
-	if cmd, _ := entry["command"].([]any); len(cmd) != 2 || cmd[0] != "/exe" {
+	if cmd, _ := entry["command"].([]any); len(cmd) != 2 || cmd[0] != "/exe" || cmd[1] != "mcp" {
 		t.Fatalf("opencode.json's agentnet entry must name exe mcp, got %v", entry["command"])
 	}
 }

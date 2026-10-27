@@ -24,7 +24,6 @@ const network = (prompt: (id: string, text: string) => Promise<unknown>) => {
   const subagents = new Set<string>()
   const delivering = new Set<string>()
   const dirs = new Map<string, string>()
-  const dead = new Set<string>() // sessions told to end: no status or delivery may touch them again
   // Mail the daemon already printed to us (and marked read) whose injection failed: retried until
   // the session ends. agentnet's delivery prints then confirms, so a rejected prompt must be ours
   // to recover, not mail silently lost.
@@ -35,7 +34,19 @@ const network = (prompt: (id: string, text: string) => Promise<unknown>) => {
   const stamps = new Map<string, number>()
   // Status reports are launched in arrival order per session: subprocesses otherwise race, and a
   // late status-busy landing after its idle would leave the daemon showing a busy session.
+  // Status reports are launched in arrival order per session: subprocesses otherwise race, and a
+  // late status-busy landing after its idle would leave the daemon showing a busy session.
   const statusChain = new Map<string, Promise<unknown>>()
+  // Tombstones for ended sessions bound the plugin where it lives for weeks: keep the most recent
+  // ends only, since events for a deleted session are impossible, and the tombstone only guards
+  // against an event ordering we can't rule out.
+  const dead = new Set<string>()
+  const rememberDead = (id: string) => {
+    dead.add(id)
+    if (dead.size > 200) {
+      dead.delete(dead.values().next().value)
+    }
+  }
 
   const deliver = async (id: string) => {
     if (delivering.has(id) || subagents.has(id) || dead.has(id)) return
@@ -49,7 +60,11 @@ const network = (prompt: (id: string, text: string) => Promise<unknown>) => {
       try {
         await prompt(id, polled)
       } catch {
-        undelivered.set(id, polled)
+        // Only retryable while the session still ends somewhere: a failure landing after the end
+        // would otherwise be re-scanned by the timer forever.
+        if (!dead.has(id)) {
+          undelivered.set(id, polled)
+        }
       } finally {
         if ((stamps.get(id) ?? 0) === stamp) {
           idle.delete(id)
@@ -97,7 +112,7 @@ const network = (prompt: (id: string, text: string) => Promise<unknown>) => {
         )
       }
       if (id) {
-        dead.add(id)
+        rememberDead(id)
         idle.delete(id)
         undelivered.delete(id)
         stamps.delete(id)
@@ -106,7 +121,7 @@ const network = (prompt: (id: string, text: string) => Promise<unknown>) => {
         return
       }
       for (const [s, dir] of [...dirs]) {
-        dead.add(s)
+        rememberDead(s)
         idle.delete(s)
         finish(s, dir)
       }
