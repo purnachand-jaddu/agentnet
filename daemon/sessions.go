@@ -100,8 +100,11 @@ func (d *Daemon) register(c ipc.Conn, a RegisterArgs) (Registered, error) {
 	defer d.mu.Unlock()
 	d.conns[c.ID()] = c
 
-	// Forward join: an MCP connection attaches to the live hook-registered session of the same agent+PID.
-	if a.MCPPID != 0 {
+	// Forward join: an MCP connection attaches to the live hook-registered session of the same agent+PID
+	// — but only when the caller brings no session id of its own (a proc:<pid> placeholder). A named
+	// key is authoritative: multiplexed agents (e.g. opencode) share one server PID across all their
+	// sessions, and joining the most recently active one would fold session B into A.
+	if a.MCPPID != 0 && isPlaceholder(a.Session.Key) {
 		if l := d.findHookSession(a.Session.Agent, a.MCPPID); l != nil {
 			l.conn = c
 			if a.MCPPush {

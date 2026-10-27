@@ -20,6 +20,7 @@ import (
 	"github.com/purnachand-jaddu/agentnet/adapter/claude"
 	"github.com/purnachand-jaddu/agentnet/adapter/codex"
 	"github.com/purnachand-jaddu/agentnet/adapter/generic"
+	"github.com/purnachand-jaddu/agentnet/adapter/opencode"
 	"github.com/purnachand-jaddu/agentnet/config"
 	"github.com/purnachand-jaddu/agentnet/daemon"
 	"github.com/purnachand-jaddu/agentnet/discovery"
@@ -36,7 +37,7 @@ import (
 
 // adapters is the registry shared by the daemon and the MCP server, so they agree on names.
 func adapters() *adapter.Registry {
-	return adapter.NewRegistry(claude.New(), codex.New(nil), generic.New(), generic.CLI())
+	return adapter.NewRegistry(claude.New(), codex.New(nil), opencode.New(), generic.New(), generic.CLI())
 }
 
 // errLocked means acquireLock(path, false) found the lock already held.

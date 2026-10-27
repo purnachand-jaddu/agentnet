@@ -17,6 +17,7 @@ type fakeAdapter struct {
 	name, short  string
 	channel      adapter.Channel
 	clientNames  []string
+	mux          bool
 	mu           sync.Mutex
 	pushed       []string
 	running      bool
@@ -30,7 +31,7 @@ func (f *fakeAdapter) Name() string                            { return f.name }
 func (f *fakeAdapter) Short() string                           { return f.short }
 func (f *fakeAdapter) EnvSessionID(func(string) string) string { return "" }
 func (f *fakeAdapter) MetaSessionID(map[string]any) string     { return "" }
-func (f *fakeAdapter) Multiplexed() bool                       { return false }
+func (f *fakeAdapter) Multiplexed() bool                       { return f.mux }
 
 // Channel returns ChannelHook once st.PushFailed is set, so tests can observe the daemon feeding it back in.
 func (f *fakeAdapter) Channel(_ adapter.Session, st adapter.State) adapter.Channel {

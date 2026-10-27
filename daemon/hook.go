@@ -19,6 +19,7 @@ type HookArgs struct {
 	Event      adapter.HookEvent `json:"event"`
 	SessionID  string            `json:"session_id"`
 	Cwd        string            `json:"cwd"`
+	State      string            `json:"state,omitempty"` // opencode's status event: "busy" or "idle"
 	PID        int               `json:"pid,omitempty"`
 	Transcript string            `json:"transcript,omitempty"`
 	Inbox      string            `json:"inbox,omitempty"`
@@ -50,16 +51,31 @@ func (d *Daemon) hook(c ipc.Conn, a HookArgs) (HookResult, error) {
 	key := reg.Key
 
 	busy := a.Event == adapter.EventPrompt || a.Event == adapter.EventTool
+	if a.Event == adapter.EventStatus {
+		busy = a.State == "busy"
+	}
 	d.mu.Lock()
 	l, ok := d.live[key]
-	if ok {
+	if ok && a.Event != adapter.EventPoll {
+		// A poll reports nothing about busyness — it's the plugin asking a (usually idle) session for
+		// mail, and it may finish after a late status-busy lands, so it never overwrites the flag.
 		l.busy = busy
 		l.statusAt = d.opts.Now()
 	}
-	if a.Event == adapter.EventEnd && ok && l.conn == nil {
-		delete(d.live, key)
+	if a.Event == adapter.EventEnd && ok {
+		if l.conn == nil {
+			delete(d.live, key)
+		} else if adp, mux := d.opts.Adapters.Get(a.Agent); mux && adp.Multiplexed() {
+			// A multiplexed agent's conn is its server's, shared by its other sessions: the end of
+			// one session must retire it without touching the conn itself (what keeps claude's own
+			// session entry alive until its conn closes still applies to non-multiplexed agents).
+			delete(d.live, key)
+		}
 	}
 	d.mu.Unlock()
+	if a.Event == adapter.EventStatus {
+		return HookResult{Key: key}, nil // status words, never mail: polling prints it
+	}
 
 	msgs, err := d.pending(key)
 	if err != nil {

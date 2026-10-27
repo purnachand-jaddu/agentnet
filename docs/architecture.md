@@ -16,7 +16,8 @@ service, not a relay. Two machines that have joined the same team talk directly 
   (`list_team`, `send_message`, `check_inbox`), dialing the daemon's socket (`ipc`) for each call.
   It never talks to the network or the store directly.
 - **Hooks** (`agentnet hook <agent> <event>`) run at an agent's lifecycle points (start, prompt,
-  tool use, stop, end) and also talk to the daemon over the socket — this is how a message reaches
+  tool use, stop, end — and opencode's plugin also drives `poll` and `status`) and also talk to
+  the daemon over the socket — this is how a message reaches
   a session that isn't currently connected over MCP.
 - **The CLI** (`send`, `who`, `listen`, `folder`, `setup`, `init`, `join`, `admit`, `accept`,
   `revoke`, `doctor`, `up`, `held`, `approve`, `refuse`, `pause`, `resume`) is a person's own
@@ -28,7 +29,7 @@ service, not a relay. Two machines that have joined the same team talk directly 
 |---|---|
 | `daemon` | session registry, send/deliver/receive, policy, presence, audit |
 | `store` (+ `store/sqlite`) | persistence: mailboxes, outbox, sessions, blobs |
-| `adapter` (+ `claude`, `codex`, `generic`) | what's agent-specific: push, hook output, reachability |
+| `adapter` (+ `claude`, `codex`, `opencode`, `generic`) | what's agent-specific: push, hook output, reachability |
 | `identity`, `team` | keys, certs, join/admit/accept, revocation |
 | `envelope` | signs and HPKE-seals one message or presence update between two machines |
 | `seal` | the HPKE primitive envelope uses |

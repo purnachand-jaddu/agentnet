@@ -11,6 +11,7 @@ import (
 	"github.com/purnachand-jaddu/agentnet/adapter"
 	"github.com/purnachand-jaddu/agentnet/adapter/claude"
 	"github.com/purnachand-jaddu/agentnet/adapter/generic"
+	"github.com/purnachand-jaddu/agentnet/adapter/opencode"
 	"github.com/purnachand-jaddu/agentnet/daemon"
 	"github.com/purnachand-jaddu/agentnet/ipc"
 	"github.com/purnachand-jaddu/agentnet/store/storetest"
@@ -31,6 +32,7 @@ func testAdapters() *adapter.Registry {
 	return adapter.NewRegistry(
 		generic.WithEnv("mcp", "AGENTNET_TEST_SESSION"),
 		claude.New(),
+		opencode.New(),
 		newFakeMultiplexedAdapter(),
 		newFakeMetaAdapter(),
 	)
