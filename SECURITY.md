@@ -6,8 +6,9 @@ and its limits — read it before you trust it with anything.
 ## Consent is a speed bump, not a boundary
 
 `init`, `join`, `admit`, `accept`, `revoke`, `setup` and `folder add` all go through
-`consent.Approver` (a system dialog on macOS, a TTY prompt elsewhere). No MCP tool or hook can
-trigger them. But the approver only proves a human is present at the machine right now — it does
+`consent.Approver` (a system dialog on macOS, and on Linux when a dialog tool like
+zenity is installed and a display is set; a TTY prompt otherwise). No MCP tool or hook can trigger them. But the approver only proves a human
+is present at the machine right now — it does
 not prove the process asking is trustworthy. Any process that can control your terminal or your
 screen (including a misbehaving or prompt-injected agent with shell access) can answer the prompt
 for you. Don't treat an approval as proof of informed consent; treat it as a reminder to look.

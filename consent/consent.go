@@ -25,16 +25,28 @@ func isTerminal(f *os.File) bool {
 	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
 
-// Default picks the approver for this environment: macOS always uses the system dialog;
-// elsewhere a TTY prompt is used when stdin/stderr are terminals and no agent env is set; else NoHuman.
-func Default(goos string, getenv func(string) string, in, out *os.File) Approver {
-	if goos == "darwin" {
-		return Dialog{Run: runOsascript}
+// Default picks the approver for this environment: macOS always uses the system
+// dialog; elsewhere a system dialog when one can be shown (backend plus, on Linux,
+// an actual display; see dialogs), then a TTY prompt when stdin/stderr are terminals
+// and no agent env is set, else NoHuman.
+func Default(goos string, getenv func(string) string, dialogs func() bool, in, out *os.File) Approver {
+	if dialogs() && hasDisplay(goos, getenv) || goos == "darwin" {
+		return Dialog{Pick: pickZenity}
 	}
 	if isTerminal(in) && isTerminal(out) && !AgentEnv(getenv) {
 		return TTY{In: in, Out: out}
 	}
 	return NoHuman{}
+}
+
+// hasDisplay reports whether the environment can put a dialog on screen: darwin and
+// windows dialogs need no display variable, while Linux needs DISPLAY or WAYLAND_DISPLAY.
+func hasDisplay(goos string, getenv func(string) string) bool {
+	switch goos {
+	case "darwin", "windows":
+		return true
+	}
+	return getenv("DISPLAY") != "" || getenv("WAYLAND_DISPLAY") != ""
 }
 
 // NoHuman always refuses: there is no person to ask.

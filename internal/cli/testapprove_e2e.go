@@ -7,6 +7,7 @@ import (
 	"os"
 	"runtime"
 
+	"github.com/ncruces/zenity"
 	"github.com/purnachand-jaddu/agentnet/consent"
 )
 
@@ -17,7 +18,7 @@ func init() {
 		if os.Getenv("AGENTNET_TEST_APPROVE") == "yes" {
 			return testApprover{}
 		}
-		return consent.Default(runtime.GOOS, os.Getenv, os.Stdin, os.Stderr)
+		return consent.Default(runtime.GOOS, os.Getenv, zenity.IsAvailable, os.Stdin, os.Stderr)
 	}
 }
 
