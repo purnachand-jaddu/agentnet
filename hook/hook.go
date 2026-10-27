@@ -72,10 +72,11 @@ func Run(ctx context.Context, agent, event string, stdin io.Reader, stdout io.Wr
 	}
 
 	var in stdinJSON
-	json.Unmarshal(bytes.TrimPrefix(readStdin(stdin, 3*time.Second), bom), &in) // best effort
-
 	sessionID := flags.SessionID
 	if sessionID == "" {
+		// A --session caller (opencode's plugin) passes an open-but-empty stdin pipe; reading it
+		// would burn the 3-second deadline on every call, so flags carry the whole stdin contract.
+		json.Unmarshal(bytes.TrimPrefix(readStdin(stdin, 3*time.Second), bom), &in) // best effort
 		sessionID = in.SessionID
 	}
 	if sessionID == "" {

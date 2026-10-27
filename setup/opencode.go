@@ -2,6 +2,7 @@ package setup
 
 import (
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -44,7 +45,12 @@ func opencodeStep(home, exe string, run Runner) Step {
 			return errors.Join(errConfig, errPlugin)
 		},
 		Check: func() (bool, error) {
-			return opencodeConfigApplied(configPath, exe)
+			// Both pieces together: "already applied" that ignores missing delivery wiring lies.
+			mcp, err := opencodeConfigApplied(configPath, exe)
+			if err != nil {
+				return false, err
+			}
+			return mcp && opencodePluginApplied(pluginPath, exe), nil
 		},
 	}
 }
@@ -54,6 +60,24 @@ func opencodeJSONC(home string) bool {
 	dir := filepath.Join(home, ".config", "opencode")
 	_, err := os.Stat(filepath.Join(dir, "opencode.jsonc"))
 	return err == nil
+}
+
+// opencodeJSONCNoteFor renders the snippet jsonc users get instead of an edit, with the exe
+// marshalled like the written config: the note must stay valid JSON for any exe path.
+func opencodeJSONCNoteFor(exe string) string {
+	snippet, err := json.Marshal(map[string]any{
+		"mcp": map[string]any{
+			"servers": map[string]any{
+				"agentnet": map[string]any{
+					"type": "local", "command": []string{exe, "mcp"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return "" // a marshalling failure here is unreachable: plain maps and strings
+	}
+	return fmt.Sprintf("opencode: you use opencode.jsonc, which agentnet doesn't edit. Add this object's contents under the top level of opencode.jsonc:\n%s\n", snippet)
 }
 
 // applyOpencodeConfig writes mcp.servers.agentnet into opencode.json. With a jsonc file and no
@@ -67,7 +91,7 @@ func applyOpencodeConfig(dir, configPath, exe string) error {
 			if err := backupOnce(jsoncPath); err != nil {
 				return err
 			}
-			fmt.Fprintf(os.Stderr, opencodeJSONCNote, exe)
+			fmt.Fprint(os.Stderr, opencodeJSONCNoteFor(exe))
 			return nil
 		}
 	}
@@ -96,10 +120,6 @@ func applyOpencodeConfig(dir, configPath, exe string) error {
 	return saveJSON(configPath, doc)
 }
 
-// opencodeJSONCNote is the manual snippet jsonc users get instead of an edit.
-const opencodeJSONCNote = `opencode: you use opencode.jsonc, which agentnet doesn't edit. Add under "mcp": {"servers": {"agentnet": {"type": "local", "command": ["%s", "mcp"]}}}
-`
-
 // opencodeConfigApplied reads opencode.json directly: agentnet's local MCP server naming exe, or
 // not-found, never invoking the opencode binary.
 func opencodeConfigApplied(configPath, exe string) (bool, error) {
@@ -119,6 +139,9 @@ func opencodeConfigApplied(configPath, exe string) (bool, error) {
 	if entry == nil || entry["type"] != "local" {
 		return false, nil
 	}
+	if disabled, _ := entry["disabled"].(bool); disabled {
+		return false, nil // opencode won't load it, so it isn't wired
+	}
 	cmd, ok := entry["command"].([]any)
 	if !ok || len(cmd) != 2 || cmd[1] != "mcp" {
 		return false, nil
@@ -127,8 +150,12 @@ func opencodeConfigApplied(configPath, exe string) (bool, error) {
 	return c0 == exe, nil
 }
 
-// applyOpencodePlugin writes the plugin file, embedding the quoted exe path.
+// applyOpencodePlugin writes the plugin file, embedding the quoted exe path. A file at plugins/agentnet.ts
+// that isn't agentnet's is refused, not truncated: --remove keeps strangers' files, so must setup.
 func applyOpencodePlugin(pluginPath, exe string) error {
+	if data, err := os.ReadFile(pluginPath); err == nil && !strings.Contains(string(data), opencodePluginMarker) {
+		return fmt.Errorf("%s already exists and isn't agentnet's; move or remove it, then re-run `agentnet setup`", pluginPath)
+	}
 	content := strings.Replace(opencodePluginTemplate, "AGENTNET_ENGINE_PLACEHOLDER", strconv.Quote(exe), 1)
 	if err := os.MkdirAll(filepath.Dir(pluginPath), 0o700); err != nil {
 		return err
@@ -195,17 +222,15 @@ func removeOpencodePlugin(pluginPath string) error {
 }
 
 // OpenCodeWired reports whether the MCP registration and the plugin are wired for exe, read-only.
-// With opencode.jsonc in use the config write is a manual step the person does themselves, so a
-// jsonc file and a wired plugin count as wired (check shows what to add by --dry-run).
-func OpenCodeWired(home, exe string) (mcp, plugin bool, err error) {
+// A jsonc home is reported through the jsonc flag, never folded into mcp: agentnet can't know
+// whether the manual snippet was ever added, so claiming wired there would print a green that lies.
+func OpenCodeWired(home, exe string) (mcp, plugin, jsonc bool, err error) {
 	dir := filepath.Join(home, ".config", "opencode")
 	mcp, err = opencodeConfigApplied(filepath.Join(dir, "opencode.json"), exe)
 	if err != nil {
-		return false, false, err
-	}
-	if !mcp && opencodeJSONC(home) {
-		mcp = true // the snippet is on the person, not on a missing registration we could fix
+		return false, false, false, err
 	}
 	plugin = opencodePluginApplied(filepath.Join(dir, "plugins", "agentnet.ts"), exe)
-	return mcp, plugin, nil
+	jsonc = opencodeJSONC(home)
+	return mcp, plugin, jsonc, nil
 }

@@ -48,6 +48,24 @@ func TestDoctorOpencodeLines(t *testing.T) {
 	}
 }
 
+// TestDoctorOpencodeJSONCRequiresManualMCP pins the honesty rule: a jsonc home is never reported
+// as wired — the config snippet there is a manual step doctor fails until the person does it.
+func TestDoctorOpencodeJSONCRequiresManualMCP(t *testing.T) {
+	c := healthyChecks()
+	c.Agents = func() doctorAgents {
+		return doctorAgents{ClaudeFound: true, ClaudeMCP: true, ClaudeHooks: true, CodexFound: true, CodexConfig: true, CodexHooks: true,
+			OpenCodeFound: true, OpenCodePlugin: true, OpenCodeJSONC: true}
+	}
+	lines, code := runDoctor(c)
+	out := render(lines)
+	if code != 1 {
+		t.Fatalf("code = %d, want 1 (a manual jsonc step remains)", code)
+	}
+	if !strings.Contains(out, "opencode.jsonc") {
+		t.Fatalf("output must name the manual jsonc step:\n%s", out)
+	}
+}
+
 // TestDoctorOpencodeNotInstalledIsNotApplicable keeps a machine without opencode at exit 0.
 func TestDoctorOpencodeNotInstalledIsNotApplicable(t *testing.T) {
 	c := healthyChecks()

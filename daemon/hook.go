@@ -56,12 +56,21 @@ func (d *Daemon) hook(c ipc.Conn, a HookArgs) (HookResult, error) {
 	}
 	d.mu.Lock()
 	l, ok := d.live[key]
-	if ok {
+	if ok && a.Event != adapter.EventPoll {
+		// A poll reports nothing about busyness — it's the plugin asking a (usually idle) session for
+		// mail, and it may finish after a late status-busy lands, so it never overwrites the flag.
 		l.busy = busy
 		l.statusAt = d.opts.Now()
 	}
-	if a.Event == adapter.EventEnd && ok && l.conn == nil {
-		delete(d.live, key)
+	if a.Event == adapter.EventEnd && ok {
+		if l.conn == nil {
+			delete(d.live, key)
+		} else if adp, mux := d.opts.Adapters.Get(a.Agent); mux && adp.Multiplexed() {
+			// A multiplexed agent's conn is its server's, shared by its other sessions: the end of
+			// one session must retire it without touching the conn itself (what keeps claude's own
+			// session entry alive until its conn closes still applies to non-multiplexed agents).
+			delete(d.live, key)
+		}
 	}
 	d.mu.Unlock()
 	if a.Event == adapter.EventStatus {

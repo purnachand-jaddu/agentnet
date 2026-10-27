@@ -52,8 +52,9 @@ hold-for-approval and the loop guard all stay in the daemon.
 Two corollaries of the above, both standard same-user trust:
 
 - Any process running as you can drop its own `.ts` into that plugins directory, and OpenCode will
-  run it the same way it runs ours. agentnet neither reads nor cleans up a plugin file that
-  doesn't carry its own marker comment; `setup --remove` leaves strangers' files alone.
+  run it the same way it runs ours. Setup refuses to overwrite a `plugins/agentnet.ts` that doesn't
+  carry its marker (save it or move it first), and `setup --remove` deletes only the file carrying
+  its marker — strangers' files stay.
 - The plugin runs the installed `agentnet` binary by path. Replacing that binary replaces what the
   plugin executes — same as replacing any binary your hooks run.
 

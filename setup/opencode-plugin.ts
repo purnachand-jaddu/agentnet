@@ -2,18 +2,21 @@
 // Reports each session's busy/idle state to agentnet, and polls idle sessions to deliver
 // teammates' mail into them, on opencode 1.x and 2.x.
 import type { Plugin } from "@opencode-ai/plugin"
-import { execFile } from "node:child_process"
+import { execFile, type ChildProcess } from "node:child_process"
 
 const ENGINE = AGENTNET_ENGINE_PLACEHOLDER
 
 // windowsHide: opencode's background server has no console on Windows, so each hook call (a poll
 // every few seconds per idle session) would open a console window of its own that closes at once.
 const run = (args: string[], cwd: string) =>
-  new Promise<string>((resolve) =>
-    execFile(ENGINE, args, { cwd, timeout: 10_000, windowsHide: true }, (err, out) =>
+  new Promise<string>((resolve) => {
+    const child: ChildProcess = execFile(ENGINE, args, { cwd, timeout: 10_000, windowsHide: true }, (err, out) =>
       resolve(err ? "" : String(out).trim()),
-    ),
-  )
+    )
+    // execFile leaves stdin as an open pipe; agentnet's hook doesn't need it (--session is a flag),
+    // and an open pipe would make the hook wait its full stdin-read deadline on every call.
+    child.stdin?.end()
+  })
 
 // What both plugin formats share; `prompt` puts a teammate's message into a session.
 const network = (prompt: (id: string, text: string) => Promise<unknown>) => {
@@ -21,20 +24,40 @@ const network = (prompt: (id: string, text: string) => Promise<unknown>) => {
   const subagents = new Set<string>()
   const delivering = new Set<string>()
   const dirs = new Map<string, string>()
+  // Mail the daemon already printed to us (and marked read) whose injection failed: retried until
+  // the session ends. agentnet's delivery prints then confirms, so a rejected prompt must be ours
+  // to recover, not mail silently lost.
+  const undelivered = new Map<string, string>()
 
   const deliver = async (id: string) => {
     if (delivering.has(id) || subagents.has(id)) return
     delivering.add(id)
     try {
-      const text = await run(["hook", "opencode", "poll", "--session", id], dirs.get(id)!)
-      if (!text) return
-      idle.delete(id)
-      await prompt(id, text)
+      const polled = undelivered.get(id) ?? (await run(["hook", "opencode", "poll", "--session", id], dirs.get(id)!))
+      undelivered.delete(id)
+      if (!polled) return
+      // The session may have ended while the poll ran; mail for a session opencode forgot would
+      // only fail again.
+      if (!dirs.has(id)) return
+      try {
+        await prompt(id, polled)
+      } catch {
+        undelivered.set(id, polled)
+      } finally {
+        idle.delete(id)
+      }
     } finally {
       delivering.delete(id)
     }
   }
-  const timer = setInterval(() => idle.forEach((id) => void deliver(id)), 5_000)
+  const timer = setInterval(() => {
+    for (const [id, text] of [...undelivered]) {
+      void deliver(id)
+    }
+    for (const id of [...idle]) {
+      void deliver(id)
+    }
+  }, 5_000)
 
   return {
     subagent: (id: string) => subagents.add(id),
@@ -56,6 +79,8 @@ const network = (prompt: (id: string, text: string) => Promise<unknown>) => {
         dirs.delete(s)
         void run(["hook", "opencode", "session-end", "--session", s], dir)
       }
+      if (id) undelivered.delete(id)
+      else undelivered.clear()
     },
   }
 }
@@ -69,8 +94,12 @@ const Agentnet: Plugin = async ({ client, directory }) => {
       const e = event as { type?: string; properties?: { info?: { id?: string; parentID?: string }; sessionID?: string; status?: { type?: string } } }
       if (e.type === "session.created" && e.properties?.info?.parentID) net.subagent(e.properties.info.id)
       if (e.type === "session.status") await net.status(e.properties?.sessionID ?? "", e.properties?.status?.type ?? "", directory)
+      if (e.type === "session.deleted") net.end(e.properties?.sessionID)
     },
-    dispose: async () => net.stop(),
+    dispose: async () => {
+      net.stop()
+      net.end()
+    },
   }
 }
 
@@ -86,6 +115,8 @@ const STATE: Record<string, string> = {
 export default {
   id: "agentnet",
   server: Agentnet,
+  // The typed context is 2.x's; 1.x calls this too, with a context that has no events, and runs
+  // `server` instead.
   setup: (ctx: {
     event?: { subscribe: (opts: { signal: AbortSignal }) => AsyncIterable<{ type?: string; data?: { sessionID?: string; parentID?: string }; location?: { directory?: string } }> }
     location: { directory: string }

@@ -217,29 +217,155 @@ func TestOpencodePluginEngineIsAQuotedPath(t *testing.T) {
 	}
 }
 
-// TestOpencodeWiredChecksBothPieces mirrors the claude/codex wired checks: no files means not
-// wired, an applied config plus plugin means wired.
+// TestOpencodeWiredReportsJSONCSeparately mirrors the claude/codex wired checks: no files means
+// not wired; an applied config plus plugin is wired; a jsonc home means the config side is a
+// manual step, never claimed as done.
 func TestOpencodeWired(t *testing.T) {
 	home := t.TempDir()
-	if mcp, plugin, err := OpenCodeWired(home, "/exe"); mcp || plugin || err != nil {
-		t.Fatalf("empty home: mcp=%v plugin=%v err=%v", mcp, plugin, err)
+	if mcp, plugin, jsonc, err := OpenCodeWired(home, "/exe"); mcp || plugin || jsonc || err != nil {
+		t.Fatalf("empty home: mcp=%v plugin=%v jsonc=%v err=%v", mcp, plugin, jsonc, err)
 	}
 	if err := opencodeStep(home, "/exe", Exec).Apply(); err != nil {
 		t.Fatal(err)
 	}
-	mcp, plugin, err := OpenCodeWired(home, "/exe")
+	mcp, plugin, jsonc, err := OpenCodeWired(home, "/exe")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !mcp || !plugin {
-		t.Fatalf("after apply: mcp=%v plugin=%v", mcp, plugin)
+	if !mcp || !plugin || jsonc {
+		t.Fatalf("after apply: mcp=%v plugin=%v jsonc=%v", mcp, plugin, jsonc)
 	}
 	// A foreign, wrong-exe entry is not ours.
 	other := t.TempDir()
 	if err := opencodeStep(other, "/other/exe", Exec).Apply(); err != nil {
 		t.Fatal(err)
 	}
-	if mcp, plugin, err := OpenCodeWired(other, "/exe"); mcp || plugin || err != nil {
-		t.Fatalf("stranger's home: mcp=%v plugin=%v err=%v", mcp, plugin, err)
+	if mcp, plugin, jsonc, err := OpenCodeWired(other, "/exe"); mcp || plugin || jsonc || err != nil {
+		t.Fatalf("stranger's home: mcp=%v plugin=%v jsonc=%v err=%v", mcp, plugin, jsonc, err)
+	}
+}
+
+// TestOpencodeWiredRejectsDisabledEntry pins that a disabled agentnet entry is not "wired": opencode
+// won't load it, so claiming the MCP side would print a green that lies.
+func TestOpencodeWiredRejectsDisabledEntry(t *testing.T) {
+	home := t.TempDir()
+	if err := opencodeStep(home, "/exe", Exec).Apply(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, ".config", "opencode", "opencode.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabled := strings.Replace(string(data), `"disabled": false`, `"disabled": true`, 1)
+	if disabled == string(data) {
+		t.Fatalf("expected a disabled:false in the written config: %s", data)
+	}
+	if err := os.WriteFile(path, []byte(disabled), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mcp, _, _, err := OpenCodeWired(home, "/exe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mcp {
+		t.Fatal("a disabled entry must not count as wired")
+	}
+}
+
+// TestOpencodeWiredJSONCIsManualNotWired pins that a jsonc home is reported as a manual step, not
+// as wired: agentnet cannot know whether the snippet was ever added.
+func TestOpencodeWiredJSONCIsManualNotWired(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, ".config", "opencode")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "opencode.jsonc"), []byte("{\"plugin\":[\"x\"] // note\n}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := opencodeStep(home, "/exe", Exec).Apply(); err != nil {
+		t.Fatal(err)
+	}
+	mcp, plugin, jsonc, err := OpenCodeWired(home, "/exe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mcp || !plugin || !jsonc {
+		t.Fatalf("jsonc-only home: mcp=%v plugin=%v jsonc=%v", mcp, plugin, jsonc)
+	}
+}
+
+// TestOpencodeApplyRefusesForeignPluginFile checks apply never destroys a plugins/agentnet.ts that
+// isn't agentnet's: --remove already keeps it, ordinary setup must not truncate it either.
+func TestOpencodeApplyRefusesForeignPluginFile(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, ".config", "opencode")
+	if err := os.MkdirAll(filepath.Join(dir, "plugins"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	foreign := "// someone else's plugin with the same name\nexport default {}"
+	path := filepath.Join(dir, "plugins", "agentnet.ts")
+	if err := os.WriteFile(path, []byte(foreign), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := opencodeStep(home, "/exe", Exec).Apply()
+	if err == nil || !strings.Contains(err.Error(), "agentnet.ts") {
+		t.Fatalf("apply should refuse a foreign plugin file, got: %v", err)
+	}
+	data, err2 := os.ReadFile(path)
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+	if string(data) != foreign {
+		t.Fatal("foreign plugin file was modified")
+	}
+}
+
+// TestOpencodeCheckSeesBothPieces: a step whose config is applied but whose plugin was removed
+// (or never applied) must not read as already applied.
+func TestOpencodeCheckSeesBothPieces(t *testing.T) {
+	home := t.TempDir()
+	s := opencodeStep(home, "/exe", Exec)
+	if err := s.Apply(); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.Check(); err != nil || !ok {
+		t.Fatalf("check after apply: %v %v", ok, err)
+	}
+	if err := os.Remove(filepath.Join(home, ".config", "opencode", "plugins", "agentnet.ts")); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.Check(); err != nil || ok {
+		t.Fatalf("check without the plugin: %v %v", ok, err)
+	}
+}
+
+// TestOpencodeJSONCNoteEscapesExe: the snippet printed for jsonc users must be valid JSON for
+// whatever exe path it carries, escaped like the written config is.
+func TestOpencodeJSONCNoteEscapesExe(t *testing.T) {
+	exe := `/tmp/w Space"quote\agentnet`
+	note := opencodeJSONCNoteFor(exe)
+	// The exe must appear escaped exactly as JSON escapes it, not broken by the raw characters.
+	raw, _ := json.Marshal(exe)
+	if !strings.Contains(note, string(raw)) {
+		t.Fatalf("note lost the exe entirely:\n%s", note)
+	}
+	// The note embeds a JSON object under mcp.servers.agentnet; parse just that part.
+	start, end := strings.Index(note, "{"), strings.LastIndex(note, "}")
+	if start < 0 || end <= start {
+		t.Fatalf("note carries no JSON object:\n%s", note)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(note[start:end+1]), &parsed); err != nil {
+		t.Fatalf("the note's object is not valid JSON: %v\n%s", err, note)
+	}
+	mcp, _ := parsed["mcp"].(map[string]any)
+	servers, _ := mcp["servers"].(map[string]any)
+	entry, _ := servers["agentnet"].(map[string]any)
+	cmd, _ := entry["command"].([]any)
+	if len(cmd) != 2 || cmd[0] != exe {
+		t.Fatalf("note's command escapes wrongly: %v", entry)
 	}
 }

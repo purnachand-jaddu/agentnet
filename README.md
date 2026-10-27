@@ -90,7 +90,8 @@ via `agentnet setup`'s wiring — you shouldn't need to run them by hand.
 
 `agentnet setup` edits opencode.json only. If your config is `~/.config/opencode/opencode.jsonc`
 it won't be touched: setup prints the `mcp.servers.agentnet` snippet to add by hand, and still
-writes the plugin (`~/.config/opencode/plugins/agentnet.ts`, which opencode autoloads).
+writes the plugin (`~/.config/opencode/plugins/agentnet.ts`, which opencode autoloads — worth
+confirming in a fresh session).
 
 ## Config
 

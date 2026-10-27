@@ -36,11 +36,12 @@ type doctorTeamInfo struct {
 
 // doctorAgents is whether Claude Code, Codex and opencode are installed, and whether their MCP
 // registration and lifecycle hooks (or, for opencode, its plugin) are each wired, from setup's own
-// read-only checks.
+// read-only checks. OpenCodeJSONC means the config file is one agentnet can't edit.
 type doctorAgents struct {
 	ClaudeFound, ClaudeMCP, ClaudeHooks        bool
 	CodexFound, CodexConfig, CodexHooks        bool
 	OpenCodeFound, OpenCodeMCP, OpenCodePlugin bool
+	OpenCodeJSONC                              bool
 }
 
 // doctorChecks is every call doctor makes to the outside world, as funcs, so tests can fake all of
@@ -147,7 +148,7 @@ func doctorAgentsFromSetup() doctorAgents {
 
 	if _, err := exec.LookPath("opencode"); err == nil || opencodeDirExists(home) {
 		a.OpenCodeFound = true
-		a.OpenCodeMCP, a.OpenCodePlugin, _ = setup.OpenCodeWired(home, exe)
+		a.OpenCodeMCP, a.OpenCodePlugin, a.OpenCodeJSONC, _ = setup.OpenCodeWired(home, exe)
 	}
 	return a
 }
@@ -342,6 +343,8 @@ func opencodeLine(a doctorAgents) line {
 	switch {
 	case a.OpenCodeMCP && a.OpenCodePlugin:
 		return okLine("opencode: wired")
+	case a.OpenCodeJSONC && !a.OpenCodeMCP:
+		return badLine("opencode: plugin " + wired(a.OpenCodePlugin) + ", but the MCP snippet must be hand-added to opencode.jsonc (`agentnet setup --dry-run` prints it)")
 	case !a.OpenCodeMCP && !a.OpenCodePlugin:
 		return badLine("opencode: installed but not wired (MCP and plugin both missing); re-run `agentnet setup`")
 	case a.OpenCodeMCP:
@@ -349,6 +352,14 @@ func opencodeLine(a doctorAgents) line {
 	default:
 		return badLine("opencode: installed but MCP not registered; re-run `agentnet setup`")
 	}
+}
+
+// wired is the word for whether a piece is in place, for lines that compose it into longer text.
+func wired(v bool) string {
+	if v {
+		return "wired"
+	}
+	return "missing"
 }
 
 // agentLine reports which part of the wiring (MCP registration, hooks, or both) is missing.
