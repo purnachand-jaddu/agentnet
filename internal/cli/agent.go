@@ -42,6 +42,8 @@ func cmdMCP(args []string) int {
 func cmdHook(args []string) int {
 	fs := flag.NewFlagSet("hook", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	sessionFlag := fs.String("session", "", "session id, when no stdin JSON carries one")
+	stateFlag := fs.String("state", "", "opencode's status event only: busy or idle")
 	if err := fs.Parse(args); err != nil {
 		return 0
 	}
@@ -58,6 +60,6 @@ func cmdHook(args []string) int {
 		defer client.Close()
 		call = client.Call
 	}
-	hook.Run(context.Background(), rest[0], rest[1], stdin, stdout, call, os.Getenv)
+	hook.Run(context.Background(), rest[0], rest[1], stdin, stdout, call, os.Getenv, hook.Flags{SessionID: *sessionFlag, State: *stateFlag})
 	return 0
 }

@@ -34,11 +34,13 @@ type doctorTeamInfo struct {
 	HasFounderKey  bool
 }
 
-// doctorAgents is whether Claude Code and Codex are installed, and whether their MCP registration
-// and lifecycle hooks are each wired, from setup's own read-only checks.
+// doctorAgents is whether Claude Code, Codex and opencode are installed, and whether their MCP
+// registration and lifecycle hooks (or, for opencode, its plugin) are each wired, from setup's own
+// read-only checks.
 type doctorAgents struct {
-	ClaudeFound, ClaudeMCP, ClaudeHooks bool
-	CodexFound, CodexConfig, CodexHooks bool
+	ClaudeFound, ClaudeMCP, ClaudeHooks        bool
+	CodexFound, CodexConfig, CodexHooks        bool
+	OpenCodeFound, OpenCodeMCP, OpenCodePlugin bool
 }
 
 // doctorChecks is every call doctor makes to the outside world, as funcs, so tests can fake all of
@@ -142,7 +144,18 @@ func doctorAgentsFromSetup() doctorAgents {
 		a.CodexFound = true
 		a.CodexConfig, a.CodexHooks, _ = setup.CodexWired(home, exe)
 	}
+
+	if _, err := exec.LookPath("opencode"); err == nil || opencodeDirExists(home) {
+		a.OpenCodeFound = true
+		a.OpenCodeMCP, a.OpenCodePlugin, _ = setup.OpenCodeWired(home, exe)
+	}
 	return a
+}
+
+// opencodeDirExists reports whether OpenCode's config directory exists.
+func opencodeDirExists(home string) bool {
+	_, err := os.Stat(filepath.Join(home, ".config", "opencode"))
+	return err == nil
 }
 
 func doctorFolders() ([]string, error) {
@@ -317,6 +330,24 @@ func agentLines(a doctorAgents) []line {
 	return []line{
 		agentLine("Claude Code", a.ClaudeFound, a.ClaudeMCP, a.ClaudeHooks),
 		agentLine("Codex", a.CodexFound, a.CodexConfig, a.CodexHooks),
+		opencodeLine(a),
+	}
+}
+
+// opencodeLine reports which part of the wiring (the MCP registration or the plugin) is missing.
+func opencodeLine(a doctorAgents) line {
+	if !a.OpenCodeFound {
+		return naLine("opencode: not installed")
+	}
+	switch {
+	case a.OpenCodeMCP && a.OpenCodePlugin:
+		return okLine("opencode: wired")
+	case !a.OpenCodeMCP && !a.OpenCodePlugin:
+		return badLine("opencode: installed but not wired (MCP and plugin both missing); re-run `agentnet setup`")
+	case a.OpenCodeMCP:
+		return badLine("opencode: installed but plugin missing; re-run `agentnet setup`")
+	default:
+		return badLine("opencode: installed but MCP not registered; re-run `agentnet setup`")
 	}
 }
 

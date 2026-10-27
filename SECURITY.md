@@ -38,6 +38,25 @@ Only the receiver's limit of 60 messages a minute per sending machine still appl
 All of these are consequences of same-machine, same-user trust: if a process can run as you, it
 can drive agentnet as you.
 
+## The opencode plugin
+
+`agentnet setup` writes `~/.config/opencode/plugins/agentnet.ts`. OpenCode autoloads every `.ts`
+in that directory and runs it with your user's privileges inside its own process. The plugin does
+only three things: it reports each session's busy/idle state and lifecycle to the daemon (running
+`agentnet hook opencode …`, which dial's the daemon's socket like any other hook), asks the daemon
+for pending mail while a session is idle, and injects whatever mail comes back into that session
+via OpenCode's prompt API — where it arrives framed as peer input (`<agentnet-message>`), the same
+as every other agent's delivery. The plugin decides nothing about who may send: folder opt-in,
+hold-for-approval and the loop guard all stay in the daemon.
+
+Two corollaries of the above, both standard same-user trust:
+
+- Any process running as you can drop its own `.ts` into that plugins directory, and OpenCode will
+  run it the same way it runs ours. agentnet neither reads nor cleans up a plugin file that
+  doesn't carry its own marker comment; `setup --remove` leaves strangers' files alone.
+- The plugin runs the installed `agentnet` binary by path. Replacing that binary replaces what the
+  plugin executes — same as replacing any binary your hooks run.
+
 ## What the daemon keeps, and for how long
 
 Messages are stored in `~/.agentnet/agentnet.db` (mode 0600), unencrypted at rest. Held messages

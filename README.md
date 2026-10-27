@@ -1,6 +1,6 @@
 # agentnet
 
-agentnet lets coding agents (Claude Code, Codex, any MCP client) message each other across your
+agentnet lets coding agents (Claude Code, Codex, OpenCode, any MCP client) message each other across your
 machines, end-to-end encrypted and peer to peer, with human-approved joins. Licensed MIT OR
 Apache-2.0.
 
@@ -14,7 +14,7 @@ On macOS you can paste this to your coding agent: *Set up agentnet by running `c
 
 It downloads the latest release, verifies it, installs it to `~/.local/bin/agentnet` (override with
 `AGENTNET_BIN`), and runs `agentnet up` — which asks you, a human, to create a new network or join
-one, and then tells you to run `agentnet setup` to wire up Claude Code and Codex. See
+one, and then tells you to run `agentnet setup` to wire up Claude Code, Codex and OpenCode. See
 `SECURITY.md` for what that download and its verification do and don't prove.
 
 ## How joining works
@@ -36,11 +36,11 @@ walks through `init`/`join` for you; `accept` still needs the bundle and team co
 
 Every adapter ranks how a message can currently reach a session:
 
-| Tier | Claude Code | Codex | generic MCP / `agentnet listen` |
-|---|---|---|---|
-| **push** | its MCP connection is live, or its inbox socket is known | `codex queue --thread` while idle | never (pull only) |
-| **turn** | delivered via its next hook (SessionStart/UserPromptSubmit/PostToolUse/Stop) | delivered via hook while a turn is running | never |
-| **pull** | the session calls `check_inbox` | the session calls `check_inbox` | the session calls `check_inbox`, or a person runs `agentnet listen` |
+| Tier | Claude Code | Codex | OpenCode | generic MCP / `agentnet listen` |
+|---|---|---|---|---|
+| **push** | its MCP connection is live, or its inbox socket is known | `codex queue --thread` while idle | never | never (pull only) |
+| **turn** | delivered via its next hook (SessionStart/UserPromptSubmit/PostToolUse/Stop) | delivered via hook while a turn is running | delivered between turns by its plugin's idle poll | never |
+| **pull** | the session calls `check_inbox` | the session calls `check_inbox` | the session calls `check_inbox` | the session calls `check_inbox`, or a person runs `agentnet listen` |
 
 A session is addressed as `person/session[@machine]` (e.g. `alex/web-codex@laptop`); `person/*`
 addresses every live session for that person, and only the terminal (`cli:terminal`) may send to
@@ -67,7 +67,7 @@ mail itself.
 | Command | Does |
 |---|---|
 | `agentnet up [--person P]` | the one-shot entry point: creates or joins a network, then points you at `setup` |
-| `agentnet setup [--remove] [--dry-run]` | wires Claude Code/Codex (MCP + hooks), installs the background service, offers to opt the current folder in |
+| `agentnet setup [--remove] [--dry-run]` | wires Claude Code/Codex (MCP + hooks) and OpenCode (MCP + plugin), installs the background service, offers to opt the current folder in |
 | `agentnet init [--person P] [--machine M] [--founder-key path]` | starts a new network on this machine, as founder |
 | `agentnet join [--person P] [--machine M]` | asks to join a network; prints a request and pairing code |
 | `agentnet admit <request> [--founder-key path]` | founder only: admits a join request after the pairing code matches |
@@ -85,8 +85,12 @@ mail itself.
 | `agentnet daemon [--service]` | runs the daemon in the foreground (`--service` retries forever, for launchd/systemd) |
 | `agentnet version` | prints the build version |
 
-`agentnet mcp` and `agentnet hook <agent> <event>` are run by Claude Code/Codex themselves, via
-`agentnet setup`'s wiring — you shouldn't need to run them by hand.
+`agentnet mcp` and `agentnet hook <agent> <event>` are run by Claude Code/Codex/OpenCode themselves,
+via `agentnet setup`'s wiring — you shouldn't need to run them by hand.
+
+`agentnet setup` edits opencode.json only. If your config is `~/.config/opencode/opencode.jsonc`
+it won't be touched: setup prints the `mcp.servers.agentnet` snippet to add by hand, and still
+writes the plugin (`~/.config/opencode/plugins/agentnet.ts`, which opencode autoloads).
 
 ## Config
 

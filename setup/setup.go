@@ -74,6 +74,15 @@ func Plan(home, exe string, run Runner) []Step {
 		steps = append(steps, codexStep(home, exe, run))
 	}
 
+	opencodePath, opencodeErr := exec.LookPath("opencode")
+	if opencodeErr == nil {
+		binDirs = append(binDirs, filepath.Dir(opencodePath))
+	}
+	_, opencodeDirErr := os.Stat(filepath.Join(home, ".config", "opencode"))
+	if opencodeErr == nil || opencodeDirErr == nil {
+		steps = append(steps, opencodeStep(home, exe, run))
+	}
+
 	steps = append(steps, serviceStep(home, exe, run, goos, binDirs))
 	return steps
 }

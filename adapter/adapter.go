@@ -53,6 +53,8 @@ const (
 	EventTool   HookEvent = "tool"
 	EventStop   HookEvent = "stop"
 	EventEnd    HookEvent = "end"
+	EventPoll   HookEvent = "poll"   // opencode's plugin polls for pending mail
+	EventStatus HookEvent = "status" // opencode's plugin reports busy/idle; no mail is returned
 )
 
 // Adapter is everything agent-specific: identity, push and hook output.

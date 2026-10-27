@@ -19,6 +19,7 @@ type HookArgs struct {
 	Event      adapter.HookEvent `json:"event"`
 	SessionID  string            `json:"session_id"`
 	Cwd        string            `json:"cwd"`
+	State      string            `json:"state,omitempty"` // opencode's status event: "busy" or "idle"
 	PID        int               `json:"pid,omitempty"`
 	Transcript string            `json:"transcript,omitempty"`
 	Inbox      string            `json:"inbox,omitempty"`
@@ -50,6 +51,9 @@ func (d *Daemon) hook(c ipc.Conn, a HookArgs) (HookResult, error) {
 	key := reg.Key
 
 	busy := a.Event == adapter.EventPrompt || a.Event == adapter.EventTool
+	if a.Event == adapter.EventStatus {
+		busy = a.State == "busy"
+	}
 	d.mu.Lock()
 	l, ok := d.live[key]
 	if ok {
@@ -60,6 +64,9 @@ func (d *Daemon) hook(c ipc.Conn, a HookArgs) (HookResult, error) {
 		delete(d.live, key)
 	}
 	d.mu.Unlock()
+	if a.Event == adapter.EventStatus {
+		return HookResult{Key: key}, nil // status words, never mail: polling prints it
+	}
 
 	msgs, err := d.pending(key)
 	if err != nil {

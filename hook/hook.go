@@ -17,6 +17,12 @@ import (
 // agentPID finds the agent's real pid past any shell that execs the hook; tests stub it to stay hermetic.
 var agentPID = func(start int) int { return proc.AgentPID(start, proc.PS) }
 
+// Flags are the command-line flags that override stdin-JSON fields (an execFile caller passes no stdin).
+type Flags struct {
+	SessionID string // --session
+	State     string // --state: opencode's status event, "busy" or "idle"
+}
+
 // eventByName maps a hook system's event name to the adapter.HookEvent the daemon expects.
 var eventByName = map[string]adapter.HookEvent{
 	"session-start":      adapter.EventStart,
@@ -24,6 +30,8 @@ var eventByName = map[string]adapter.HookEvent{
 	"post-tool-use":      adapter.EventTool,
 	"stop":               adapter.EventStop,
 	"session-end":        adapter.EventEnd,
+	"poll":               adapter.EventPoll,
+	"status":             adapter.EventStatus,
 }
 
 // stdinJSON is the subset of a hook's JSON payload Run reads.
@@ -52,9 +60,9 @@ func readStdin(r io.Reader, timeout time.Duration) []byte {
 	}
 }
 
-// Run reads the hook's stdin JSON, tells the daemon about event, and prints any mail. It never
-// returns an error: a broken daemon or malformed input must not break the agent that ran the hook.
-func Run(ctx context.Context, agent, event string, stdin io.Reader, stdout io.Writer, call func(ctx context.Context, op string, args, result any) error, getenv func(string) string) error {
+// Run reads the hook's stdin JSON (or Flags), tells the daemon about event, and prints any mail.
+// It never returns an error: a broken daemon or malformed input must not break the agent that ran the hook.
+func Run(ctx context.Context, agent, event string, stdin io.Reader, stdout io.Writer, call func(ctx context.Context, op string, args, result any) error, getenv func(string) string, flags Flags) error {
 	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 
@@ -66,7 +74,10 @@ func Run(ctx context.Context, agent, event string, stdin io.Reader, stdout io.Wr
 	var in stdinJSON
 	json.Unmarshal(bytes.TrimPrefix(readStdin(stdin, 3*time.Second), bom), &in) // best effort
 
-	sessionID := in.SessionID
+	sessionID := flags.SessionID
+	if sessionID == "" {
+		sessionID = in.SessionID
+	}
 	if sessionID == "" {
 		sessionID = in.SessionIDAlt
 	}
@@ -86,7 +97,7 @@ func Run(ctx context.Context, agent, event string, stdin io.Reader, stdout io.Wr
 	}
 
 	args := daemon.HookArgs{
-		Agent: agent, Event: ev, SessionID: sessionID, Cwd: cwd, PID: agentPID(os.Getppid()), Transcript: in.TranscriptPath,
+		Agent: agent, Event: ev, SessionID: sessionID, Cwd: cwd, State: flags.State, PID: agentPID(os.Getppid()), Transcript: in.TranscriptPath,
 	}
 	if agent == "claude-code" {
 		args.Inbox = getenv("CLAUDE_CODE_MESSAGING_SOCKET")
