@@ -339,9 +339,16 @@ func TestOpencodeApplyRefusesUnreadablePluginFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
-
 	if err := opencodeStep(home, "/exe", Exec).Apply(); err == nil {
 		t.Fatal("apply should refuse a plugin file it cannot inspect")
+	}
+	// The point of the refusal: an uninspectable file must come out of setup byte-identical. Make
+	// it readable again before verifying that.
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != "unreadable foreign plugin" {
+		t.Fatalf("unreadable plugin file must be untouched: %v %s", err, data)
 	}
 }
 
@@ -367,8 +374,21 @@ func TestOpencodeBothFilesPrefersJSON(t *testing.T) {
 	if data, err := os.ReadFile(filepath.Join(dir, "opencode.jsonc")); err != nil || string(data) != jsonc {
 		t.Fatalf("opencode.jsonc must be untouched: %v %s", err, data)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "opencode.json")); err != nil {
-		t.Fatalf("opencode.json should still be written when it exists: %v", err)
+	data, err := os.ReadFile(filepath.Join(dir, "opencode.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatal(err)
+	}
+	servers, _ := doc["mcp"].(map[string]any)["servers"].(map[string]any)
+	entry, _ := servers["agentnet"].(map[string]any)
+	if entry == nil || entry["type"] != "local" {
+		t.Fatalf("opencode.json must carry agentnet's server entry, got %v", doc)
+	}
+	if cmd, _ := entry["command"].([]any); len(cmd) != 2 || cmd[0] != "/exe" {
+		t.Fatalf("opencode.json's agentnet entry must name exe mcp, got %v", entry["command"])
 	}
 }
 

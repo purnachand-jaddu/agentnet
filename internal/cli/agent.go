@@ -50,7 +50,7 @@ func cmdHook(args []string) int {
 	call := func(ctx context.Context, op string, args, result any) error {
 		return fmt.Errorf("agentnet: daemon unavailable")
 	}
-	if client, err := autostartDial(); err == nil {
+	if client, err := dial(); err == nil {
 		defer client.Close()
 		call = client.Call
 	}
@@ -58,9 +58,13 @@ func cmdHook(args []string) int {
 	return 0
 }
 
-// hookRun is `agentnet hook`'s call into the hook package, as a var so tests can pin how cmdHook
-// wires a parsed argv (the plugin's exact invocation shape) into hook.Run.
-var hookRun = hook.Run
+// hookRun is `agentnet hook`'s call into the hook package, and dial is its path to the daemon, as
+// vars so tests can pin the wiring without touching a real socket, the launchd service or a
+// re-executed test binary.
+var (
+	hookRun = hook.Run
+	dial    = autostartDial
+)
 
 // hookArgs parses `agentnet hook` arguments: agent and event are positional, and --session/--state may
 // sit on either side of them — opencode's plugin calls with the positionals first, and Go's flag

@@ -2,10 +2,12 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"io"
 	"testing"
 
 	"github.com/purnachand-jaddu/agentnet/hook"
+	"github.com/purnachand-jaddu/agentnet/ipc"
 )
 
 // TestHookArgsParsesPluginInvocation pins the plugin's exact argv shapes: opencode's execFile puts
@@ -52,17 +54,19 @@ func TestHookArgsParsesPluginInvocation(t *testing.T) {
 }
 
 // TestCmdHookParsesPluginArgv pins the wiring itself: the plugin's exact argv must come out of
-// cmdHook as the right agent/event for hook.Run, not just out of the parser in isolation.
+// cmdHook as the right agent/event for hook.Run — and it must not touch a real daemon while doing
+// it (dial stays unbound: a missing daemon answers through the error call, like the plugin sees).
 func TestCmdHookParsesPluginArgv(t *testing.T) {
 	var agent, event string
 	var flags hook.Flags
 	calls := 0
-	orig := hookRun
+	origHookRun, origDial := hookRun, dial
 	hookRun = func(_ context.Context, a, e string, _ io.Reader, _ io.Writer, _ func(ctx context.Context, op string, args, result any) error, _ func(string) string, f hook.Flags) error {
 		agent, event, flags, calls = a, e, f, calls+1
 		return nil
 	}
-	defer func() { hookRun = orig }()
+	dial = func() (*ipc.Client, error) { return nil, errors.New("tests never dial") }
+	defer func() { hookRun, dial = origHookRun, origDial }()
 
 	code := cmdHook([]string{"opencode", "status", "--session", "ses_1", "--state", "busy"})
 	if code != 0 || calls != 1 {

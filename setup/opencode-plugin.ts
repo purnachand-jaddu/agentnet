@@ -24,35 +24,34 @@ const network = (prompt: (id: string, text: string) => Promise<unknown>) => {
   const subagents = new Set<string>()
   const delivering = new Set<string>()
   const dirs = new Map<string, string>()
+  const dead = new Set<string>() // sessions told to end: no status or delivery may touch them again
   // Mail the daemon already printed to us (and marked read) whose injection failed: retried until
   // the session ends. agentnet's delivery prints then confirms, so a rejected prompt must be ours
   // to recover, not mail silently lost.
   const undelivered = new Map<string, string>()
-  // Which delivery attempt is the newest per session: only that one clears the idle flag when it
-  // finishes, or it could erase an idle state that arrived while a prompt was still running.
+  // Bumped by every status transition: a delivery observes the stamp when it starts and only the
+  // unchanged owner clears the idle flag on completion, or it could erase an idle state that
+  // arrived while its prompt was still running.
   const stamps = new Map<string, number>()
   // Status reports are launched in arrival order per session: subprocesses otherwise race, and a
   // late status-busy landing after its idle would leave the daemon showing a busy session.
   const statusChain = new Map<string, Promise<unknown>>()
 
   const deliver = async (id: string) => {
-    if (delivering.has(id) || subagents.has(id)) return
+    if (delivering.has(id) || subagents.has(id) || dead.has(id)) return
     delivering.add(id)
-    const stamp = (stamps.get(id) ?? 0) + 1
-    stamps.set(id, stamp)
+    const stamp = stamps.get(id) ?? 0
     try {
       const polled = undelivered.get(id) ?? (await run(["hook", "opencode", "poll", "--session", id], dirs.get(id)))
       undelivered.delete(id)
       if (!polled) return
-      // The session may have ended or become a subagent while the poll ran; mail for it would only
-      // fail again.
-      if (!dirs.has(id) || subagents.has(id)) return
+      if (!dirs.has(id) || subagents.has(id)) return // the session ended or became a subagent meanwhile
       try {
         await prompt(id, polled)
       } catch {
         undelivered.set(id, polled)
       } finally {
-        if (stamps.get(id) === stamp) {
+        if ((stamps.get(id) ?? 0) === stamp) {
           idle.delete(id)
         }
       }
@@ -72,8 +71,9 @@ const network = (prompt: (id: string, text: string) => Promise<unknown>) => {
   return {
     subagent: (id: string) => subagents.add(id),
     status: async (id: string, state: string, dir: string) => {
-      if (subagents.has(id)) return
+      if (subagents.has(id) || dead.has(id)) return
       dirs.set(id, dir)
+      stamps.set(id, (stamps.get(id) ?? 0) + 1) // either transition supersedes deliveries in flight
       const next = (statusChain.get(id) ?? Promise.resolve()).catch(() => {}).then(() =>
         run(["hook", "opencode", "status", "--session", id, "--state", state], dir),
       )
@@ -85,25 +85,32 @@ const network = (prompt: (id: string, text: string) => Promise<unknown>) => {
     },
     stop: () => clearInterval(timer),
     // Off the network: the session is gone, or opencode unloaded this plugin and nothing delivers
-    // to it any more. Known sessions end with their folder's cwd, so the daemon's folder check
-    // passes; a session the plugin never saw still sends its end (no cwd), so the daemon can
-    // retire it.
+    // to it any more. The session-end is chained behind the statuses queued for that session (they
+    // could otherwise run after the end and resurrect it in the daemon), and known sessions end
+    // with their folder's cwd so the daemon's folder check passes.
     end: (id?: string) => {
+      const finish = (s: string, dir?: string) => {
+        const pending = statusChain.get(s)
+        statusChain.delete(s)
+        void (pending ?? Promise.resolve()).catch(() => {}).then(() =>
+          run(["hook", "opencode", "session-end", "--session", s], dir),
+        )
+      }
       if (id) {
-        const dir = dirs.get(id)
+        dead.add(id)
         idle.delete(id)
         undelivered.delete(id)
         stamps.delete(id)
-        statusChain.delete(id)
+        finish(id, dirs.get(id))
         dirs.delete(id)
-        void run(["hook", "opencode", "session-end", "--session", id], dir)
         return
       }
       for (const [s, dir] of [...dirs]) {
+        dead.add(s)
         idle.delete(s)
-        dirs.delete(s)
-        void run(["hook", "opencode", "session-end", "--session", s], dir)
+        finish(s, dir)
       }
+      dirs.clear()
       undelivered.clear()
       stamps.clear()
     },
