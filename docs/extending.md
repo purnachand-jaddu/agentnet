@@ -7,8 +7,8 @@ up in `internal/cli/cli.go`.
 
 ## `adapter.Adapter` — a coding agent
 
-Defined in `adapter/adapter.go`. One per agent (Claude Code, Codex, a generic pull-only MCP
-client).
+Defined in `adapter/adapter.go`. One per agent (Claude Code, Codex, OpenCode, a generic pull-only
+MCP client).
 
 ```go
 type Adapter interface {
@@ -42,7 +42,7 @@ client reports a name other than `Name()`.
 
 ```go
 func adapters() *adapter.Registry {
-	return adapter.NewRegistry(claude.New(), codex.New(nil), generic.New(), generic.CLI())
+	return adapter.NewRegistry(claude.New(), codex.New(nil), opencode.New(), generic.New(), generic.CLI())
 }
 ```
 

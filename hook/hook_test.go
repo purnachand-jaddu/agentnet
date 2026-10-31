@@ -28,7 +28,7 @@ func TestPrintsMailThenConfirms(t *testing.T) {
 	}
 	var out bytes.Buffer
 	in := strings.NewReader(`{"session_id":"s1","cwd":"/src/api","transcript_path":"/t"}`)
-	if err := Run(context.Background(), "codex", "post-tool-use", in, &out, call, func(string) string { return "" }); err != nil {
+	if err := Run(context.Background(), "codex", "post-tool-use", in, &out, call, func(string) string { return "" }, Flags{}); err != nil {
 		t.Fatal(err)
 	}
 	if out.String() != "X\n" || strings.Join(ops, ",") != "hook,delivered" || gotArgs.Event != "tool" || gotArgs.Transcript != "/t" {
@@ -39,7 +39,7 @@ func TestPrintsMailThenConfirms(t *testing.T) {
 func TestBrokenDaemonNeverBreaksTheAgent(t *testing.T) {
 	var out bytes.Buffer
 	call := func(context.Context, string, any, any) error { return errors.New("down") }
-	if err := Run(context.Background(), "codex", "stop", strings.NewReader(`{"session_id":"s1"}`), &out, call, func(string) string { return "" }); err != nil || out.Len() != 0 {
+	if err := Run(context.Background(), "codex", "stop", strings.NewReader(`{"session_id":"s1"}`), &out, call, func(string) string { return "" }, Flags{}); err != nil || out.Len() != 0 {
 		t.Fatalf("err %v out %q", err, out.String())
 	}
 }
@@ -60,7 +60,7 @@ func TestWriteErrorSkipsDelivered(t *testing.T) {
 		}
 		return nil
 	}
-	if err := Run(context.Background(), "codex", "stop", strings.NewReader(`{"session_id":"s1"}`), errWriter{}, call, func(string) string { return "" }); err != nil {
+	if err := Run(context.Background(), "codex", "stop", strings.NewReader(`{"session_id":"s1"}`), errWriter{}, call, func(string) string { return "" }, Flags{}); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Join(ops, ",") != "hook" {
@@ -73,7 +73,7 @@ func TestInvalidStdinNoSessionIDMakesNoCalls(t *testing.T) {
 	calls := 0
 	call := func(context.Context, string, any, any) error { calls++; return nil }
 	var out bytes.Buffer
-	if err := Run(context.Background(), "codex", "stop", strings.NewReader("not json"), &out, call, func(string) string { return "" }); err != nil {
+	if err := Run(context.Background(), "codex", "stop", strings.NewReader("not json"), &out, call, func(string) string { return "" }, Flags{}); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 0 || out.Len() != 0 {
@@ -86,7 +86,7 @@ func TestUnknownEventMakesNoCalls(t *testing.T) {
 	calls := 0
 	call := func(context.Context, string, any, any) error { calls++; return nil }
 	var out bytes.Buffer
-	if err := Run(context.Background(), "codex", "weird-event", strings.NewReader(`{"session_id":"s1"}`), &out, call, func(string) string { return "" }); err != nil {
+	if err := Run(context.Background(), "codex", "weird-event", strings.NewReader(`{"session_id":"s1"}`), &out, call, func(string) string { return "" }, Flags{}); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 0 {
@@ -108,13 +108,13 @@ func TestClaudeEnvInboxOnlyForClaudeCode(t *testing.T) {
 	}
 	var out bytes.Buffer
 
-	Run(context.Background(), "claude-code", "stop", strings.NewReader(`{"session_id":"s1"}`), &out, call, getenv)
+	Run(context.Background(), "claude-code", "stop", strings.NewReader(`{"session_id":"s1"}`), &out, call, getenv, Flags{})
 	if gotArgs.Inbox != "/tmp/sock" || gotArgs.InboxToken != "tok" {
 		t.Fatalf("claude-code args = %+v", gotArgs)
 	}
 
 	gotArgs = daemon.HookArgs{}
-	Run(context.Background(), "codex", "stop", strings.NewReader(`{"session_id":"s1"}`), &out, call, getenv)
+	Run(context.Background(), "codex", "stop", strings.NewReader(`{"session_id":"s1"}`), &out, call, getenv, Flags{})
 	if gotArgs.Inbox != "" || gotArgs.InboxToken != "" {
 		t.Fatalf("codex args should have empty inbox fields, got %+v", gotArgs)
 	}
