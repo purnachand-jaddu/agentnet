@@ -8,7 +8,6 @@ import (
 	"os"
 	"runtime"
 
-	"github.com/ncruces/zenity"
 	"github.com/purnachand-jaddu/agentnet/consent"
 )
 
@@ -21,7 +20,7 @@ var (
 
 // newApprover builds the consent.Approver for folder add/remove; tests override it.
 var newApprover = func() consent.Approver {
-	return consent.Default(runtime.GOOS, os.Getenv, zenity.IsAvailable, os.Stdin, os.Stderr)
+	return consent.Default(runtime.GOOS, os.Getenv, os.Stdin, os.Stderr)
 }
 
 // Main runs the agentnet CLI for args (os.Args[1:]) and returns the process exit code.

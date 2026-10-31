@@ -134,9 +134,8 @@ nil to get `seal.HPKE{}` (the daemon's own default).
 
 ## `consent.Approver` — asking a human
 
-Defined in `consent/consent.go`. Implementations are `consent.Dialog` (system dialog, asked through
-`github.com/ncruces/zenity` — native on Windows, `osascript` on macOS, `zenity`/`qarma`/`matedialog`
-on Linux), `consent.TTY` (terminal prompt) and `consent.NoHuman` (always refuses — no person to ask).
+Defined in `consent/consent.go`. Implementations are `consent.Dialog` (macOS system dialog),
+`consent.TTY` (terminal prompt) and `consent.NoHuman` (always refuses — no person to ask).
 
 ```go
 type Approver interface {
@@ -150,4 +149,4 @@ This is the one interface every command that crosses a security boundary (`init`
 hook may call. See `SECURITY.md` for why this is a speed bump, not a boundary.
 
 **Register it** via the `newApprover` package var in `internal/cli/cli.go`, which calls
-`consent.Default(runtime.GOOS, os.Getenv, zenity.IsAvailable, os.Stdin, os.Stderr)`.
+`consent.Default(runtime.GOOS, os.Getenv, os.Stdin, os.Stderr)`.

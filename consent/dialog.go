@@ -2,84 +2,68 @@ package consent
 
 import (
 	"context"
-	"errors"
+	"fmt"
+	"os/exec"
 	"strings"
-	"time"
-
-	"github.com/ncruces/zenity"
 )
 
-// Dialog asks a person through a system dialog, using the pure-Go zenity driver
-// (github.com/ncruces/zenity): native dialogs on Windows, osascript on macOS, and
-// zenity, qarma or matedialog on Linux. Pick is the backend call; tests stub it,
-// Default wires the real zenity one.
+// Dialog asks a person through a macOS system dialog (osascript).
 type Dialog struct {
-	// Pick shows a single-choice list and returns zenity.ErrCanceled when the person cancels.
-	Pick func(ctx context.Context, title, detail string, options []string) (string, error)
+	Run func(ctx context.Context, name string, args ...string) ([]byte, error)
 }
 
-// pickZenity shows a single-choice list through zenity.
-func pickZenity(ctx context.Context, title, detail string, options []string) (string, error) {
-	return zenity.List(detail, options, zenity.Title(title), zenity.Context(ctx))
+// osascriptErr maps a failed osascript run: cancel (-128) is nil, no GUI session (-1713) is ErrNoHuman, else an error with its output.
+func osascriptErr(out []byte, err error) error {
+	msg := strings.TrimSpace(string(out))
+	switch {
+	case strings.Contains(msg, "(-128)"):
+		return nil
+	case strings.Contains(msg, "(-1713)"):
+		return ErrNoHuman
+	}
+	return fmt.Errorf("osascript: %w: %s", err, msg)
 }
 
-// confirmChoice is the option a person must pick to approve. Denial is every other
-// outcome — the picker's raw result is never trusted.
-const approveChoice = "Approve"
+// runOsascript is Dialog's real runner, shelling out to osascript.
+func runOsascript(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+}
 
-// confirmGiveUp is how long Confirm waits before silently denying, like the old
-// "giving up after 300" dialog: callers do not set deadlines of their own.
-const confirmGiveUp = 5 * time.Minute
+// escapeAppleScript escapes backslash and double quote for a quoted AppleScript string literal.
+func escapeAppleScript(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	return strings.ReplaceAll(s, `"`, `\"`)
+}
 
-// Confirm approves only when the person explicitly picked Approve from the list.
-// An untouched list answers Deny or empty —cancel, window close and giving up read
-// as denials too. It gives up and denies after five minutes.
+// Confirm shows a Deny/Approve dialog that defaults to Deny and gives up after 300s.
 func (d Dialog) Confirm(ctx context.Context, title, detail string) (bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, confirmGiveUp)
-	defer cancel()
-	choice, err := d.pick(ctx, title, detail, "Deny", approveChoice)
+	script := `display dialog "` + escapeAppleScript(detail) + `" with title "` + escapeAppleScript(title) +
+		`" buttons {"Deny", "Approve"} default button "Deny" cancel button "Deny" giving up after 300 with icon caution`
+	out, err := d.Run(ctx, "osascript", "-e", script)
 	if err != nil {
-		return false, err
+		return false, osascriptErr(out, err)
 	}
-	return choice == approveChoice, nil
+	s := string(out)
+	return strings.Contains(s, "button returned:Approve") && !strings.Contains(s, "gave up:true"), nil
 }
 
-// Choose returns the chosen option, or "" on cancel, gave up or a bogus result.
-// A result not among the offered options is never trusted.
+// Choose shows a macOS list picker and returns the chosen option, or "" on cancel or a bogus result.
 func (d Dialog) Choose(ctx context.Context, title, detail string, options []string) (string, error) {
-	choice, err := d.pick(ctx, title, detail, options...)
-	if err != nil {
-		return "", err
+	quoted := make([]string, len(options))
+	for i, o := range options {
+		quoted[i] = `"` + escapeAppleScript(o) + `"`
 	}
+	script := `choose from list {` + strings.Join(quoted, ", ") + `} with title "` + escapeAppleScript(title) +
+		`" with prompt "` + escapeAppleScript(detail) + `"`
+	out, err := d.Run(ctx, "osascript", "-e", script)
+	if err != nil {
+		return "", osascriptErr(out, err)
+	}
+	choice := strings.TrimSpace(string(out))
 	for _, o := range options {
 		if choice == o {
 			return choice, nil
 		}
 	}
 	return "", nil
-}
-
-// pick maps backend errors through consent's taxonomy: cancel and gave up are
-// silent denials, no GUI session is ErrNoHuman, anything else is reported. The
-// backend maps every exit status 1 to ErrCanceled, so some backend failures deny
-// silently instead of reporting — they never approve.
-func (d Dialog) pick(ctx context.Context, title, detail string, options ...string) (string, error) {
-	choice, err := d.Pick(ctx, title, detail, options)
-	switch {
-	case err == nil:
-		return choice, nil
-	case errors.Is(err, zenity.ErrCanceled), errors.Is(err, context.DeadlineExceeded):
-		return "", nil
-	case noGUI(err):
-		return "", ErrNoHuman
-	}
-	return "", err
-}
-
-// noGUI reports "there is nobody on screen to ask": macOS reports that as
-// osascript error -1713 ("No user interaction allowed"). Unrecognized failures
-// propagate as errors instead — they deny, never approve.
-func noGUI(err error) bool {
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "no user interaction") || strings.Contains(s, "-1713")
 }
