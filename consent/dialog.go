@@ -2,6 +2,7 @@ package consent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -37,7 +38,7 @@ func escapeAppleScript(s string) string {
 
 // Confirm shows a Deny/Approve dialog that defaults to Deny and gives up after 300s.
 func (d Dialog) Confirm(ctx context.Context, title, detail string) (bool, error) {
-	script := `display dialog "` + escapeAppleScript(detail) + `" with title "` + escapeAppleScript(title) +
+	script := `display dialog "` + escapeAppleScript(dialogBody(title, detail)) + `" with title "` + escapeAppleScript(title) +
 		`" buttons {"Deny", "Approve"} default button "Deny" cancel button "Deny" giving up after 300 with icon caution`
 	out, err := d.Run(ctx, "osascript", "-e", script)
 	if err != nil {
@@ -47,15 +48,20 @@ func (d Dialog) Confirm(ctx context.Context, title, detail string) (bool, error)
 	return strings.Contains(s, "button returned:Approve") && !strings.Contains(s, "gave up:true"), nil
 }
 
-// Choose shows a macOS list picker and returns the chosen option, or "" on cancel or a bogus result.
+// Choose shows a macOS list picker and returns the chosen option, or "" on cancel, giving up after 5 minutes or a bogus result.
 func (d Dialog) Choose(ctx context.Context, title, detail string, options []string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, dialogGiveUp)
+	defer cancel()
 	quoted := make([]string, len(options))
 	for i, o := range options {
 		quoted[i] = `"` + escapeAppleScript(o) + `"`
 	}
 	script := `choose from list {` + strings.Join(quoted, ", ") + `} with title "` + escapeAppleScript(title) +
-		`" with prompt "` + escapeAppleScript(detail) + `"`
+		`" with prompt "` + escapeAppleScript(dialogBody(title, detail)) + `"`
 	out, err := d.Run(ctx, "osascript", "-e", script)
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return "", nil
+	}
 	if err != nil {
 		return "", osascriptErr(out, err)
 	}

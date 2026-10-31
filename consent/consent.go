@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"time"
 )
 
 // ErrNoHuman means no person can be asked to approve: run this in your own terminal.
@@ -16,6 +17,17 @@ type Approver interface {
 	Choose(ctx context.Context, title, detail string, options []string) (string, error) // "" when cancelled
 }
 
+// dialogGiveUp is how long a dialog waits for an answer before it is killed and read as a denial.
+const dialogGiveUp = 5 * time.Minute
+
+// dialogBody is the text a dialog shows: detail, or title when detail is empty.
+func dialogBody(title, detail string) string {
+	if detail == "" {
+		return title
+	}
+	return detail
+}
+
 // isTerminal reports whether f is a character device; nil is never a terminal.
 func isTerminal(f *os.File) bool {
 	if f == nil {
@@ -25,14 +37,19 @@ func isTerminal(f *os.File) bool {
 	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
 
-// Default picks the approver for this environment: macOS always uses the system dialog;
-// elsewhere a TTY prompt is used when stdin/stderr are terminals and no agent env is set; else NoHuman.
-func Default(goos string, getenv func(string) string, in, out *os.File) Approver {
+// Default picks the approver: the system dialog on macOS; elsewhere a TTY prompt for a human terminal,
+// then a desktop dialog when a display and a dialog tool exist (never on Windows), else NoHuman.
+func Default(goos string, getenv func(string) string, lookPath func(string) (string, error), in, out *os.File) Approver {
 	if goos == "darwin" {
 		return Dialog{Run: runOsascript}
 	}
 	if isTerminal(in) && isTerminal(out) && !AgentEnv(getenv) {
 		return TTY{In: in, Out: out}
+	}
+	if goos != "windows" && (getenv("DISPLAY") != "" || getenv("WAYLAND_DISPLAY") != "") {
+		if tool := linuxTool(lookPath); tool != "" {
+			return LinuxDialog{Tool: tool, Run: runDialog}
+		}
 	}
 	return NoHuman{}
 }

@@ -4,8 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func env(kv map[string]string) func(string) string { return func(k string) string { return kv[k] } }
@@ -25,15 +30,72 @@ func TestTTYNeedsYes(t *testing.T) {
 	}
 }
 
+// lookPathFinds returns a lookPath that finds only the named programs.
+func lookPathFinds(names ...string) func(string) (string, error) {
+	return func(name string) (string, error) {
+		if slices.Contains(names, name) {
+			return "/usr/bin/" + name, nil
+		}
+		return "", exec.ErrNotFound
+	}
+}
+
+func TestDefault(t *testing.T) {
+	term, err := os.OpenFile(os.DevNull, os.O_RDWR, 0) // a character device, so isTerminal says yes
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { term.Close() })
+	agent, display := map[string]string{"CLAUDECODE": "1"}, map[string]string{"DISPLAY": ":0"}
+	agentDisplay := map[string]string{"CLAUDECODE": "1", "DISPLAY": ":0"}
+	agentWayland := map[string]string{"CLAUDECODE": "1", "WAYLAND_DISPLAY": "wayland-0"}
+	for _, c := range []struct {
+		name     string
+		goos     string
+		env      map[string]string
+		terminal bool
+		tools    []string
+		want     string
+	}{
+		{"darwin", "darwin", agent, false, nil, "consent.Dialog"},
+		{"linux human terminal", "linux", nil, true, []string{"zenity"}, "consent.TTY"},
+		{"linux human terminal display tool", "linux", display, true, []string{"zenity"}, "consent.TTY"},
+		{"linux agent display tool", "linux", agentDisplay, false, []string{"zenity"}, "consent.LinuxDialog"},
+		{"linux agent wayland tool", "linux", agentWayland, true, []string{"qarma"}, "consent.LinuxDialog"},
+		{"linux no agent no terminal display tool", "linux", display, false, []string{"matedialog"}, "consent.LinuxDialog"},
+		{"freebsd agent display tool", "freebsd", agentDisplay, false, []string{"zenity"}, "consent.LinuxDialog"},
+		{"linux agent display no tool", "linux", agentDisplay, false, nil, "consent.NoHuman"},
+		{"linux agent no display", "linux", agent, true, []string{"zenity"}, "consent.NoHuman"},
+		{"linux no terminal no display", "linux", nil, false, []string{"zenity"}, "consent.NoHuman"},
+		{"windows agent", "windows", agentDisplay, false, []string{"zenity"}, "consent.NoHuman"},
+		{"windows human terminal", "windows", nil, true, []string{"zenity"}, "consent.TTY"},
+	} {
+		in, out := (*os.File)(nil), (*os.File)(nil)
+		if c.terminal {
+			in, out = term, term
+		}
+		if got := fmt.Sprintf("%T", Default(c.goos, env(c.env), lookPathFinds(c.tools...), in, out)); got != c.want {
+			t.Errorf("%s: got %s, want %s", c.name, got, c.want)
+		}
+	}
+}
+
+func TestDefaultLinuxDialogUsesFoundTool(t *testing.T) {
+	a := Default("linux", env(map[string]string{"DISPLAY": ":0"}), lookPathFinds("qarma"), nil, nil)
+	if d, ok := a.(LinuxDialog); !ok || d.Tool != "/usr/bin/qarma" || d.Run == nil {
+		t.Fatalf("got %#v", a)
+	}
+}
+
 func TestLinuxAgentGetsNoHuman(t *testing.T) {
-	a := Default("linux", env(map[string]string{"CLAUDECODE": "1"}), nil, nil)
+	a := Default("linux", env(map[string]string{"CLAUDECODE": "1"}), lookPathFinds(), nil, nil)
 	if _, err := a.Confirm(context.Background(), "t", "d"); !errors.Is(err, ErrNoHuman) {
 		t.Fatalf("err = %v", err)
 	}
 }
 
 func TestMacAlwaysUsesDialog(t *testing.T) {
-	if _, ok := Default("darwin", env(nil), nil, nil).(Dialog); !ok {
+	if _, ok := Default("darwin", env(nil), lookPathFinds(), nil, nil).(Dialog); !ok {
 		t.Fatal("macOS should always ask through the system dialog")
 	}
 }
@@ -145,6 +207,46 @@ func TestDialogChoose(t *testing.T) {
 	}
 }
 
+func TestDialogEmptyDetailShowsTitle(t *testing.T) {
+	var script string
+	d := Dialog{Run: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		script = args[len(args)-1]
+		return []byte("a\n"), nil
+	}}
+	d.Confirm(context.Background(), "Revoke alice?", "")
+	if !strings.HasPrefix(script, `display dialog "Revoke alice?"`) {
+		t.Fatalf("Confirm script %q should show the title as the body", script)
+	}
+	d.Choose(context.Background(), "Pick one", "", []string{"a"})
+	if !strings.Contains(script, `with prompt "Pick one"`) {
+		t.Fatalf("Choose script %q should show the title as the prompt", script)
+	}
+}
+
+func TestDialogChooseGivesUpAfterFiveMinutes(t *testing.T) {
+	var deadline time.Time
+	d := Dialog{Run: func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
+		deadline, _ = ctx.Deadline()
+		return []byte("a\n"), nil
+	}}
+	start := time.Now()
+	d.Choose(context.Background(), "t", "d", []string{"a"})
+	if got := deadline.Sub(start); got < 4*time.Minute || got > 6*time.Minute {
+		t.Fatalf("Run's deadline is %v out, want about 5m", got)
+	}
+}
+
+func TestDialogChooseDeadlineIsNotAnError(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	d := Dialog{Run: func(context.Context, string, ...string) ([]byte, error) {
+		return nil, errors.New("signal: killed")
+	}}
+	if got, err := d.Choose(ctx, "t", "d", []string{"a"}); got != "" || err != nil {
+		t.Fatalf("Choose = %q, %v; want \"\", nil", got, err)
+	}
+}
+
 func TestTTYChoose(t *testing.T) {
 	out := &bytes.Buffer{}
 	got, err := TTY{In: strings.NewReader("2\n"), Out: out}.Choose(context.Background(), "t", "d", []string{"a", "b"})
@@ -178,7 +280,7 @@ func TestNoHuman(t *testing.T) {
 
 func TestDefaultNonTerminalFallsBackToNoHuman(t *testing.T) {
 	// nil files are not terminals, so even without an agent env this is NoHuman.
-	if _, ok := Default("linux", env(nil), nil, nil).(NoHuman); !ok {
+	if _, ok := Default("linux", env(nil), lookPathFinds(), nil, nil).(NoHuman); !ok {
 		t.Fatal("expected NoHuman when in/out are not terminals")
 	}
 }
