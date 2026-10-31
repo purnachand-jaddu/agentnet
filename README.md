@@ -10,7 +10,7 @@ Apache-2.0.
 curl -fsSL https://raw.githubusercontent.com/purnachand-jaddu/agentnet/main/install.sh | sh -s -- up
 ```
 
-On macOS you can paste this to your coding agent: *Set up agentnet by running `curl -fsSL https://raw.githubusercontent.com/purnachand-jaddu/agentnet/main/install.sh | sh -s -- up`; it will ask me to approve.* The approval is a system dialog, so it reaches you even when an agent runs the command. On Linux, run the command in your own terminal: approval there is a terminal prompt, and agentnet won't prompt when an agent runs it.
+On macOS you can paste this to your coding agent: *Set up agentnet by running `curl -fsSL https://raw.githubusercontent.com/purnachand-jaddu/agentnet/main/install.sh | sh -s -- up`; it will ask me to approve.* The approval is a system dialog, so it reaches you even when an agent runs the command. On Linux, approval is a terminal prompt when you run the command in your own terminal, and otherwise (say, when an agent runs it) a desktop dialog if zenity, qarma or matedialog is installed and a display is set. If neither is possible, agentnet refuses with "run this in your own terminal".
 
 It downloads the latest release, verifies it, installs it to `~/.local/bin/agentnet` (override with
 `AGENTNET_BIN`), and runs `agentnet up` — which asks you, a human, to create a new network or join

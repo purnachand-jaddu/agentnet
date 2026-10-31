@@ -6,11 +6,19 @@ and its limits — read it before you trust it with anything.
 ## Consent is a speed bump, not a boundary
 
 `init`, `join`, `admit`, `accept`, `revoke`, `setup` and `folder add` all go through
-`consent.Approver` (a system dialog on macOS, a TTY prompt elsewhere). No MCP tool or hook can
+`consent.Approver` (a system dialog on macOS; elsewhere a TTY prompt in your own terminal, else on
+Linux a zenity, qarma or matedialog dialog when a display is set). No MCP tool or hook can
 trigger them. But the approver only proves a human is present at the machine right now — it does
 not prove the process asking is trustworthy. Any process that can control your terminal or your
 screen (including a misbehaving or prompt-injected agent with shell access) can answer the prompt
 for you. Don't treat an approval as proof of informed consent; treat it as a reminder to look.
+
+On Linux the dialog also appears when an agent runs the command. Under X11 any local process,
+including the agent (with `xdotool`, say), can answer it. Wayland doesn't stop this either: the
+agent controls the dialog's environment, so it can point it at XWayland or its own Xvfb. On a
+machine with a display but nobody at it, the command waits up to five minutes, then denies. An
+agent can also put a fake dialog program (`zenity`, or `osascript` on macOS) first on `PATH` to
+answer for you; that is a known limit, consistent with the same-user trust below.
 
 ## What any local, same-user process can do
 
