@@ -184,3 +184,15 @@ func TestLinuxTool(t *testing.T) {
 		}
 	}
 }
+
+func TestLinuxDialogEmptyDetailShowsTitle(t *testing.T) {
+	f := &fakeDialog{}
+	linuxDialog(f).Confirm(context.Background(), "Revoke R&D?", "")
+	if !slices.Contains(f.args, "--text=Revoke R&amp;D?") {
+		t.Fatalf("args %q should show the escaped title as the body", f.args)
+	}
+	linuxDialog(f).Choose(context.Background(), "Pick one", "", []string{"a"})
+	if !slices.Contains(f.args, "--text=Pick one") {
+		t.Fatalf("args %q should show the title as the body", f.args)
+	}
+}

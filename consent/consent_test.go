@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func env(kv map[string]string) func(string) string { return func(k string) string { return kv[k] } }
@@ -58,6 +59,7 @@ func TestDefault(t *testing.T) {
 	}{
 		{"darwin", "darwin", agent, false, nil, "consent.Dialog"},
 		{"linux human terminal", "linux", nil, true, []string{"zenity"}, "consent.TTY"},
+		{"linux human terminal display tool", "linux", display, true, []string{"zenity"}, "consent.TTY"},
 		{"linux agent display tool", "linux", agentDisplay, false, []string{"zenity"}, "consent.LinuxDialog"},
 		{"linux agent wayland tool", "linux", agentWayland, true, []string{"qarma"}, "consent.LinuxDialog"},
 		{"linux no agent no terminal display tool", "linux", display, false, []string{"matedialog"}, "consent.LinuxDialog"},
@@ -202,6 +204,46 @@ func TestDialogChoose(t *testing.T) {
 	got, err = d.Choose(context.Background(), "t", "d", []string{"a", "b"})
 	if err != nil || got != "" {
 		t.Fatalf("bogus choice: got %q, %v", got, err)
+	}
+}
+
+func TestDialogEmptyDetailShowsTitle(t *testing.T) {
+	var script string
+	d := Dialog{Run: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		script = args[len(args)-1]
+		return []byte("a\n"), nil
+	}}
+	d.Confirm(context.Background(), "Revoke alice?", "")
+	if !strings.HasPrefix(script, `display dialog "Revoke alice?"`) {
+		t.Fatalf("Confirm script %q should show the title as the body", script)
+	}
+	d.Choose(context.Background(), "Pick one", "", []string{"a"})
+	if !strings.Contains(script, `with prompt "Pick one"`) {
+		t.Fatalf("Choose script %q should show the title as the prompt", script)
+	}
+}
+
+func TestDialogChooseGivesUpAfterFiveMinutes(t *testing.T) {
+	var deadline time.Time
+	d := Dialog{Run: func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
+		deadline, _ = ctx.Deadline()
+		return []byte("a\n"), nil
+	}}
+	start := time.Now()
+	d.Choose(context.Background(), "t", "d", []string{"a"})
+	if got := deadline.Sub(start); got < 4*time.Minute || got > 6*time.Minute {
+		t.Fatalf("Run's deadline is %v out, want about 5m", got)
+	}
+}
+
+func TestDialogChooseDeadlineIsNotAnError(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	d := Dialog{Run: func(context.Context, string, ...string) ([]byte, error) {
+		return nil, errors.New("signal: killed")
+	}}
+	if got, err := d.Choose(ctx, "t", "d", []string{"a"}); got != "" || err != nil {
+		t.Fatalf("Choose = %q, %v; want \"\", nil", got, err)
 	}
 }
 

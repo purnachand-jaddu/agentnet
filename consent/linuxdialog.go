@@ -9,14 +9,10 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
-	"time"
 )
 
 // linuxTools are the zenity-compatible dialog programs LinuxDialog can drive, in order of preference.
 var linuxTools = []string{"zenity", "qarma", "matedialog"}
-
-// dialogGiveUp is how long a dialog waits for an answer before it is killed and read as a denial.
-const dialogGiveUp = 5 * time.Minute
 
 // LinuxDialog asks a person through a zenity-compatible list dialog (zenity, qarma or matedialog).
 type LinuxDialog struct {
@@ -74,7 +70,7 @@ func (d LinuxDialog) Choose(ctx context.Context, title, detail string, options [
 func (d LinuxDialog) pick(ctx context.Context, title, detail string, options []string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, dialogGiveUp)
 	defer cancel()
-	args := append([]string{"--list", "--hide-header", "--title=" + title, "--text=" + escapeDialogText(detail), "--column="}, options...)
+	args := append([]string{"--list", "--hide-header", "--title=" + title, "--text=" + escapeDialogText(dialogBody(title, detail)), "--column="}, options...)
 	stdout, stderr, err := d.Run(ctx, d.Tool, args...)
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return "", nil
