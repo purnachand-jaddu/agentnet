@@ -87,6 +87,18 @@ func TestLinuxDialogExit1WithGtkNoiseIsCancel(t *testing.T) {
 	}
 }
 
+func TestLinuxDialogFailureNeverTrustsStdout(t *testing.T) {
+	for _, err := range []error{fakeExitError{code: 1}, fakeExitError{code: 255}, context.DeadlineExceeded} {
+		f := &fakeDialog{stdout: "Approve\n", err: err}
+		if ok, _ := linuxDialog(f).Confirm(context.Background(), "t", "d"); ok {
+			t.Errorf("Confirm with stdout Approve and err %v approved", err)
+		}
+		if got, _ := linuxDialog(f).Choose(context.Background(), "t", "d", []string{"Approve"}); got != "" {
+			t.Errorf("Choose with stdout Approve and err %v = %q, want \"\"", err, got)
+		}
+	}
+}
+
 func TestLinuxDialogNoDisplayIsNoHuman(t *testing.T) {
 	for _, stderr := range []string{
 		"(zenity:1234): Gtk-WARNING **: 10:00:00.000: cannot open display: :0\n",
