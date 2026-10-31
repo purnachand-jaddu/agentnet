@@ -14,7 +14,8 @@ screen (including a misbehaving or prompt-injected agent with shell access) can 
 for you. Don't treat an approval as proof of informed consent; treat it as a reminder to look.
 
 On Linux the dialog also appears when an agent runs the command. Under X11 any local process,
-including the agent (with `xdotool`, say), can answer it; Wayland blocks that synthetic input. On a
+including the agent (with `xdotool`, say), can answer it. Wayland doesn't stop this either: the
+agent controls the dialog's environment, so it can point it at XWayland or its own Xvfb. On a
 machine with a display but nobody at it, the command waits up to five minutes, then denies. An
 agent can also put a fake dialog program (`zenity`, or `osascript` on macOS) first on `PATH` to
 answer for you; that is a known limit, consistent with the same-user trust below.
